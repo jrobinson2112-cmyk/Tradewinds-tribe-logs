@@ -1,0 +1,1 @@
+web: python tribe-log-forwarder.py
