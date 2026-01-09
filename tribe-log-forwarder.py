@@ -1,149 +1,147 @@
-require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
-const fs = require("fs");
-const path = require("path");
+import os
+import time
+import ftplib
+import hashlib
+import requests
 
-// ✅ Your target channel (Valkyrie tribe logs)
-const TARGET_CHANNEL_ID = "1449304199270502420";
+# ============================================================
+# CONFIG (ENV VARS)
+# ============================================================
 
-// --- ANSI helpers ---
-// Discord ANSI colors: 30–37 (fg), 90–97 (bright fg).
-// Purple isn't truly available, so we approximate "purple" using magenta (35 / 95).
-const ANSI = {
-  reset: "\u001b[0m",
-  red: "\u001b[31m",
-  green: "\u001b[32m",
-  yellow: "\u001b[33m",
-  magenta: "\u001b[35m",
-  gray: "\u001b[90m",
-};
+FTP_HOST = os.getenv("FTP_HOST")
+FTP_PORT = int(os.getenv("FTP_PORT", "21"))
+FTP_USER = os.getenv("FTP_USER")
+FTP_PASS = os.getenv("FTP_PASS")
 
-// --- Event detection (tweak keywords to match your exact log formats) ---
-function classifyLog(line) {
-  const l = line.toLowerCase();
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-  // Claiming (purple)
-  if (
-    l.includes("claimed") ||
-    l.includes("unclaimed") ||
-    l.includes("tribe of") && l.includes("has joined") // optional
-  ) return "CLAIM";
+# Path to ShooterGame.log on Nitrado
+FTP_LOG_PATH = "arksa/ShooterGame/Saved/Logs/ShooterGame.log"
 
-  // Taming (green)
-  if (l.includes("tamed") || l.includes("taming")) return "TAME";
+# Tribe name to filter
+TARGET_TRIBE = "Valkyrie"
 
-  // Deaths (red)
-  if (l.includes("killed") || l.includes("was killed") || l.includes("died")) return "DEATH";
+# Poll interval (seconds)
+POLL_INTERVAL = 15
 
-  // Demolished (yellow)
-  if (l.includes("demolished") || l.includes("destroyed") || l.includes("decayed")) return "DEMO";
 
-  return "OTHER";
-}
+# ============================================================
+# VALIDATION
+# ============================================================
 
-function colorize(line) {
-  const type = classifyLog(line);
+required = [
+    FTP_HOST,
+    FTP_USER,
+    FTP_PASS,
+    DISCORD_WEBHOOK_URL,
+]
 
-  switch (type) {
-    case "CLAIM":
-      return `${ANSI.magenta}${line}${ANSI.reset}`;
-    case "TAME":
-      return `${ANSI.green}${line}${ANSI.reset}`;
-    case "DEATH":
-      return `${ANSI.red}${line}${ANSI.reset}`;
-    case "DEMO":
-      return `${ANSI.yellow}${line}${ANSI.reset}`;
-    default:
-      return line; // default color
-  }
-}
+if not all(required):
+    raise RuntimeError("Missing required environment variables")
 
-// Splits into chunks that fit Discord's 2000-char message limit.
-// We wrap each chunk in ```ansi ... ```
-function buildAnsiMessages(lines) {
-  const messages = [];
-  let buf = "```ansi\n";
 
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
+# ============================================================
+# DISCORD FORMAT HELPERS
+# ============================================================
 
-    const colored = colorize(line);
+def format_log_line(line: str) -> dict:
+    """
+    Returns Discord embed payload with color based on ARK log type
+    """
+    text = line.strip()
 
-    // +1 for newline, +3 for closing ```
-    if ((buf.length + colored.length + 1 + 3) > 2000) {
-      buf += "```";
-      messages.push(buf);
-      buf = "```ansi\n";
+    color = 0x95A5A6  # default grey
+
+    lower = text.lower()
+
+    if "claimed" in lower or "claiming" in lower:
+        color = 0x9B59B6  # purple
+    elif "tamed" in lower or "taming" in lower:
+        color = 0x2ECC71  # green
+    elif "killed" in lower or "died" in lower:
+        color = 0xE74C3C  # red
+    elif "demolished" in lower or "destroyed" in lower:
+        color = 0xF1C40F  # yellow
+
+    return {
+        "embeds": [
+            {
+                "description": text,
+                "color": color
+            }
+        ]
     }
 
-    buf += colored + "\n";
-  }
 
-  if (buf !== "```ansi\n") {
-    buf += "```";
-    messages.push(buf);
-  }
+def send_to_discord(payload: dict):
+    requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
 
-  return messages;
-}
 
-// --- Example log source: tail a local file ---
-// Replace this with your actual per-tribe log capture pipeline.
-const LOG_FILE = path.join(__dirname, "valkyrie-tribe.log");
+# ============================================================
+# FTP LOG HANDLING
+# ============================================================
 
-// Basic file-tail (polling). For high volume, use a real tail library or stream.
-let lastSize = 0;
-function readNewLogLines() {
-  if (!fs.existsSync(LOG_FILE)) return [];
-  const stats = fs.statSync(LOG_FILE);
-  const size = stats.size;
+def fetch_log() -> str:
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+    ftp.login(FTP_USER, FTP_PASS)
 
-  // file rotated/truncated
-  if (size < lastSize) lastSize = 0;
+    lines = []
 
-  const fd = fs.openSync(LOG_FILE, "r");
-  const buf = Buffer.alloc(size - lastSize);
-  fs.readSync(fd, buf, 0, buf.length, lastSize);
-  fs.closeSync(fd);
+    def handle_line(line):
+        lines.append(line)
 
-  lastSize = size;
+    ftp.retrlines(f"RETR {FTP_LOG_PATH}", handle_line)
+    ftp.quit()
 
-  const text = buf.toString("utf8");
-  return text.split(/\r?\n/).filter(Boolean);
-}
+    return "\n".join(lines)
 
-// --- Discord client ---
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
 
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
-  const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) {
-    console.error("Target channel not found or not a text channel.");
-    process.exit(1);
-  }
 
-  console.log(`Sending Valkyrie tribe logs to #${channel.name} (${TARGET_CHANNEL_ID})`);
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-  // Poll every 2 seconds
-  setInterval(async () => {
-    try {
-      const newLines = readNewLogLines();
-      if (newLines.length === 0) return;
+def main():
+    print("Tribe log forwarder started")
 
-      const msgs = buildAnsiMessages(newLines);
+    last_hash = None
 
-      for (const m of msgs) {
-        await channel.send({ content: m });
-      }
-    } catch (err) {
-      console.error("Error sending logs:", err);
-    }
-  }, 2000);
-});
+    while True:
+        try:
+            log_text = fetch_log()
+            current_hash = hash_text(log_text)
 
-client.login(process.env.DISCORD_TOKEN);
+            if last_hash is None:
+                last_hash = current_hash
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if current_hash == last_hash:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            new_lines = log_text.splitlines()
+
+            for line in new_lines:
+                if TARGET_TRIBE.lower() in line.lower():
+                    payload = format_log_line(line)
+                    send_to_discord(payload)
+
+            last_hash = current_hash
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
