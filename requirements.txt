@@ -2,3 +2,5 @@ discord.py
 python-dotenv
 aioftp
 requests
+requests==2.32.3
+rcon==2.4.9
