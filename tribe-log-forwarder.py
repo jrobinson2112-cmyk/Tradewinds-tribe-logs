@@ -1,459 +1,388 @@
 import os
-import re
-import io
 import time
-import json
 import ftplib
-import asyncio
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 
-import discord
-from discord import app_commands
+import requests
 
 # ============================================================
-# LOGGING
+# CONFIG (ENV VARS)
 # ============================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("tribe-forwarder")
-
-# ============================================================
-# ENV / CONFIG
-# ============================================================
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 
-FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs").strip().rstrip("/")
-TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
+# Always read ONLY this directory + file
+FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs")
+LOG_FILE = os.getenv("LOG_FILE", "ShooterGame.log")  # ONLY this file
+
+# Tribe filter
+TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
+
+# Polling
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # seconds
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "10"))
 
-DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
-DISCORD_CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID) if DISCORD_CHANNEL_ID and DISCORD_CHANNEL_ID.isdigit() else None
+# State file (persists cursor + dedupe across restarts on Railway if disk persists)
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-STATE_PATH = "/tmp/tribe_forwarder_state.json"
+# Discord rate limit safety
+SEND_MIN_DELAY = float(os.getenv("SEND_MIN_DELAY", "0.35"))  # seconds between webhook posts
+MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "5"))  # keep it low to avoid 429 spikes
 
-ALLOWED_RE = re.compile(r"^(ShooterGame\.log|ServerGame\..*\.log)$", re.IGNORECASE)
-SKIP_SUBSTRINGS = ("backup", "failedwater", "crash", "crashstack")
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 # ============================================================
 # VALIDATION
 # ============================================================
-missing = []
-for name, val in [
-    ("DISCORD_TOKEN", DISCORD_TOKEN),
-    ("FTP_HOST", FTP_HOST),
-    ("FTP_USER", FTP_USER),
-    ("FTP_PASS", FTP_PASS),
-]:
-    if not val:
-        missing.append(name)
 
-if missing:
-    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+def require_env():
+    missing = []
+    if not FTP_HOST: missing.append("FTP_HOST")
+    if not FTP_USER: missing.append("FTP_USER")
+    if not FTP_PASS: missing.append("FTP_PASS")
+    if not DISCORD_WEBHOOK_URL: missing.append("DISCORD_WEBHOOK_URL")
+
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 # ============================================================
 # DISCORD FORMAT HELPERS
 # ============================================================
-def color_for_line(text: str) -> int:
+
+def classify_color(text: str) -> int:
+    """
+    Color-code like ARK tribe logs:
+    - claiming in purple
+    - taming in green
+    - deaths in red
+    - demolished in yellow
+    - otherwise neutral grey
+    """
     lower = text.lower()
+
     if "claimed" in lower or "claiming" in lower:
         return 0x9B59B6  # purple
     if "tamed" in lower or "taming" in lower:
         return 0x2ECC71  # green
-    if "killed" in lower or "died" in lower or "death" in lower:
+    if "killed" in lower or "died" in lower or "was killed" in lower or "was slain" in lower:
         return 0xE74C3C  # red
     if "demolished" in lower or "destroyed" in lower:
         return 0xF1C40F  # yellow
-    return 0x95A5A6  # default grey
 
-def strip_richcolor(text: str) -> str:
-    return re.sub(r"<\/?RichColor[^>]*>", "", text, flags=re.IGNORECASE)
+    return 0x95A5A6  # grey
 
-def make_embed(line: str) -> discord.Embed:
-    clean = strip_richcolor(line.strip())
-    return discord.Embed(description=clean, color=color_for_line(clean))
+
+def format_discord_payload(line: str) -> dict:
+    text = line.strip()
+    return {
+        "embeds": [
+            {
+                "description": text,
+                "color": classify_color(text),
+            }
+        ]
+    }
+
+
+def send_to_discord(payload: dict) -> Tuple[bool, Optional[float], str]:
+    """
+    Returns (ok, retry_after_seconds, message)
+    """
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+    except Exception as e:
+        return False, None, f"Webhook request failed: {e}"
+
+    if resp.status_code in (200, 204):
+        return True, None, "OK"
+
+    # Rate limit handling
+    if resp.status_code == 429:
+        try:
+            data = resp.json()
+            retry_after = float(data.get("retry_after", 1.0))
+        except Exception:
+            retry_after = 1.0
+        return False, retry_after, f"Discord webhook error 429: {resp.text}"
+
+    return False, None, f"Discord webhook error {resp.status_code}: {resp.text}"
+
+
+# ============================================================
+# STATE (cursor + dedupe)
+# ============================================================
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {
+            "offset": 0,
+            "seen": [],  # list of recent hashes
+            "last_active_size": 0,
+            "last_heartbeat_ts": 0,
+        }
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "offset": 0,
+            "seen": [],
+            "last_active_size": 0,
+            "last_heartbeat_ts": 0,
+        }
+
+
+def save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.warning(f"Could not save state: {e}")
+
+
+def line_fingerprint(line: str) -> str:
+    # Strong-ish stable dedupe key
+    return hashlib.sha256(line.strip().encode("utf-8", errors="ignore")).hexdigest()
+
+
+def remember_seen(state: dict, fp: str, limit: int = 2000) -> None:
+    seen = state.get("seen", [])
+    seen.append(fp)
+    if len(seen) > limit:
+        seen = seen[-limit:]
+    state["seen"] = seen
+
+
+def has_seen(state: dict, fp: str) -> bool:
+    return fp in state.get("seen", [])
+
 
 # ============================================================
 # FTP HELPERS
 # ============================================================
+
 def ftp_connect() -> ftplib.FTP:
     ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=20)
     ftp.login(FTP_USER, FTP_PASS)
     return ftp
 
-def ftp_list_logs(ftp: ftplib.FTP, logs_dir: str) -> List[str]:
+
+def ftp_cwd_logs(ftp: ftplib.FTP) -> None:
+    # Always operate relative to the logs dir
+    ftp.cwd(FTP_LOGS_DIR)
+
+
+def ftp_get_size_binary(ftp: ftplib.FTP, filename: str) -> Optional[int]:
+    """
+    Nitrado sometimes blocks SIZE in ASCII mode.
+    Force binary TYPE I, then try SIZE.
+    """
     try:
-        entries = ftp.nlst(logs_dir)
-    except ftplib.error_perm as e:
-        log.warning(f"NLST failed on {logs_dir}: {e}. Trying CWD + NLST.")
-        ftp.cwd("/")
-        ftp.cwd(logs_dir)
-        entries = ftp.nlst()
+        ftp.voidcmd("TYPE I")
+        return ftp.size(filename)
+    except Exception as e:
+        logging.warning(f"Could not get remote file size: {e}")
+        return None
 
-    names = []
-    for e in entries:
-        names.append(e.split("/")[-1])
-    return sorted(set(names))
 
-def ftp_size_binary(ftp: ftplib.FTP, remote_path: str) -> int:
+def ftp_read_from_offset(ftp: ftplib.FTP, filename: str, offset: int) -> Tuple[bytes, int]:
+    """
+    Reads file bytes from offset to end via RETR with rest parameter.
+    Returns (data, new_offset).
+    """
+    chunks: List[bytes] = []
+
+    def cb(b: bytes):
+        chunks.append(b)
+
+    # Ensure binary transfers
     ftp.voidcmd("TYPE I")
-    return ftp.size(remote_path)  # type: ignore
 
-def ftp_read_from_offset(ftp: ftplib.FTP, remote_path: str, offset: int) -> bytes:
-    ftp.voidcmd("TYPE I")
-    buf = io.BytesIO()
-    def _cb(chunk: bytes):
-        buf.write(chunk)
-    ftp.retrbinary(f"RETR {remote_path}", _cb, rest=offset)
-    return buf.getvalue()
+    # Use REST if offset > 0; otherwise read full (but we will set offset to end on first run)
+    if offset > 0:
+        ftp.retrbinary(f"RETR {filename}", cb, rest=offset)
+    else:
+        ftp.retrbinary(f"RETR {filename}", cb)
 
-def list_allowed(names: List[str]) -> List[str]:
+    data = b"".join(chunks)
+    return data, offset + len(data)
+
+
+# ============================================================
+# LOG PARSING
+# ============================================================
+
+def extract_matching_lines(text: str, target_tribe: str) -> List[str]:
+    """
+    Returns only lines that contain the target tribe string.
+    """
     out = []
-    for n in names:
-        lower = n.lower()
-        if any(s in lower for s in SKIP_SUBSTRINGS):
-            continue
-        if not ALLOWED_RE.match(n):
-            continue
-        out.append(n)
+    needle = target_tribe.lower()
+    for line in text.splitlines():
+        if needle in line.lower():
+            out.append(line)
     return out
 
-def pick_growing_log(ftp: ftplib.FTP, names: List[str], logs_dir: str, last_sizes: Dict[str, int]) -> Optional[str]:
-    """
-    Choose the log that is currently growing (or largest if all equal),
-    among ShooterGame.log and ServerGame*.log.
-    """
-    allowed = list_allowed(names)
-    if not allowed:
-        return None
-
-    sizes = {}
-    for n in allowed:
-        rp = f"{logs_dir}/{n}"
-        try:
-            sizes[n] = ftp_size_binary(ftp, rp)
-        except Exception:
-            # ignore files we can't size
-            continue
-
-    if not sizes:
-        return None
-
-    # Prefer whichever increased since last time
-    best = None
-    best_delta = -1
-    best_size = -1
-
-    for n, sz in sizes.items():
-        prev = last_sizes.get(n, 0)
-        delta = sz - prev
-        if delta > best_delta or (delta == best_delta and sz > best_size):
-            best = n
-            best_delta = delta
-            best_size = sz
-
-    # Update last_sizes snapshot
-    last_sizes.clear()
-    last_sizes.update(sizes)
-
-    return best
 
 # ============================================================
-# STATE
+# MAIN LOOP
 # ============================================================
-@dataclass
-class ForwarderState:
-    active_file: Optional[str] = None
-    offset: int = 0
-    carry: str = ""
-    last_sent_line_hash: Optional[str] = None
-    last_sent_ts: float = 0.0
-    last_sizes: Dict[str, int] = None  # log_name -> last known size
-
-def load_state() -> ForwarderState:
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return ForwarderState(
-            active_file=d.get("active_file"),
-            offset=int(d.get("offset", 0)),
-            carry=d.get("carry", "") or "",
-            last_sent_line_hash=d.get("last_sent_line_hash"),
-            last_sent_ts=float(d.get("last_sent_ts", 0.0)),
-            last_sizes=d.get("last_sizes", {}) or {},
-        )
-    except Exception:
-        return ForwarderState(last_sizes={})
-
-def save_state(st: ForwarderState) -> None:
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({
-                "active_file": st.active_file,
-                "offset": st.offset,
-                "carry": st.carry,
-                "last_sent_line_hash": st.last_sent_line_hash,
-                "last_sent_ts": st.last_sent_ts,
-                "last_sizes": st.last_sizes or {},
-            }, f)
-    except Exception as e:
-        log.warning(f"Could not save state: {e}")
-
-def stable_hash(s: str) -> str:
-    return str(abs(hash(s)))
-
-# ============================================================
-# CORE LOGIC
-# ============================================================
-def filter_matching_lines(lines: List[str]) -> List[str]:
-    t = TARGET_TRIBE.lower()
-    return [ln for ln in lines if t in ln.lower()]
-
-async def send_embed_safely(channel: discord.abc.Messageable, embed: discord.Embed) -> bool:
-    try:
-        await channel.send(embed=embed)
-        return True
-    except discord.HTTPException as e:
-        log.error(f"Discord send failed: {e}")
-        return False
-
-async def check_for_new_lines_and_collect(st: ForwarderState) -> Tuple[Optional[str], List[str], str]:
-    ftp = None
-    try:
-        ftp = ftp_connect()
-        names = ftp_list_logs(ftp, FTP_LOGS_DIR)
-
-        if st.last_sizes is None:
-            st.last_sizes = {}
-
-        # Choose the log that's actually growing right now
-        active = pick_growing_log(ftp, names, FTP_LOGS_DIR, st.last_sizes)
-        if not active:
-            return None, [], f"No allowed logs found in {FTP_LOGS_DIR}"
-
-        remote_path = f"{FTP_LOGS_DIR}/{active}"
-
-        try:
-            remote_size = ftp_size_binary(ftp, remote_path)
-        except Exception as e:
-            return active, [], f"Could not get remote file size: {e}"
-
-        # If active file changed, reset cursor
-        if st.active_file != active:
-            log.info(f"Active log changed: {st.active_file} -> {active} (resetting cursor)")
-            st.active_file = active
-            st.offset = 0
-            st.carry = ""
-
-        # Handle rotation/truncation
-        if st.offset > remote_size:
-            log.info(f"Detected truncation/rotation (offset {st.offset} > size {remote_size}); resetting offset")
-            st.offset = 0
-            st.carry = ""
-
-        if remote_size == st.offset:
-            return active, [], f"Heartbeat: file={active} size={remote_size} offset={st.offset}->{st.offset} new_lines=0"
-
-        chunk = ftp_read_from_offset(ftp, remote_path, st.offset)
-        old_offset = st.offset
-        st.offset = remote_size
-
-        text = chunk.decode("utf-8", errors="replace")
-        if st.carry:
-            text = st.carry + text
-
-        # carry partial line
-        if text and not text.endswith("\n") and not text.endswith("\r"):
-            parts = text.splitlines(keepends=False)
-            if parts:
-                st.carry = parts[-1]
-                lines = parts[:-1]
-            else:
-                st.carry = text
-                lines = []
-        else:
-            st.carry = ""
-            lines = text.splitlines()
-
-        return active, lines, f"Heartbeat: file={active} size={remote_size} offset={old_offset}->{st.offset} new_lines={len(lines)}"
-
-    finally:
-        try:
-            if ftp:
-                ftp.quit()
-        except Exception:
-            pass
-
-# ============================================================
-# DISCORD BOT
-# ============================================================
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-state = load_state()
-last_known_channel_id: Optional[int] = None
-
-async def get_output_channel(interaction: Optional[discord.Interaction] = None) -> Optional[discord.abc.Messageable]:
-    global last_known_channel_id
-
-    if DISCORD_CHANNEL_ID_INT:
-        ch = client.get_channel(DISCORD_CHANNEL_ID_INT)
-        if ch:
-            return ch
-
-    if interaction and interaction.channel:
-        last_known_channel_id = interaction.channel.id
-        return interaction.channel
-
-    if last_known_channel_id:
-        ch = client.get_channel(last_known_channel_id)
-        if ch:
-            return ch
-
-    return None
-
-async def send_most_recent_matching(channel: discord.abc.Messageable, matching: List[str]) -> int:
-    if not matching:
-        return 0
-
-    most_recent = matching[-1].strip()
-    h = stable_hash(most_recent)
-
-    if state.last_sent_line_hash == h:
-        return 0
-
-    ok = await send_embed_safely(channel, make_embed(most_recent))
-    if ok:
-        state.last_sent_line_hash = h
-        state.last_sent_ts = time.time()
-        save_state(state)
-        return 1
-    return 0
-
-async def send_up_to_n_matching(channel: discord.abc.Messageable, lines: List[str], limit: int = 8) -> int:
-    match = filter_matching_lines(lines)
-    if not match:
-        return 0
-
-    to_send = match[-limit:]
-    sent = 0
-    for ln in to_send:
-        ln = ln.strip()
-        h = stable_hash(ln)
-        if state.last_sent_line_hash == h:
-            continue
-        ok = await send_embed_safely(channel, make_embed(ln))
-        if ok:
-            sent += 1
-            state.last_sent_line_hash = h
-            state.last_sent_ts = time.time()
-            save_state(state)
-            await asyncio.sleep(0.35)
-    return sent
-
-@tree.command(name="gettribelogs", description="Check FTP for new Tribe Valkyrie logs and post the latest.")
-async def gettribelogs(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    channel = await get_output_channel(interaction)
-    if channel is None:
-        await interaction.followup.send("I can't find a channel to post into. Set DISCORD_CHANNEL_ID or run the command in a text channel.", ephemeral=True)
-        return
-
-    active, new_lines, status = await check_for_new_lines_and_collect(state)
-    save_state(state)
-
-    sent = 0
-    if new_lines:
-        sent = await send_up_to_n_matching(channel, new_lines, limit=8)
-
-    await interaction.followup.send(
-        f"Checked `{active or 'none'}`. {status}\nSent `{sent}` message(s).",
-        ephemeral=True
-    )
-
-async def poll_loop():
-    await client.wait_until_ready()
-    log.info("Starting Container")
-    log.info(f"Polling every {POLL_INTERVAL:.1f} seconds")
-    log.info(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
-    log.info(f"Logs dir: {FTP_LOGS_DIR}")
-    log.info("Allowed logs: ShooterGame.log and ServerGame*.log (excluding backups/FailedWater/etc)")
-
-    first_run = True
-
-    while not client.is_closed():
-        try:
-            channel = await get_output_channel(None)
-            active, new_lines, status = await check_for_new_lines_and_collect(state)
-            save_state(state)
-
-            if active is None:
-                log.warning(status)
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            log.info(status)
-
-            if first_run:
-                log.info("First run: skipped backlog and started live from the end.")
-                first_run = False
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            if channel and new_lines:
-                matching = filter_matching_lines(new_lines)
-                sent = await send_most_recent_matching(channel, matching)
-                if sent:
-                    log.info("Sent 1 message to Discord")
-
-        except Exception as e:
-            log.error(f"Poll error: {e}")
-
-        await asyncio.sleep(POLL_INTERVAL)
-
-async def heartbeat_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        try:
-            await asyncio.sleep(HEARTBEAT_MINUTES * 60)
-            channel = await get_output_channel(None)
-            if not channel:
-                continue
-
-            now = time.time()
-            if state.last_sent_ts == 0 or (now - state.last_sent_ts) >= (HEARTBEAT_MINUTES * 60):
-                await channel.send(f"🫀 Heartbeat: No new logs since last check. (Filtering: {TARGET_TRIBE})")
-
-        except Exception as e:
-            log.error(f"Heartbeat error: {e}")
-
-@client.event
-async def on_ready():
-    try:
-        synced = await tree.sync()
-        log.info(f"Slash commands synced: {len(synced)}")
-    except Exception as e:
-        log.error(f"Failed to sync commands: {e}")
-
-    if not getattr(client, "_poll_task_started", False):
-        client._poll_task_started = True  # type: ignore
-        asyncio.create_task(poll_loop())
-        asyncio.create_task(heartbeat_loop())
 
 def main():
-    client.run(DISCORD_TOKEN)
+    require_env()
+
+    logging.info("Starting Container")
+    logging.info(f"Polling every {POLL_INTERVAL:.1f} seconds")
+    logging.info(f"Filtering: {TARGET_TRIBE}")
+    logging.info(f"Logs dir: {FTP_LOGS_DIR}")
+    logging.info(f"Reading ONLY: {LOG_FILE}")
+
+    state = load_state()
+    first_run = True
+
+    sent_since_last = 0
+    last_send_ts = 0.0
+
+    while True:
+        sent_this_poll = 0
+        new_matching_lines: List[str] = []
+
+        try:
+            ftp = ftp_connect()
+            try:
+                ftp_cwd_logs(ftp)
+
+                # Determine size (best-effort)
+                size = ftp_get_size_binary(ftp, LOG_FILE)
+
+                # If first run: start at end to avoid backlog spam
+                if first_run:
+                    if size is not None:
+                        state["offset"] = size
+                        state["last_active_size"] = size
+                        save_state(state)
+                        logging.info("First run: skipped backlog and started live from the end.")
+                    else:
+                        # No size available; safest is to read full once, then set offset to end
+                        data, new_offset = ftp_read_from_offset(ftp, LOG_FILE, 0)
+                        state["offset"] = new_offset
+                        state["last_active_size"] = new_offset
+                        save_state(state)
+                        logging.info("First run: SIZE unavailable; consumed file and started live from end.")
+                    first_run = False
+                    ftp.quit()
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # If file shrank (rotation), reset offset to 0
+                if size is not None and size < int(state.get("offset", 0)):
+                    logging.info(f"Log rotated (size {size} < offset {state['offset']}). Resetting offset to 0.")
+                    state["offset"] = 0
+
+                # Read new bytes
+                offset_before = int(state.get("offset", 0))
+                data, offset_after = ftp_read_from_offset(ftp, LOG_FILE, offset_before)
+                state["offset"] = offset_after
+
+                # Heartbeat line
+                effective_size = size if size is not None else offset_after
+                logging.info(
+                    f"Heartbeat: file={LOG_FILE} size={effective_size} offset={offset_before}->{offset_after} new_bytes={len(data)}"
+                )
+
+                ftp.quit()
+
+                if data:
+                    # decode bytes to text; tolerate odd bytes
+                    text = data.decode("utf-8", errors="ignore")
+                    new_matching_lines = extract_matching_lines(text, TARGET_TRIBE)
+
+            finally:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
+        except ftplib.error_perm as e:
+            logging.error(f"FTP permission/error: {e}")
+        except Exception as e:
+            logging.error(f"Error: {e}")
+
+        # If we found matching lines, send ONLY the most recent one (as requested)
+        if new_matching_lines:
+            most_recent = new_matching_lines[-1].strip()
+            fp = line_fingerprint(most_recent)
+
+            if not has_seen(state, fp):
+                payload = format_discord_payload(most_recent)
+
+                # Send with rate-limit aware retry
+                ok, retry_after, msg = send_to_discord(payload)
+                if not ok and retry_after:
+                    # wait and retry once
+                    time.sleep(retry_after)
+                    ok, retry_after2, msg2 = send_to_discord(payload)
+                    msg = msg2 if not ok else "OK after retry"
+
+                if ok:
+                    remember_seen(state, fp)
+                    save_state(state)
+                    sent_this_poll += 1
+                    sent_since_last += 1
+                    logging.info("Sent 1 message to Discord (most recent matching log).")
+                else:
+                    logging.error(msg)
+            else:
+                logging.info("Most recent matching line was already sent (deduped).")
+
+        # Heartbeat message to Discord every HEARTBEAT_MINUTES: "No new logs since last"
+        now = time.time()
+        last_hb = float(state.get("last_heartbeat_ts", 0))
+        if now - last_hb >= HEARTBEAT_MINUTES * 60:
+            # Only send heartbeat if we didn't send a log recently in this window
+            # (keeps noise down)
+            if sent_since_last == 0:
+                hb_payload = {
+                    "embeds": [
+                        {
+                            "description": "No new logs since last check.",
+                            "color": 0x95A5A6,
+                        }
+                    ]
+                }
+                ok, retry_after, msg = send_to_discord(hb_payload)
+                if not ok and retry_after:
+                    time.sleep(retry_after)
+                    ok, _, _ = send_to_discord(hb_payload)
+                if ok:
+                    logging.info("Sent heartbeat to Discord.")
+                else:
+                    logging.warning(f"Heartbeat send failed: {msg}")
+
+            # reset heartbeat window
+            state["last_heartbeat_ts"] = now
+            sent_since_last = 0
+            save_state(state)
+
+        # Respect delay between polls
+        time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
