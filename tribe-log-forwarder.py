@@ -4,7 +4,7 @@ import json
 import re
 import ftplib
 import hashlib
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import requests
 
@@ -19,20 +19,25 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Logs directory on your server
 FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "arksa/ShooterGame/Saved/Logs").rstrip("/")
 
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
 STATE_FILE = "cursor.json"
+
+# Behavior toggles
 SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
+SEND_LATEST_ON_START = os.getenv("SEND_LATEST_ON_START", "true").lower() in ("1", "true", "yes")
+
+# How many bytes from the end to inspect when sending "latest on start"
+TAIL_BYTES = int(os.getenv("TAIL_BYTES", "200000"))  # ~200 KB
 
 # Only these log types are allowed
 ALLOW_EXACT = {"shootergame.log"}
-ALLOW_PREFIX = ("servergame",)  # ServerGame.12345.2026...log etc.
+ALLOW_PREFIX = ("servergame",)
 
-# Always ignore these patterns (case-insensitive substring match)
+# Always ignore these patterns
 DENY_SUBSTRINGS = (
     "-backup-",
     "failedwaterdinospawns",
@@ -52,7 +57,6 @@ for k, v in [
 ]:
     if not v:
         missing.append(k)
-
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
@@ -77,7 +81,7 @@ def line_color(text: str) -> int:
         return 0xE74C3C  # red
     if "demolished" in lower or "destroyed" in lower:
         return 0xF1C40F  # yellow
-    return 0x95A5A6      # grey
+    return 0x95A5A6      # default
 
 def format_payload(line: str) -> dict:
     txt = clean_ark_text(line)
@@ -107,7 +111,7 @@ def hash_line(line: str) -> str:
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"path": None, "offset": 0, "initialized": False, "last_hash": None}
+        return {"path": None, "offset": 0, "initialized": False, "last_hash": None, "sizes": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
@@ -116,14 +120,21 @@ def load_state() -> dict:
             "offset": int(s.get("offset", 0)),
             "initialized": bool(s.get("initialized", False)),
             "last_hash": s.get("last_hash"),
+            "sizes": s.get("sizes", {}) or {},
         }
     except Exception:
-        return {"path": None, "offset": 0, "initialized": False, "last_hash": None}
+        return {"path": None, "offset": 0, "initialized": False, "last_hash": None, "sizes": {}}
 
-def save_state(path: str, offset: int, initialized: bool, last_hash: Optional[str]) -> None:
+def save_state(path: str, offset: int, initialized: bool, last_hash: Optional[str], sizes: Dict[str, int]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"path": path, "offset": int(offset), "initialized": bool(initialized), "last_hash": last_hash},
+            {
+                "path": path,
+                "offset": int(offset),
+                "initialized": bool(initialized),
+                "last_hash": last_hash,
+                "sizes": sizes,
+            },
             f,
         )
 
@@ -136,9 +147,8 @@ def ftp_connect() -> ftplib.FTP:
     ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.set_pasv(True)
-    # binary mode helps SIZE on many servers
     try:
-        ftp.voidcmd("TYPE I")
+        ftp.voidcmd("TYPE I")  # binary mode (helps SIZE)
     except Exception:
         pass
     return ftp
@@ -152,18 +162,13 @@ def ftp_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
 
 def is_allowed_log(path: str) -> bool:
     base = path.split("/")[-1].lower()
-
-    # deny patterns
     for bad in DENY_SUBSTRINGS:
         if bad in base:
             return False
-
-    # allow list
     if base in ALLOW_EXACT:
         return True
     if any(base.startswith(pfx) for pfx in ALLOW_PREFIX) and base.endswith(".log"):
         return True
-
     return False
 
 def ftp_list_allowed_logs(ftp: ftplib.FTP, log_dir: str) -> List[str]:
@@ -179,25 +184,7 @@ def ftp_list_allowed_logs(ftp: ftplib.FTP, log_dir: str) -> List[str]:
         path = n if "/" in n else f"{log_dir}/{n}"
         if is_allowed_log(path):
             full_paths.append(path)
-
     return full_paths
-
-def choose_active_log(ftp: ftplib.FTP, log_dir: str) -> Optional[str]:
-    logs = ftp_list_allowed_logs(ftp, log_dir)
-    if not logs:
-        return None
-
-    # Prefer ShooterGame.log if present, otherwise choose the largest ServerGame*.log
-    shooter = [p for p in logs if p.split("/")[-1].lower() == "shootergame.log"]
-    if shooter:
-        return shooter[0]
-
-    info = []
-    for p in logs:
-        sz = ftp_size(ftp, p)
-        info.append((p, sz if sz is not None else -1))
-    info.sort(key=lambda t: t[1], reverse=True)
-    return info[0][0]
 
 def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
     buf = bytearray()
@@ -227,6 +214,66 @@ def fetch_new_lines(path: str, offset: int) -> Tuple[int, List[str], Optional[in
         except Exception:
             pass
 
+def fetch_tail_lines(path: str, tail_bytes: int) -> Tuple[int, List[str], Optional[int]]:
+    ftp = ftp_connect()
+    try:
+        size = ftp_size(ftp, path)
+        if size is None:
+            # fallback: read from 0 (not ideal)
+            start = 0
+        else:
+            start = max(0, size - tail_bytes)
+
+        raw = ftp_read_from_offset(ftp, path, start)
+        text = raw.decode("utf-8", errors="ignore")
+        return (size if size is not None else start + len(raw)), text.splitlines(), size
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+# =========================
+# LOG SELECTION (FOLLOW THE GROWING LOG)
+# =========================
+
+def pick_growing_log(logs: List[str], sizes_now: Dict[str, int], sizes_prev: Dict[str, int], current: Optional[str]) -> Optional[str]:
+    # Choose log with biggest positive growth since last check
+    best = None
+    best_delta = 0
+
+    for p in logs:
+        now = sizes_now.get(p, -1)
+        prev = sizes_prev.get(p, -1)
+        if now >= 0 and prev >= 0:
+            delta = now - prev
+            if delta > best_delta:
+                best_delta = delta
+                best = p
+
+    # If something grew, follow it
+    if best and best_delta > 0:
+        return best
+
+    # Otherwise keep current if it still exists
+    if current in logs:
+        return current
+
+    # Fallback: prefer ShooterGame.log if present
+    for p in logs:
+        if p.split("/")[-1].lower() == "shootergame.log":
+            return p
+
+    # Otherwise pick largest
+    biggest = None
+    biggest_sz = -1
+    for p in logs:
+        sz = sizes_now.get(p, -1)
+        if sz > biggest_sz:
+            biggest_sz = sz
+            biggest = p
+    return biggest
+
 # =========================
 # MAIN
 # =========================
@@ -243,66 +290,79 @@ def main():
     offset = int(state.get("offset", 0))
     initialized = bool(state.get("initialized", False))
     last_hash = state.get("last_hash")
-
-    ftp = ftp_connect()
-    try:
-        chosen = choose_active_log(ftp, FTP_LOG_DIR)
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
-
-    if not chosen:
-        raise RuntimeError(f"No allowed logs found in directory: {FTP_LOG_DIR}. Expected ShooterGame.log or ServerGame*.log")
-
-    if current_path != chosen:
-        print(f"Active log selected: {chosen}")
-        current_path = chosen
-        offset = 0
-        initialized = False
-        last_hash = None
+    sizes_prev: Dict[str, int] = {k: int(v) for k, v in (state.get("sizes") or {}).items()}
 
     while True:
         try:
-            # Re-evaluate active log in case server switched live file
             ftp = ftp_connect()
             try:
-                latest = choose_active_log(ftp, FTP_LOG_DIR)
+                allowed = ftp_list_allowed_logs(ftp, FTP_LOG_DIR)
+                if not allowed:
+                    print(f"No allowed logs found in directory: {FTP_LOG_DIR}")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                sizes_now: Dict[str, int] = {}
+                for p in allowed:
+                    sz = ftp_size(ftp, p)
+                    if sz is not None:
+                        sizes_now[p] = sz
+
+                chosen = pick_growing_log(allowed, sizes_now, sizes_prev, current_path)
             finally:
                 try:
                     ftp.quit()
                 except Exception:
                     pass
 
-            if not latest:
-                print("No allowed logs found this poll.")
+            if not chosen:
+                print("No chosen log this poll.")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if latest != current_path:
-                print(f"Log target changed: {current_path} -> {latest} (resetting cursor)")
-                current_path = latest
+            if chosen != current_path:
+                print(f"Log target changed: {current_path} -> {chosen} (resetting cursor)")
+                current_path = chosen
                 offset = 0
                 initialized = False
-                last_hash = None
-
-            new_offset, lines, size = fetch_new_lines(current_path, offset)
+                # keep last_hash so we still dedupe the “latest” line if it repeats across logs
 
             base = current_path.split("/")[-1]
+
+            # Startup behavior: skip backlog BUT send the latest matching line once
+            if not initialized and SKIP_BACKLOG_ON_FIRST_RUN and SEND_LATEST_ON_START:
+                end_offset, tail_lines, size = fetch_tail_lines(current_path, TAIL_BYTES)
+                most_recent = None
+                for line in reversed(tail_lines):
+                    if TARGET_TRIBE.lower() in line.lower():
+                        most_recent = line
+                        break
+                if most_recent:
+                    h = hash_line(most_recent)
+                    if h != last_hash:
+                        send_to_discord(format_payload(most_recent))
+                        last_hash = h
+                        print("Sent latest matching line on startup.")
+                    else:
+                        print("Startup latest already sent (deduped).")
+                else:
+                    print("No matching Valkyrie line found in tail on startup.")
+
+                offset = end_offset
+                initialized = True
+                sizes_prev = sizes_now
+                save_state(current_path, offset, initialized, last_hash, sizes_prev)
+                print("First run: started live from the end.")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Normal polling
+            new_offset, lines, size = fetch_new_lines(current_path, offset)
+
             if size is not None:
                 print(f"Heartbeat: file={base} size={size} offset={offset}->{new_offset} new_lines={len(lines)}")
             else:
                 print(f"Heartbeat: file={base} offset={offset}->{new_offset} new_lines={len(lines)} (SIZE n/a)")
-
-            # First run: optionally skip backlog
-            if not initialized and SKIP_BACKLOG_ON_FIRST_RUN:
-                offset = new_offset
-                initialized = True
-                save_state(current_path, offset, initialized, last_hash)
-                print("First run: skipped backlog and started live from the end.")
-                time.sleep(POLL_INTERVAL)
-                continue
 
             offset = new_offset
 
@@ -326,7 +386,8 @@ def main():
                     print("No matching Valkyrie line in the new chunk.")
 
             initialized = True
-            save_state(current_path, offset, initialized, last_hash)
+            sizes_prev = sizes_now
+            save_state(current_path, offset, initialized, last_hash, sizes_prev)
 
         except Exception as e:
             print(f"Error: {e}")
