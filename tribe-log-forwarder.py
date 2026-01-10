@@ -17,8 +17,8 @@ FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 
-# Directory containing logs (your value is correct)
-FTP_LOG_DIR = os.getenv("FTP_LOG_DIR")  # e.g. arksa/ShooterGame/Saved/Logs
+# Directory containing logs (example: arksa/ShooterGame/Saved/Logs)
+FTP_LOG_DIR = os.getenv("FTP_LOG_DIR")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
@@ -33,6 +33,7 @@ missing = [k for k, v in {
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
+# Discord embed colors (decimal ints)
 COLOR_CLAIM = 0x9B59B6   # purple
 COLOR_TAME  = 0x2ECC71   # green
 COLOR_DEATH = 0xE74C3C   # red
@@ -42,6 +43,7 @@ COLOR_OTHER = 0x95A5A6   # grey
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -55,9 +57,11 @@ def load_state():
     except Exception:
         return {"file": None, "offsets": {}}
 
+
 def save_state(current_file, offsets):
     with open(STATE_FILE, "w") as f:
         json.dump({"file": current_file, "offsets": offsets}, f)
+
 
 def send_webhook(text, color):
     payload = {
@@ -82,6 +86,7 @@ def send_webhook(text, color):
     except Exception as e:
         print("Webhook failed:", e)
 
+
 def classify_color(line: str) -> int:
     l = line.lower()
     if "claimed" in l:
@@ -94,43 +99,77 @@ def classify_color(line: str) -> int:
         return COLOR_DEST
     return COLOR_OTHER
 
+
 def clean_line(line: str) -> str:
+    # remove <RichColor ...> tags, etc
     line = re.sub(r"<[^>]+>", "", line)
     return line.strip()
 
-def ensure_dir(ftp: ftplib.FTP, directory: str):
-    ftp.cwd(directory)
 
 def basename(path: str) -> str:
-    # Works for both "/" and "\" just in case
     return path.replace("\\", "/").split("/")[-1]
 
-def list_tribelog_files(ftp: ftplib.FTP) -> list[str]:
+
+def safe_nlst(ftp: ftplib.FTP, arg: str | None):
     """
-    Return entries that point to TribeLog_*.log.
-    The server may return either:
-      - "TribeLog_123.log"
-      - "arksa/ShooterGame/Saved/Logs/TribeLog_123.log"
-    We match on basename, but we return the original string so RETR works.
+    Some servers behave differently with nlst():
+      - nlst() returns filenames relative to cwd
+      - nlst(PATH) returns full paths (or fails)
     """
     try:
-        names = ftp.nlst()
-    except Exception:
-        names = []
-        lines = []
-        ftp.retrlines("LIST", lines.append)
-        for ln in lines:
-            parts = ln.split()
-            if parts:
-                names.append(parts[-1])
+        return ftp.nlst(arg) if arg else ftp.nlst()
+    except Exception as e:
+        print("nlst failed:", e)
+        return []
+
+
+def list_files_in_dir(ftp: ftplib.FTP, directory: str) -> list[str]:
+    """
+    Always try listing by passing the directory, because your server appears
+    to return full paths when listing from root.
+    Fallback to LIST <directory>.
+    """
+    names = safe_nlst(ftp, directory)
+    if names:
+        return names
+
+    # Fallback to LIST directory
+    lines = []
+    try:
+        ftp.retrlines(f"LIST {directory}", lines.append)
+    except Exception as e:
+        print("LIST failed:", e)
+        return []
+
+    out = []
+    for ln in lines:
+        parts = ln.split()
+        if parts:
+            out.append(parts[-1])
+    return out
+
+
+def list_tribelog_files(ftp: ftplib.FTP) -> list[str]:
+    entries = list_files_in_dir(ftp, FTP_LOG_DIR)
 
     tribe_logs = []
-    for n in names:
-        b = basename(n).lower()
+    for e in entries:
+        b = basename(e).lower()
         if b.startswith("tribelog_") and b.endswith(".log"):
-            tribe_logs.append(n)
+            tribe_logs.append(e)
+
+    if not tribe_logs:
+        # debug sample so we can see what the FTP is actually returning
+        sample = entries[:30]
+        if sample:
+            print("DEBUG: first entries returned for FTP_LOG_DIR:")
+            for s in sample[:10]:
+                print("  -", s)
+        else:
+            print("DEBUG: directory listing returned 0 entries for:", FTP_LOG_DIR)
 
     return tribe_logs
+
 
 def mdtm(ftp: ftplib.FTP, path_or_name: str) -> str | None:
     try:
@@ -139,11 +178,13 @@ def mdtm(ftp: ftplib.FTP, path_or_name: str) -> str | None:
     except Exception:
         return None
 
+
 def pick_latest_tribelog(ftp: ftplib.FTP) -> str | None:
     files = list_tribelog_files(ftp)
     if not files:
         return None
 
+    # Prefer MDTM newest if supported
     best = None
     best_ts = None
     for f in files:
@@ -154,11 +195,12 @@ def pick_latest_tribelog(ftp: ftplib.FTP) -> str | None:
             best = f
             best_ts = ts
 
-    if best is None:
-        # fallback: sort by basename to get the “last” one
-        return sorted(files, key=lambda x: basename(x).lower())[-1]
+    if best is not None:
+        return best
 
-    return best
+    # Fallback: sort by basename
+    return sorted(files, key=lambda x: basename(x).lower())[-1]
+
 
 def read_from_ftp_with_rest(ftp: ftplib.FTP, remote_path: str, start_offset: int) -> bytes:
     data = bytearray()
@@ -181,6 +223,7 @@ def read_from_ftp_with_rest(ftp: ftplib.FTP, remote_path: str, start_offset: int
 
     return bytes(data)
 
+
 def get_new_lines():
     state = load_state()
     offsets = state["offsets"]
@@ -189,8 +232,6 @@ def get_new_lines():
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         ftp.login(FTP_USER, FTP_PASS)
         ftp.set_pasv(True)
-
-        ensure_dir(ftp, FTP_LOG_DIR)
 
         latest = pick_latest_tribelog(ftp)
         if latest is None:
@@ -213,8 +254,11 @@ def get_new_lines():
         text = raw.decode(errors="ignore")
         return text.splitlines()
 
+
 def main():
+    print("Starting Container")
     print(f"Polling every {POLL_INTERVAL:.1f} seconds")
+
     while True:
         try:
             lines = get_new_lines()
@@ -236,6 +280,7 @@ def main():
             print("Error:", e)
 
         time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
