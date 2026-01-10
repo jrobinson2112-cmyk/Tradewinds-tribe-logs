@@ -4,6 +4,7 @@ import ftplib
 import json
 import re
 import requests
+from fnmatch import fnmatch
 
 # ============================================================
 # CONFIG (ENV VARS)
@@ -16,16 +17,19 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Path to log file on FTP
-FTP_LOG_PATH = os.getenv("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs/ShooterGame.log")
+# IMPORTANT:
+# - If this is a FILE path, we'll read that file
+# - If this is a DIRECTORY, we'll auto-pick the newest TribeLog_*.log inside it
+FTP_LOG_PATH = os.getenv("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs")
 
-# Tribe name to filter (you said “Valkyrie” / “Tribe Valkyrie”)
+# Pattern to pick tribe log files when FTP_LOG_PATH is a directory
+LOG_PATTERN = os.getenv("LOG_PATTERN", "TribeLog_*.log")
+
+# Tribe filter text (you can set to "Tribe Valkyrie" if you prefer)
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Valkyrie")
 
-# Poll interval (seconds)
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
-# Where we store our cursor so we only send each line once
 STATE_FILE = "cursor.json"
 
 # ============================================================
@@ -48,42 +52,30 @@ if missing:
 # ============================================================
 
 def clean_ark_tags(text: str) -> str:
-    # Strip <RichColor ...> etc
-    text = re.sub(r"<[^>]+>", "", text)
-    return text.strip()
+    # Strip any <RichColor ...> etc
+    return re.sub(r"<[^>]+>", "", text).strip()
 
 
 def format_log_line(line: str) -> dict:
-    """
-    Returns Discord embed payload with color based on ARK log type
-    """
     text = clean_ark_tags(line)
+    lower = text.lower()
 
     color = 0x95A5A6  # default grey
-    lower = text.lower()
 
     if "claimed" in lower or "claiming" in lower:
         color = 0x9B59B6  # purple
-    elif "tamed" in lower or "taming" in lower or "froze baby" in lower:
+    elif "tamed" in lower or "taming" in lower:
         color = 0x2ECC71  # green
-    elif "was killed" in lower or "killed" in lower or "died" in lower or "starved" in lower:
+    elif "was killed" in lower or "killed" in lower or "died" in lower:
         color = 0xE74C3C  # red
     elif "demolished" in lower or "destroyed" in lower:
         color = 0xF1C40F  # yellow
 
-    return {
-        "embeds": [
-            {
-                "description": text[:4096],
-                "color": color
-            }
-        ]
-    }
+    return {"embeds": [{"description": text[:4096], "color": color}]}
 
 
 def send_to_discord(payload: dict):
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-    # Useful if webhook is failing (401/404/429 etc)
     if r.status_code >= 300:
         raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:300]}")
 
@@ -94,24 +86,26 @@ def send_to_discord(payload: dict):
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"offset": 0}
+        return {"file": None, "offset": 0}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
+        if "file" not in s:
+            s["file"] = None
         if "offset" not in s:
             s["offset"] = 0
         return s
     except Exception:
-        return {"offset": 0}
+        return {"file": None, "offset": 0}
 
 
-def save_state(offset: int):
+def save_state(file_path: str, offset: int):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"offset": int(offset)}, f)
+        json.dump({"file": file_path, "offset": int(offset)}, f)
 
 
 # ============================================================
-# FTP LOG HANDLING (READ ONLY NEW BYTES)
+# FTP HELPERS
 # ============================================================
 
 def ftp_connect() -> ftplib.FTP:
@@ -122,14 +116,81 @@ def ftp_connect() -> ftplib.FTP:
     return ftp
 
 
-def ftp_get_size(ftp: ftplib.FTP, path: str) -> int | None:
+def ftp_is_directory(ftp: ftplib.FTP, path: str) -> bool:
     """
-    SIZE often fails in ASCII mode on some servers, but in binary it may work.
-    If it fails, we return None and still continue using REST read.
+    Best-effort: try CWD into it. If it works, it's a directory.
+    """
+    current = ftp.pwd()
+    try:
+        ftp.cwd(path)
+        ftp.cwd(current)
+        return True
+    except Exception:
+        try:
+            ftp.cwd(current)
+        except Exception:
+            pass
+        return False
+
+
+def ftp_list_files(ftp: ftplib.FTP, directory: str) -> list[str]:
+    """
+    Returns list of filenames (not full paths) in a directory.
     """
     try:
+        return ftp.nlst(directory)
+    except Exception:
+        # Some servers return full paths; try cwd+nlst
+        ftp.cwd(directory)
+        names = ftp.nlst()
+        return [f"{directory.rstrip('/')}/{n}" for n in names]
+
+
+def ftp_mdtm(ftp: ftplib.FTP, path: str) -> str | None:
+    """
+    Returns MDTM string like '20260110074231' if supported, else None.
+    """
+    try:
+        resp = ftp.sendcmd(f"MDTM {path}")
+        # response like: '213 20260110074231'
+        parts = resp.split()
+        if len(parts) >= 2:
+            return parts[1].strip()
+        return None
+    except Exception:
+        return None
+
+
+def pick_newest_log(ftp: ftplib.FTP, directory: str, pattern: str) -> str | None:
+    """
+    Pick newest file matching pattern using MDTM if possible, otherwise by name.
+    """
+    files = ftp_list_files(ftp, directory)
+    matches = [p for p in files if fnmatch(os.path.basename(p), pattern)]
+
+    if not matches:
+        return None
+
+    # Try MDTM sorting first
+    scored = []
+    for p in matches:
+        ts = ftp_mdtm(ftp, p)
+        scored.append((ts or "", p))
+
+    # If any have MDTM, sort by that
+    if any(ts for ts, _ in scored):
+        scored.sort(key=lambda x: x[0])
+        return scored[-1][1]
+
+    # Fallback: sort by filename
+    matches.sort()
+    return matches[-1]
+
+
+def ftp_get_size(ftp: ftplib.FTP, path: str) -> int | None:
+    try:
         try:
-            ftp.voidcmd("TYPE I")  # binary mode
+            ftp.voidcmd("TYPE I")
         except Exception:
             pass
         resp = ftp.sendcmd(f"SIZE {path}")
@@ -144,39 +205,65 @@ def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
     def cb(chunk: bytes):
         data.extend(chunk)
 
-    # Ensure binary mode so REST offsets are bytes
     try:
-        ftp.voidcmd("TYPE I")
+        ftp.voidcmd("TYPE I")  # binary mode so offsets are bytes
     except Exception:
         pass
 
-    # REST is supported by most FTP servers
     ftp.retrbinary(f"RETR {path}", cb, rest=offset)
     return bytes(data)
 
 
-def fetch_new_lines() -> list[str]:
+def resolve_log_target(ftp: ftplib.FTP) -> str:
+    """
+    If FTP_LOG_PATH is a directory, return newest TribeLog file in it.
+    If it's a file, return it.
+    """
+    path = FTP_LOG_PATH.rstrip("/")
+
+    if ftp_is_directory(ftp, path):
+        newest = pick_newest_log(ftp, path, LOG_PATTERN)
+        if not newest:
+            raise RuntimeError(f"No {LOG_PATTERN} files found in directory: {path}")
+        return newest
+
+    # Otherwise treat as file path
+    return path
+
+
+# ============================================================
+# MAIN FETCH (ONLY NEW LINES)
+# ============================================================
+
+def fetch_new_lines() -> tuple[str, list[str]]:
     state = load_state()
+    last_file = state.get("file")
     offset = int(state.get("offset", 0))
 
     ftp = ftp_connect()
     try:
-        size = ftp_get_size(ftp, FTP_LOG_PATH)
+        target_file = resolve_log_target(ftp)
 
-        # If the log rotated/truncated, reset cursor
+        # If the newest target changed (rotation/new tribe log), reset cursor
+        if target_file != last_file:
+            print(f"Log target changed: {last_file} -> {target_file} (resetting cursor)")
+            offset = 0
+
+        size = ftp_get_size(ftp, target_file)
         if size is not None and size < offset:
             print(f"Log shrank (rotation?) size={size} < offset={offset}. Resetting offset to 0.")
             offset = 0
 
-        raw = ftp_read_from_offset(ftp, FTP_LOG_PATH, offset)
+        raw = ftp_read_from_offset(ftp, target_file, offset)
         if not raw:
-            return []
+            save_state(target_file, offset)
+            return target_file, []
 
         new_offset = offset + len(raw)
-        save_state(new_offset)
+        save_state(target_file, new_offset)
 
         text = raw.decode("utf-8", errors="ignore")
-        return text.splitlines()
+        return target_file, text.splitlines()
 
     finally:
         try:
@@ -192,21 +279,20 @@ def fetch_new_lines() -> list[str]:
 def main():
     print("Tribe log forwarder started")
     print("FTP_LOG_PATH:", FTP_LOG_PATH)
+    print("LOG_PATTERN:", LOG_PATTERN)
     print("TARGET_TRIBE:", TARGET_TRIBE)
-    print(f"Polling every {POLL_INTERVAL:.1f}s")
+    print(f"Polling every {POLL_INTERVAL:.1f} seconds")
 
     while True:
         try:
-            lines = fetch_new_lines()
-
+            file_used, lines = fetch_new_lines()
             if lines:
-                print(f"Read {len(lines)} new lines")
+                print(f"Read {len(lines)} new lines from {file_used}")
 
             sent = 0
             for line in lines:
                 if TARGET_TRIBE.lower() in line.lower():
-                    payload = format_log_line(line)
-                    send_to_discord(payload)
+                    send_to_discord(format_log_line(line))
                     sent += 1
 
             if lines and sent == 0:
