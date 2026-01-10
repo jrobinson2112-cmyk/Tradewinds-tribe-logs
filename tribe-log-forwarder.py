@@ -6,7 +6,7 @@ import ftplib
 import hashlib
 import requests
 from collections import deque
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================
 # ENV CONFIG
@@ -19,31 +19,22 @@ FTP_PASS = os.getenv("FTP_PASS", "").strip()
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-# Logs directory on Nitrado (AUTO-detect if not set)
 FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "").strip()
+TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Valkyrie").strip()  # just "Valkyrie" is best
 
-# Filter
-TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie").strip()
-
-# Polling
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
-
-# Heartbeat ("No new logs since last check.")
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "10"))
 
-# Throttling (avoid 429 during backlog)
 MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "10"))
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.4"))
 
-# State persistence
 STATE_FILE = os.getenv("STATE_FILE", "tribe_forwarder_state.json").strip()
-
-# Dedupe size
 DEDUPE_CACHE_SIZE = int(os.getenv("DEDUPE_CACHE_SIZE", "4000"))
 
-# Backlog controls
 SEND_BACKLOG_ON_FIRST_RUN = os.getenv("SEND_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
-FORCE_BACKLOG = os.getenv("FORCE_BACKLOG", "0").lower() in ("1", "true", "yes")  # <--- NEW
+FORCE_BACKLOG = os.getenv("FORCE_BACKLOG", "0").lower() in ("1", "true", "yes")
+
+INCLUDE_YOUR_TRIBE = os.getenv("INCLUDE_YOUR_TRIBE", "0").lower() in ("1", "true", "yes")
 
 EXCLUDE_KEYWORDS = ("backup", "failedwater", "failed", ".crash", "crashstack")
 
@@ -65,10 +56,12 @@ if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 # ============================================================
-# REGEX / CLEANUP
+# PARSING / CLEANUP
 # ============================================================
 
-DAY_TIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}:\d{2}:\d{2})\s*:\s*(.+)$")
+# Find "Day 222, 07:06:04:" anywhere in the line, then capture the remainder.
+DAY_TIME_ANYWHERE_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}:\d{2}:\d{2})\s*:\s*(.*)", re.IGNORECASE)
+
 RICHCOLOR_RE = re.compile(r"<\s*RichColor[^>]*>", re.IGNORECASE)
 TAG_CLOSE_RE = re.compile(r"</\s*>", re.IGNORECASE)
 
@@ -77,28 +70,49 @@ def normalize_line(raw: str) -> str:
     s = RICHCOLOR_RE.sub("", s)
     s = TAG_CLOSE_RE.sub("", s)
 
-    # strip common end junk: </>), !), )), etc
-    s = re.sub(r"\s*<\s*/\s*>\s*\)*\s*$", "", s)   # </>)
-    s = re.sub(r"\s*!\s*\)*\s*$", "", s)          # !)
-    s = re.sub(r"\s*\)+\s*$", "", s)              # trailing ))
+    # remove trailing junk like </>), !)), )), etc
+    s = re.sub(r"\s*<\s*/\s*>\s*\)*\s*$", "", s)     # </>)
+    s = re.sub(r"\s*!\s*\)+\s*$", "", s)             # !))
+    s = re.sub(r"\s*\)+\s*$", "", s)                 # )))
     return s.strip()
 
+def is_valkyrie_line(line: str) -> bool:
+    l = line.lower()
+    t = TARGET_TRIBE.lower()
+
+    # Most common formats
+    if f"tribe {t}" in l:
+        return True
+    if f"({t})" in l:
+        return True
+
+    # Optional: include "Your Tribe ..." lines (these can be Valkyrie events)
+    if INCLUDE_YOUR_TRIBE and "your tribe" in l:
+        return True
+
+    return False
+
 def extract_display_text(line: str) -> Optional[str]:
-    if TARGET_TRIBE.lower() not in line.lower():
+    if not is_valkyrie_line(line):
         return None
 
     cleaned = normalize_line(line)
-    m = DAY_TIME_RE.search(cleaned)
+
+    m = DAY_TIME_ANYWHERE_RE.search(cleaned)
     if not m:
         return None
 
     day = m.group(1)
-    t = m.group(2)
-    rest = m.group(3).strip()
+    tm = m.group(2)
+    rest = (m.group(3) or "").strip()
 
-    # keep it clean
+    # Remove "Tribe Valkyrie, ID ...:" prefix if it still exists in the remainder (some lines do weird repeats)
     rest = re.sub(r"^Tribe\s+[^:]+:\s*", "", rest, flags=re.IGNORECASE).strip()
-    return f"Day {day}, {t} - {rest}"
+
+    # Make "Your Tribe killed ..." nicer (optional, doesn’t break other formats)
+    rest = rest.replace("Your Tribe", "Your Tribe")
+
+    return f"Day {day}, {tm} - {rest}".strip()
 
 def color_for_text(text: str) -> int:
     lower = text.lower()
@@ -231,13 +245,11 @@ def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
 
 def main():
     print(f"Polling every {POLL_INTERVAL}s")
-    print(f"Filtering: {TARGET_TRIBE}")
-    print(f"SEND_BACKLOG_ON_FIRST_RUN={SEND_BACKLOG_ON_FIRST_RUN}")
-    print(f"FORCE_BACKLOG={FORCE_BACKLOG}")
+    print(f"Filtering target: {TARGET_TRIBE} | INCLUDE_YOUR_TRIBE={INCLUDE_YOUR_TRIBE}")
+    print(f"SEND_BACKLOG_ON_FIRST_RUN={SEND_BACKLOG_ON_FIRST_RUN} | FORCE_BACKLOG={FORCE_BACKLOG}")
 
     state = load_state()
 
-    # If forcing backlog, wipe state so it truly behaves like first run.
     if FORCE_BACKLOG:
         state = {"offsets": {}, "dedupe": []}
         try:
@@ -273,13 +285,11 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Backlog behavior
             if first_run and SEND_BACKLOG_ON_FIRST_RUN:
                 for p in log_files:
                     offsets.setdefault(p, 0)
                 print("Backlog mode: reading from start of log files (offset=0).")
 
-            # For newly discovered files after first run, start at end
             if not first_run:
                 for p in log_files:
                     if p not in offsets:
@@ -296,7 +306,6 @@ def main():
 
                 off = offsets.get(p, 0)
 
-                # rotation/truncation
                 if current_size < off:
                     off = 0
 
@@ -346,16 +355,15 @@ def main():
 
             ftp.quit()
 
+            # Only flip out of backlog mode once we’ve actually processed at least one loop.
             if first_run and SEND_BACKLOG_ON_FIRST_RUN:
-                # After first successful scan, switch to live mode
                 first_run = False
                 save_state({"offsets": offsets, "dedupe": list(dedupe)})
-                print("Backlog complete. Now watching only newly appended logs.")
+                print("Backlog scan complete. Now watching only newly appended logs.")
 
         except Exception as e:
             print(f"Error: {e}")
 
-        # Heartbeat
         now = time.time()
         hb_interval = HEARTBEAT_MINUTES * 60
         if HEARTBEAT_MINUTES > 0 and (now - last_heartbeat_ts) >= hb_interval:
