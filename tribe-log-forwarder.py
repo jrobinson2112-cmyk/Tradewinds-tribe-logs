@@ -7,8 +7,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
+# ======================
+# Config
+# ======================
 TRIBE_NAME = "Tribe Valkyrie"
-POLL_INTERVAL = 5.0
+
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 STATE_FILE = "cursor.json"
 
 FTP_HOST = os.getenv("FTP_HOST")
@@ -16,45 +20,58 @@ FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 
-# If AUTO_PICK_LATEST_LOG=1, this is treated as a DIRECTORY to scan.
-# Otherwise it is treated as the exact file to read.
-FTP_LOG_FILE = os.getenv("FTP_LOG_FILE")  # e.g. arksa/ShooterGame/Saved/Logs/ShooterGame.log
-AUTO_PICK_LATEST_LOG = os.getenv("AUTO_PICK_LATEST_LOG", "0") == "1"
+# IMPORTANT: this is a DIRECTORY, not a file
+FTP_LOG_DIR = os.getenv("FTP_LOG_DIR")  # e.g. arksa/ShooterGame/Saved/Logs
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_LOG_FILE, DISCORD_WEBHOOK_URL]):
-    raise RuntimeError("Missing required environment variables")
+missing = [k for k, v in {
+    "FTP_HOST": FTP_HOST,
+    "FTP_USER": FTP_USER,
+    "FTP_PASS": FTP_PASS,
+    "FTP_LOG_DIR": FTP_LOG_DIR,
+    "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
+}.items() if not v]
 
+if missing:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+# Discord embed colors (decimal ints)
 COLOR_CLAIM = 0x9B59B6   # purple
 COLOR_TAME  = 0x2ECC71   # green
 COLOR_DEATH = 0xE74C3C   # red
 COLOR_DEST  = 0xF1C40F   # yellow
 COLOR_OTHER = 0x95A5A6   # grey
 
+
+# ======================
+# Helpers
+# ======================
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"path": None, "offset": 0}
+        return {"file": None, "offsets": {}}
     try:
         with open(STATE_FILE, "r") as f:
             s = json.load(f)
-            return {"path": s.get("path"), "offset": int(s.get("offset", 0))}
+        if "offsets" not in s or not isinstance(s["offsets"], dict):
+            s["offsets"] = {}
+        return {"file": s.get("file"), "offsets": s["offsets"]}
     except Exception:
-        return {"path": None, "offset": 0}
+        return {"file": None, "offsets": {}}
 
-def save_state(path, offset):
+def save_state(current_file, offsets):
     with open(STATE_FILE, "w") as f:
-        json.dump({"path": path, "offset": int(offset)}, f)
+        json.dump({"file": current_file, "offsets": offsets}, f)
 
 def send_webhook(text, color):
     payload = {
         "embeds": [{
             "description": text[:4096],
-            "color": color,
-            "timestamp": utc_now()
+            "color": int(color),
+            "timestamp": utc_now(),
         }]
     }
     data = json.dumps(payload).encode("utf-8")
@@ -62,7 +79,7 @@ def send_webhook(text, color):
         DISCORD_WEBHOOK_URL,
         data=data,
         headers={"Content-Type": "application/json"},
-        method="POST"
+        method="POST",
     )
     try:
         urllib.request.urlopen(req, timeout=20).read()
@@ -72,7 +89,7 @@ def send_webhook(text, color):
     except Exception as e:
         print("Webhook failed:", e)
 
-def classify_color(line):
+def classify_color(line: str) -> int:
     l = line.lower()
     if "claimed" in l:
         return COLOR_CLAIM
@@ -84,165 +101,151 @@ def classify_color(line):
         return COLOR_DEST
     return COLOR_OTHER
 
-def clean_line(line):
+def clean_line(line: str) -> str:
+    # remove ARK rich color tags, etc.
     line = re.sub(r"<[^>]+>", "", line)
     return line.strip()
 
-def split_dir_and_file(path):
-    path = path.strip()
-    if "/" not in path:
-        return "", path
-    d, f = path.rsplit("/", 1)
-    return d, f
+def ensure_dir(ftp: ftplib.FTP, directory: str):
+    # Some servers need absolute path / no leading slash differences; just try.
+    ftp.cwd(directory)
 
-def ftp_list_files(ftp, directory):
-    files = []
-    try:
-        ftp.cwd(directory)
-    except Exception:
-        return files
-
+def list_tribelog_files(ftp: ftplib.FTP) -> list[str]:
+    """
+    Return TribeLog_*.log files only, ignoring restart.log and everything else.
+    """
     try:
         names = ftp.nlst()
     except Exception:
-        return files
+        # fallback: try LIST parsing (less reliable)
+        names = []
+        lines = []
+        ftp.retrlines("LIST", lines.append)
+        for ln in lines:
+            parts = ln.split()
+            if parts:
+                names.append(parts[-1])
 
+    tribe_logs = []
     for n in names:
-        if n in (".", ".."):
-            continue
-        files.append(n)
-    return files
+        low = n.lower()
+        if low.startswith("tribelog_") and low.endswith(".log"):
+            tribe_logs.append(n)
 
-def ftp_mdtm(ftp, filename):
+    return tribe_logs
+
+def mdtm(ftp: ftplib.FTP, filename: str) -> str | None:
     try:
         resp = ftp.sendcmd(f"MDTM {filename}")
-        # resp like: "213 20260110071234"
-        ts = resp.split()[-1].strip()
-        return ts
+        # "213 20260110071234"
+        return resp.split()[-1].strip()
     except Exception:
         return None
 
-def pick_latest_log_path(ftp, base_path):
-    # base_path can be a directory or a file path; if it looks like a file, use its directory
-    base_dir, base_name = split_dir_and_file(base_path)
-
-    # If user gave a file and AUTO_PICK is enabled, scan the file's directory
-    directory = base_path if base_name == "" else base_dir
-    if directory == "":
-        directory = "."
-
-    candidates = ftp_list_files(ftp, directory)
-    if not candidates:
-        return base_path
-
-    # Prefer active-looking logs
-    preferred = []
-    for n in candidates:
-        ln = n.lower()
-        if ln == "shootergame.log" or ln.startswith("servergame.") or ln.startswith("shootergame-backup") is False:
-            if ln.endswith(".log"):
-                preferred.append(n)
-
-    if not preferred:
-        preferred = [n for n in candidates if n.lower().endswith(".log")]
+def pick_latest_tribelog(ftp: ftplib.FTP) -> str | None:
+    files = list_tribelog_files(ftp)
+    if not files:
+        return None
 
     best = None
     best_ts = None
-    for n in preferred:
-        ts = ftp_mdtm(ftp, n)
+    for f in files:
+        ts = mdtm(ftp, f)
         if ts is None:
             continue
         if best is None or ts > best_ts:
-            best = n
+            best = f
             best_ts = ts
 
+    # If MDTM not supported, just use lexicographically last as a fallback
     if best is None:
-        # fallback: if ShooterGame.log exists, use it
-        for n in candidates:
-            if n.lower() == "shootergame.log":
-                best = n
-                break
+        return sorted(files)[-1]
 
-    if best is None:
-        return base_path
+    return best
 
-    # return full path
-    if directory in (".", ""):
-        return best
-    return f"{directory}/{best}"
+def read_from_ftp_with_rest(ftp: ftplib.FTP, remote_file: str, start_offset: int) -> bytes:
+    """
+    Reads bytes starting from start_offset using REST (no SIZE needed).
+    If REST beyond EOF, server usually returns empty data.
+    """
+    data = bytearray()
 
-def read_new_lines():
+    def cb(chunk):
+        data.extend(chunk)
+
+    try:
+        # Switch to binary for REST/RETR
+        try:
+            ftp.voidcmd("TYPE I")
+        except Exception:
+            pass
+
+        ftp.retrbinary(f"RETR {remote_file}", cb, rest=start_offset)
+    except ftplib.error_perm as e:
+        # Some servers error if rest is beyond EOF; treat as no new data
+        msg = str(e)
+        if "550" in msg or "450" in msg or "426" in msg:
+            return b""
+        raise
+
+    return bytes(data)
+
+def get_new_lines():
     state = load_state()
-    last_path = state["path"]
-    offset = state["offset"]
+    offsets = state["offsets"]
 
     with ftplib.FTP() as ftp:
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         ftp.login(FTP_USER, FTP_PASS)
         ftp.set_pasv(True)
-        ftp.voidcmd("TYPE I")  # binary for SIZE + REST
 
-        target_path = FTP_LOG_FILE
+        ensure_dir(ftp, FTP_LOG_DIR)
 
-        if AUTO_PICK_LATEST_LOG:
-            # Choose newest log in the folder so we keep following active logs
-            target_path = pick_latest_log_path(ftp, FTP_LOG_FILE)
-
-        # If the log file changed (rotation/new active file), reset cursor
-        if last_path != target_path:
-            print(f"Log target changed: {last_path} -> {target_path} (resetting cursor)")
-            offset = 0
-
-        # Get size (handle rotation: if size < offset => reset)
-        try:
-            size = ftp.size(target_path)
-        except Exception as e:
-            print("Could not get remote file size:", e)
-            size = None
-
-        if size is not None and size < offset:
-            print(f"Detected rotation/truncation (size {size} < offset {offset}) -> resetting cursor")
-            offset = 0
-
-        if size is not None and size <= offset:
-            save_state(target_path, offset)
+        latest = pick_latest_tribelog(ftp)
+        if latest is None:
+            print("No TribeLog_*.log files found in directory:", FTP_LOG_DIR)
             return []
 
-        data = bytearray()
+        # If we switched to a new log file, we start at 0 for that file (unless we have an offset saved)
+        if state["file"] != latest:
+            print(f"Log target changed: {state['file']} -> {latest}")
+        current_offset = int(offsets.get(latest, 0))
 
-        def cb(chunk):
-            data.extend(chunk)
+        # Read from offset using REST (no SIZE)
+        raw = read_from_ftp_with_rest(ftp, latest, current_offset)
 
-        try:
-            ftp.retrbinary(f"RETR {target_path}", cb, rest=offset)
-        except ftplib.error_perm as e:
-            print("FTP permission/error:", e)
-            save_state(target_path, offset)
-            return []
-        except Exception as e:
-            print("FTP error:", e)
-            save_state(target_path, offset)
+        if not raw:
+            # No new bytes. Still persist current file so we keep tracking it.
+            save_state(latest, offsets)
             return []
 
-        # If we knew the size, use it. Otherwise update by bytes we read.
-        new_offset = size if size is not None else (offset + len(data))
-        save_state(target_path, new_offset)
+        # Advance offset by number of bytes read
+        new_offset = current_offset + len(raw)
+        offsets[latest] = new_offset
+        save_state(latest, offsets)
 
-        return data.decode(errors="ignore").splitlines()
+        text = raw.decode(errors="ignore")
+        return text.splitlines()
 
 def main():
-    print("Polling every", POLL_INTERVAL, "seconds")
+    print(f"Polling every {POLL_INTERVAL:.1f} seconds")
     while True:
         try:
-            lines = read_new_lines()
+            lines = get_new_lines()
             if lines:
                 print("Read", len(lines), "new lines")
+
             for line in lines:
                 if TRIBE_NAME not in line:
                     continue
+
                 clean = clean_line(line)
+                if not clean:
+                    continue
+
                 color = classify_color(clean)
                 send_webhook(clean, color)
+
         except Exception as e:
             print("Error:", e)
 
