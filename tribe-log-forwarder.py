@@ -1,520 +1,553 @@
-# tradewinds_bot.py
-# ------------------------------------------------------------
-# Tradewinds Bot + Tribe Log Forwarder (FTP -> Discord Webhook)
-#
-# Features added:
-#  - Background polling of Nitrado logs (ShooterGame.log + ServerGame*.log)
-#  - Filters ONLY "Tribe Valkyrie" lines
-#  - Sends ONLY the most recent matching log per check (prevents spam / rate limits)
-#  - Dedupes so the same log line is never sent twice
-#  - Slash command: /gettribelogs  (forces an immediate check)
-#  - Heartbeat every 10 minutes: "No new logs since last"
-#
-# ENV VARS REQUIRED:
-#   DISCORD_BOT_TOKEN
-#   DISCORD_WEBHOOK_URL
-#   FTP_HOST
-#   FTP_USER
-#   FTP_PASS
-#
-# ENV VARS OPTIONAL:
-#   FTP_PORT (default 21)
-#   FTP_LOGS_DIR (default arksa/ShooterGame/Saved/Logs)
-#   TARGET_TRIBE (default "Tribe Valkyrie")
-#   POLL_INTERVAL_SECONDS (default 10)
-#   HEARTBEAT_MINUTES (default 10)
-# ------------------------------------------------------------
-
 import os
 import re
+import io
 import time
 import json
 import ftplib
-import hashlib
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import requests
 import discord
 from discord import app_commands
 
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("tribe-forwarder")
 
 # ============================================================
 # ENV / CONFIG
 # ============================================================
-
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 
-FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs")
-TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
+FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs").strip().rstrip("/")
+TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie").strip()
 
-POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "10"))
 
-# Post limits (Discord webhooks have rate limits; keep it low)
-WEBHOOK_TIMEOUT_SECONDS = 10
+# Optional: pin output channel; otherwise we post where the slash command was used
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+DISCORD_CHANNEL_ID_INT = int(DISCORD_CHANNEL_ID) if DISCORD_CHANNEL_ID and DISCORD_CHANNEL_ID.isdigit() else None
 
+STATE_PATH = "/tmp/tribe_forwarder_state.json"
 
-def require_env():
-    missing = []
-    for k, v in [
-        ("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN),
-        ("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL),
-        ("FTP_HOST", FTP_HOST),
-        ("FTP_USER", FTP_USER),
-        ("FTP_PASS", FTP_PASS),
-    ]:
-        if not v:
-            missing.append(k)
-    if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+# Only allow these log names:
+# - ShooterGame.log
+# - ServerGame*.log
+ALLOWED_RE = re.compile(r"^(ShooterGame\.log|ServerGame\..*\.log)$", re.IGNORECASE)
 
+# Skip these (even if .log)
+SKIP_SUBSTRINGS = (
+    "backup",
+    "failedwater",
+    "crash",
+    "crashstack",
+)
 
 # ============================================================
-# DISCORD WEBHOOK HELPERS (color-coded like ARK tribe logs)
+# VALIDATION
+# ============================================================
+missing = []
+for name, val in [
+    ("DISCORD_TOKEN", DISCORD_TOKEN),
+    ("FTP_HOST", FTP_HOST),
+    ("FTP_USER", FTP_USER),
+    ("FTP_PASS", FTP_PASS),
+]:
+    if not val:
+        missing.append(name)
+
+if missing:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+# ============================================================
+# DISCORD FORMAT HELPERS
 # ============================================================
 
-RICHCOLOR_TAG_RE = re.compile(r"<\/?RichColor[^>]*>", re.IGNORECASE)
-ARK_TIMESTAMP_PREFIX_RE = re.compile(r"^\[[0-9\.\-:]+\]\[[0-9]+\]")  # strips [2026...][410] style prefix
-
-
-def clean_line(text: str) -> str:
-    t = text.strip()
-    t = RICHCOLOR_TAG_RE.sub("", t)
-    t = ARK_TIMESTAMP_PREFIX_RE.sub("", t).strip()
-    # Remove stray formatting artifacts
-    t = t.replace("!>)", "!").replace("!>)", "!")
-    return t.strip()
-
-
-def embed_payload_for_log_line(line: str) -> dict:
+def color_for_line(text: str) -> int:
     """
-    Returns a Discord webhook payload with embed color based on log type:
-      - claiming/claimed: purple
-      - taming/tamed: green
-      - deaths: red
-      - demolished/destroyed: yellow
-      - else: grey
+    Map ARK log type -> embed color
+    - claiming: purple
+    - taming: green
+    - deaths: red
+    - demolished: yellow
+    - default: neutral grey
     """
-    text = clean_line(line)
     lower = text.lower()
 
-    color = 0x95A5A6  # default grey
-
     if "claimed" in lower or "claiming" in lower:
-        color = 0x9B59B6  # purple
-    elif "tamed" in lower or "taming" in lower:
-        color = 0x2ECC71  # green
-    elif "killed" in lower or "died" in lower or "death" in lower:
-        color = 0xE74C3C  # red
-    elif "demolished" in lower or "destroyed" in lower:
-        color = 0xF1C40F  # yellow
+        return 0x9B59B6  # purple
+    if "tamed" in lower or "taming" in lower:
+        return 0x2ECC71  # green
+    if "killed" in lower or "died" in lower or "death" in lower:
+        return 0xE74C3C  # red
+    if "demolished" in lower or "destroyed" in lower:
+        return 0xF1C40F  # yellow
 
-    return {
-        "embeds": [
-            {
-                "description": text[:4096],  # Discord embed description limit
-                "color": color,
-            }
-        ]
-    }
+    return 0x95A5A6  # default grey
 
+def strip_richcolor(text: str) -> str:
+    # Removes <RichColor ...> tags while keeping inner content
+    # Example: <RichColor Color="...">Sir Magnus claimed...</>)
+    text = re.sub(r"<\/?RichColor[^>]*>", "", text, flags=re.IGNORECASE)
+    return text
 
-def send_webhook(payload: dict) -> Tuple[bool, Optional[float], str]:
-    """
-    Sends payload to Discord webhook.
-    Returns: (ok, retry_after_seconds_if_rate_limited, error_text)
-    """
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=WEBHOOK_TIMEOUT_SECONDS)
-        if r.status_code in (200, 204):
-            return True, None, ""
-        if r.status_code == 429:
-            try:
-                data = r.json()
-                retry_after = float(data.get("retry_after", 1.0))
-            except Exception:
-                retry_after = 1.0
-            return False, retry_after, f"Discord webhook rate limited (429): {r.text}"
-        return False, None, f"Discord webhook error {r.status_code}: {r.text}"
-    except Exception as e:
-        return False, None, f"Discord webhook exception: {e}"
-
-
-async def send_webhook_with_retry(payload: dict, max_retries: int = 5) -> bool:
-    """
-    Handles Discord webhook rate limiting automatically.
-    """
-    for _ in range(max_retries):
-        ok, retry_after, err = send_webhook(payload)
-        if ok:
-            return True
-        if retry_after is not None:
-            await asyncio.sleep(max(0.1, retry_after))
-            continue
-        # non-rate-limit error
-        print(err)
-        return False
-    return False
+def make_embed(line: str) -> discord.Embed:
+    clean = strip_richcolor(line.strip())
+    emb = discord.Embed(description=clean, color=color_for_line(clean))
+    return emb
 
 
 # ============================================================
-# FTP LOG READER (incremental tail)
+# FTP HELPERS
 # ============================================================
 
-ALLOWED_ACTIVE_LOG_RE = re.compile(r"^(ShooterGame\.log|ServerGame\..*\.log)$", re.IGNORECASE)
-EXCLUDE_RE = re.compile(r"(backup|FailedWater|crashstack)", re.IGNORECASE)
-
-
-def _ftp_connect() -> ftplib.FTP:
+def ftp_connect() -> ftplib.FTP:
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
     ftp.login(FTP_USER, FTP_PASS)
-    # Passive mode typically works best on hosting panels
-    ftp.set_pasv(True)
     return ftp
 
-
-def _ftp_listdir(ftp: ftplib.FTP, path: str) -> List[str]:
+def ftp_list_logs(ftp: ftplib.FTP, logs_dir: str) -> List[str]:
     """
-    Returns list of filenames within 'path'.
-    Uses MLSD if available, otherwise NLST.
+    Return list of filenames in logs_dir.
     """
-    names: List[str] = []
-
-    # Prefer MLSD (gives structured entries)
     try:
-        for entry in ftp.mlsd(path):
-            name, facts = entry
-            names.append(name)
-        return names
-    except Exception:
-        pass
+        entries = ftp.nlst(logs_dir)
+    except ftplib.error_perm as e:
+        # Some servers require cwd then nlst
+        log.warning(f"NLST failed on {logs_dir}: {e}. Trying CWD + NLST.")
+        ftp.cwd("/")
+        ftp.cwd(logs_dir)
+        entries = ftp.nlst()
 
-    # Fallback to NLST
-    try:
-        for item in ftp.nlst(path):
-            # NLST may return full paths; normalize to filename
-            name = item.split("/")[-1]
-            if name:
-                names.append(name)
-    except Exception:
-        pass
+    # Normalize to just filenames
+    names = []
+    for e in entries:
+        name = e.split("/")[-1]
+        names.append(name)
+    return sorted(set(names))
 
-    return names
-
-
-def pick_active_log_file(ftp: ftplib.FTP, logs_dir: str) -> Optional[str]:
+def pick_active_log(names: List[str]) -> Optional[str]:
     """
-    Chooses the "active" log file to tail:
-      - ShooterGame.log preferred
-      - else newest-ish ServerGame.*.log (by name; Nitrado usually rotates with timestamps)
-    Excludes backups and unrelated logs.
-    Returns full remote path.
+    Choose preferred log:
+    - ShooterGame.log if present
+    - else newest ServerGame*.log (lexicographically often correlates with time)
     """
-    names = _ftp_listdir(ftp, logs_dir)
-    if not names:
-        return None
-
-    # Filter allowed + exclude noise
-    allowed = []
+    filtered = []
     for n in names:
-        if EXCLUDE_RE.search(n):
+        lower = n.lower()
+        if any(s in lower for s in SKIP_SUBSTRINGS):
             continue
-        if ALLOWED_ACTIVE_LOG_RE.match(n):
-            allowed.append(n)
+        if not ALLOWED_RE.match(n):
+            continue
+        filtered.append(n)
 
-    if not allowed:
+    if not filtered:
         return None
 
     # Prefer ShooterGame.log
-    for n in allowed:
+    for n in filtered:
         if n.lower() == "shootergame.log":
-            return f"{logs_dir.rstrip('/')}/{n}"
+            return n
 
-    # Else pick the "largest-looking/newest name" ServerGame file by sorting
-    allowed.sort(reverse=True)
-    return f"{logs_dir.rstrip('/')}/{allowed[0]}"
+    # Otherwise, pick the "latest" servergame by sorting descending
+    filtered.sort(reverse=True)
+    return filtered[0]
 
-
-def ftp_get_size(ftp: ftplib.FTP, remote_path: str) -> Optional[int]:
+def ftp_size_binary(ftp: ftplib.FTP, remote_path: str) -> int:
     """
-    Returns remote file size in bytes if supported.
-    Some servers require TYPE I before SIZE.
+    Some servers refuse SIZE in ASCII mode.
+    We force TYPE I (binary) first.
     """
-    try:
-        ftp.voidcmd("TYPE I")
-    except Exception:
-        pass
-
-    try:
-        return ftp.size(remote_path)
-    except Exception as e:
-        # Common: "550 SIZE not allowed in ASCII mode" or missing file
-        print(f"Could not get remote file size: {e}")
-        return None
-
+    ftp.voidcmd("TYPE I")
+    return ftp.size(remote_path)  # type: ignore
 
 def ftp_read_from_offset(ftp: ftplib.FTP, remote_path: str, offset: int) -> bytes:
     """
-    Reads bytes from remote file starting at 'offset' using REST (binary).
-    If REST is not supported, falls back to reading the whole file.
+    Read bytes from remote_path starting at offset using REST.
     """
-    # Ensure binary
-    try:
-        ftp.voidcmd("TYPE I")
-    except Exception:
-        pass
+    ftp.voidcmd("TYPE I")
+    buf = io.BytesIO()
 
-    chunks: List[bytes] = []
+    def _cb(chunk: bytes):
+        buf.write(chunk)
 
-    # Try REST streaming
-    try:
-        conn = ftp.transfercmd(f"RETR {remote_path}", rest=offset)
-        while True:
-            block = conn.recv(8192)
-            if not block:
-                break
-            chunks.append(block)
-        conn.close()
-        try:
-            ftp.voidresp()
-        except Exception:
-            pass
-        return b"".join(chunks)
-    except Exception:
-        # Fallback: read entire file then slice
-        chunks.clear()
-        ftp.retrbinary(f"RETR {remote_path}", chunks.append)
-        data = b"".join(chunks)
-        if offset <= 0:
-            return data
-        return data[offset:]
+    # Use REST for resume
+    ftp.retrbinary(f"RETR {remote_path}", _cb, rest=offset)
+    return buf.getvalue()
 
-
-def split_new_lines(buffer: bytes) -> List[str]:
-    """
-    Converts raw bytes to lines safely.
-    """
-    text = buffer.decode("utf-8", errors="ignore")
-    # Normalise line breaks
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln for ln in text.split("\n") if ln.strip()]
-    return lines
+def bytes_to_lines(chunk: bytes) -> List[str]:
+    # Decode with replacement; keep consistent splitting
+    text = chunk.decode("utf-8", errors="replace")
+    # FTP chunk might start mid-line; we handle this with a carry buffer outside.
+    return text.splitlines()
 
 
 # ============================================================
-# STATE + CHECKER
+# STATE
 # ============================================================
 
 @dataclass
-class TribeLogState:
-    active_log_path: Optional[str] = None
+class ForwarderState:
+    active_file: Optional[str] = None
     offset: int = 0
-    last_sent_hash: Optional[str] = None
-    last_sent_at: float = 0.0
-    first_run_skipped_backlog: bool = False
+    carry: str = ""  # partial line carry
+    last_sent_line_hash: Optional[str] = None
+    last_sent_ts: float = 0.0  # unix time
+
+def load_state() -> ForwarderState:
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return ForwarderState(
+            active_file=d.get("active_file"),
+            offset=int(d.get("offset", 0)),
+            carry=d.get("carry", "") or "",
+            last_sent_line_hash=d.get("last_sent_line_hash"),
+            last_sent_ts=float(d.get("last_sent_ts", 0.0)),
+        )
+    except Exception:
+        return ForwarderState()
+
+def save_state(st: ForwarderState) -> None:
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "active_file": st.active_file,
+                "offset": st.offset,
+                "carry": st.carry,
+                "last_sent_line_hash": st.last_sent_line_hash,
+                "last_sent_ts": st.last_sent_ts,
+            }, f)
+    except Exception as e:
+        log.warning(f"Could not save state: {e}")
+
+def stable_hash(s: str) -> str:
+    # Fast stable hash without importing hashlib here
+    # (Discord dedupe only needs to prevent repeats)
+    return str(abs(hash(s)))
 
 
-STATE = TribeLogState()
+# ============================================================
+# CORE LOGIC
+# ============================================================
 
-
-def line_hash(line: str) -> str:
-    return hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def is_target_line(line: str) -> bool:
-    return TARGET_TRIBE.lower() in line.lower()
-
-
-async def check_for_new_logs(force: bool = False) -> bool:
+async def send_embed_safely(channel: discord.abc.Messageable, embed: discord.Embed) -> bool:
     """
-    Polls FTP log file for new content.
-    Sends ONLY the most recent matching line (Tribe Valkyrie) if new and not duplicate.
-    Returns True if it sent something.
+    Send with basic rate-limit friendliness.
+    Returns True if sent.
+    """
+    try:
+        await channel.send(embed=embed)
+        return True
+    except discord.HTTPException as e:
+        log.error(f"Discord send failed: {e}")
+        return False
+
+async def check_for_new_lines_and_collect(
+    st: ForwarderState,
+) -> Tuple[Optional[str], List[str], str]:
+    """
+    Connect to FTP, pick active log, read from st.offset, return:
+    (active_file, new_lines, status_message)
     """
     ftp = None
     try:
-        ftp = _ftp_connect()
+        ftp = ftp_connect()
+        try:
+            pwd = ftp.pwd()
+        except Exception:
+            pwd = "?"
+        names = ftp_list_logs(ftp, FTP_LOGS_DIR)
 
-        # Pick/refresh active log file each run (handles rotation)
-        active = pick_active_log_file(ftp, FTP_LOGS_DIR)
+        active = pick_active_log(names)
         if not active:
-            print(f"No allowed active logs found in directory: {FTP_LOGS_DIR}")
-            return False
+            return None, [], f"No allowed logs found in {FTP_LOGS_DIR}"
 
-        if STATE.active_log_path != active:
-            print(f"Active log selected: {active} (resetting cursor)")
-            STATE.active_log_path = active
-            STATE.offset = 0
-            STATE.first_run_skipped_backlog = False
+        remote_path = f"{FTP_LOGS_DIR}/{active}"
 
-        size = ftp_get_size(ftp, STATE.active_log_path)
-        if size is not None and size < STATE.offset:
-            # rotation/truncation
-            print("Remote log shrank (rotation/truncate). Resetting cursor.")
-            STATE.offset = 0
-            STATE.first_run_skipped_backlog = False
+        # Size + rotation handling
+        try:
+            remote_size = ftp_size_binary(ftp, remote_path)
+        except Exception as e:
+            return active, [], f"Could not get remote file size: {e}"
 
-        # On first run, skip backlog and start live from end (unless forced)
-        if not STATE.first_run_skipped_backlog and not force:
-            if size is None:
-                # If we can't size, read the whole thing once and set offset to len(data)
-                data = ftp_read_from_offset(ftp, STATE.active_log_path, 0)
-                STATE.offset = len(data)
+        # If switched active file, reset cursor
+        if st.active_file != active:
+            log.info(f"Active log changed: {st.active_file} -> {active} (resetting cursor)")
+            st.active_file = active
+            st.offset = 0
+            st.carry = ""
+
+        # If file truncated/rotated, reset
+        if st.offset > remote_size:
+            log.info(f"Detected truncation/rotation (offset {st.offset} > size {remote_size}); resetting offset")
+            st.offset = 0
+            st.carry = ""
+
+        if remote_size == st.offset:
+            return active, [], f"Heartbeat: file={active} size={remote_size} offset={st.offset}->{st.offset} new_lines=0"
+
+        chunk = ftp_read_from_offset(ftp, remote_path, st.offset)
+        new_offset = remote_size
+
+        # Convert bytes to text and preserve partial line carry
+        text = chunk.decode("utf-8", errors="replace")
+        if st.carry:
+            text = st.carry + text
+
+        # If chunk doesn't end with newline, keep last partial in carry
+        if text and not text.endswith("\n") and not text.endswith("\r"):
+            # Split off last line fragment
+            parts = text.splitlines(keepends=False)
+            if parts:
+                st.carry = parts[-1]
+                lines = parts[:-1]
             else:
-                STATE.offset = size
-            STATE.first_run_skipped_backlog = True
-            print("First run: skipped backlog and started live from the end.")
-            return False
+                st.carry = text
+                lines = []
+        else:
+            st.carry = ""
+            lines = text.splitlines()
 
-        # Read new bytes
-        data = ftp_read_from_offset(ftp, STATE.active_log_path, STATE.offset)
-        if not data:
-            return False
+        st.offset = new_offset
 
-        new_offset = STATE.offset + len(data)
-        lines = split_new_lines(data)
+        return active, lines, f"Heartbeat: file={active} size={remote_size} offset={st.offset - len(chunk)}->{st.offset} new_lines={len(lines)}"
 
-        print(f"Read {len(lines)} new lines (offset {STATE.offset}->{new_offset})")
-        STATE.offset = new_offset
-
-        # Filter lines and pick ONLY most recent matching entry
-        matches = [ln for ln in lines if is_target_line(ln)]
-        if not matches:
-            return False
-
-        most_recent = matches[-1]
-        h = line_hash(most_recent)
-
-        # Dedup (never send the same line twice)
-        if STATE.last_sent_hash == h:
-            return False
-
-        payload = embed_payload_for_log_line(most_recent)
-        ok = await send_webhook_with_retry(payload)
-        if ok:
-            STATE.last_sent_hash = h
-            STATE.last_sent_at = time.time()
-            return True
-        return False
-
-    except ftplib.error_perm as e:
-        print(f"FTP permission/error: {e}")
-        return False
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
     finally:
         try:
-            if ftp is not None:
+            if ftp:
                 ftp.quit()
         except Exception:
             pass
 
-
-# ============================================================
-# BACKGROUND TASKS
-# ============================================================
-
-async def tribe_polling_loop():
-    print(f"Polling every {POLL_INTERVAL_SECONDS:.1f} seconds")
-    print(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
-    print(f"Logs dir: {FTP_LOGS_DIR}")
-    while True:
-        try:
-            await check_for_new_logs(force=False)
-        except Exception as e:
-            print(f"Polling loop error: {e}")
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
-
-async def heartbeat_loop():
+def filter_matching_lines(lines: List[str]) -> List[str]:
     """
-    Every HEARTBEAT_MINUTES minutes, if nothing new has been sent, post a heartbeat message.
+    Only lines that contain TARGET_TRIBE (case-insensitive).
     """
-    interval = max(1, HEARTBEAT_MINUTES) * 60
-    while True:
-        try:
-            now = time.time()
-            # Only start heartbeats after we’ve started “live”
-            if STATE.first_run_skipped_backlog:
-                if STATE.last_sent_at == 0:
-                    # If nothing has ever been sent, still heartbeat
-                    payload = {
-                        "embeds": [{
-                            "description": "No new logs since last.",
-                            "color": 0x95A5A6
-                        }]
-                    }
-                    await send_webhook_with_retry(payload)
-                else:
-                    if (now - STATE.last_sent_at) >= interval:
-                        payload = {
-                            "embeds": [{
-                                "description": "No new logs since last.",
-                                "color": 0x95A5A6
-                            }]
-                        }
-                        await send_webhook_with_retry(payload)
-        except Exception as e:
-            print(f"Heartbeat error: {e}")
-        await asyncio.sleep(interval)
-
+    t = TARGET_TRIBE.lower()
+    out = []
+    for ln in lines:
+        if t in ln.lower():
+            out.append(ln)
+    return out
 
 # ============================================================
-# DISCORD BOT (Tradewinds base + tribe command)
+# DISCORD BOT
 # ============================================================
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+state = load_state()
+last_known_channel_id: Optional[int] = None
 
-@tree.command(name="gettribelogs", description="Check Nitrado logs now and post the latest Valkyrie tribe log (if any).")
+
+async def get_output_channel(interaction: Optional[discord.Interaction] = None) -> Optional[discord.abc.Messageable]:
+    global last_known_channel_id
+
+    # Prefer explicit env channel
+    if DISCORD_CHANNEL_ID_INT:
+        ch = client.get_channel(DISCORD_CHANNEL_ID_INT)
+        if ch:
+            return ch
+
+    # Else, prefer last interaction channel
+    if interaction and interaction.channel:
+        last_known_channel_id = interaction.channel.id
+        return interaction.channel
+
+    # Else, use remembered channel (if any)
+    if last_known_channel_id:
+        ch = client.get_channel(last_known_channel_id)
+        if ch:
+            return ch
+
+    return None
+
+
+async def send_most_recent_matching(channel: discord.abc.Messageable, lines: List[str]) -> int:
+    """
+    Sends ONLY the most recent matching line (to avoid rate limits).
+    Dedupes against last_sent_line_hash.
+    Returns number of messages sent (0 or 1).
+    """
+    if not lines:
+        return 0
+
+    most_recent = lines[-1].strip()
+    h = stable_hash(most_recent)
+
+    # Prevent duplicates
+    if state.last_sent_line_hash == h:
+        return 0
+
+    ok = await send_embed_safely(channel, make_embed(most_recent))
+    if ok:
+        state.last_sent_line_hash = h
+        state.last_sent_ts = time.time()
+        save_state(state)
+        return 1
+    return 0
+
+
+async def send_up_to_n_matching(channel: discord.abc.Messageable, lines: List[str], limit: int = 8) -> int:
+    """
+    Used by /gettribelogs: sends up to N newest matching lines.
+    Still dedupes by last_sent_line_hash to avoid repeats.
+    """
+    if not lines:
+        return 0
+
+    match = filter_matching_lines(lines)
+    if not match:
+        return 0
+
+    # Take newest N
+    to_send = match[-limit:]
+    sent = 0
+
+    for ln in to_send:
+        ln = ln.strip()
+        h = stable_hash(ln)
+        if state.last_sent_line_hash == h:
+            continue
+        ok = await send_embed_safely(channel, make_embed(ln))
+        if ok:
+            sent += 1
+            state.last_sent_line_hash = h
+            state.last_sent_ts = time.time()
+            save_state(state)
+            await asyncio.sleep(0.35)  # small spacing to avoid 429 bursts
+
+    return sent
+
+
+@tree.command(name="gettribelogs", description="Check FTP for new Tribe Valkyrie logs and post the latest.")
 async def gettribelogs(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    sent = await check_for_new_logs(force=True)
-    if sent:
-        await interaction.followup.send("✅ Posted the latest Valkyrie tribe log.", ephemeral=True)
-    else:
-        await interaction.followup.send("ℹ️ No new Valkyrie logs found.", ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    channel = await get_output_channel(interaction)
+    if channel is None:
+        await interaction.followup.send("I can't find a channel to post into. Set DISCORD_CHANNEL_ID or run the command in a text channel.", ephemeral=True)
+        return
+
+    active, new_lines, status = await check_for_new_lines_and_collect(state)
+    save_state(state)
+
+    # Filter tribe lines from the new chunk
+    matching = filter_matching_lines(new_lines)
+
+    sent = 0
+    if matching:
+        sent = await send_up_to_n_matching(channel, new_lines, limit=8)
+
+    await interaction.followup.send(
+        f"Checked `{active or 'none'}`. {status}\nSent `{sent}` message(s).",
+        ephemeral=True
+    )
 
 
-# ---- OPTIONAL: placeholder so you can paste your existing Tradewinds commands here ----
-# Add your existing time bot commands/events/tasks below this line if you want.
-# -------------------------------------------------------------------------------------
+async def poll_loop():
+    await client.wait_until_ready()
+    log.info("Starting Container")
+    log.info(f"Polling every {POLL_INTERVAL:.1f} seconds")
+    log.info(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
+    log.info(f"Logs dir: {FTP_LOGS_DIR}")
+    log.info("Allowed logs: ShooterGame.log and ServerGame*.log (excluding backups/FailedWater/etc)")
+
+    # On first run, skip backlog and start at end of current active file
+    first_run = True
+
+    while not client.is_closed():
+        try:
+            channel = await get_output_channel(None)
+            active, new_lines, status = await check_for_new_lines_and_collect(state)
+            save_state(state)
+
+            if active is None:
+                log.warning(status)
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            log.info(status)
+
+            if first_run:
+                # If we just read a backlog on first run, we skip it by jumping to end.
+                # Our fetch logic already moved offset to end; we simply don't send anything this cycle.
+                log.info("First run: skipped backlog and started live from the end.")
+                first_run = False
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            if channel and new_lines:
+                matching = filter_matching_lines(new_lines)
+                sent = await send_most_recent_matching(channel, matching)
+                if sent:
+                    log.info(f"Sent {sent} message to Discord")
+
+        except Exception as e:
+            log.error(f"Poll error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def heartbeat_loop():
+    await client.wait_until_ready()
+
+    while not client.is_closed():
+        try:
+            await asyncio.sleep(HEARTBEAT_MINUTES * 60)
+
+            channel = await get_output_channel(None)
+            if not channel:
+                continue
+
+            # If nothing sent in the last heartbeat window, say so
+            now = time.time()
+            if state.last_sent_ts == 0:
+                # Haven't sent anything ever
+                await channel.send(f"🫀 Heartbeat: No new logs since last check. (Filtering: {TARGET_TRIBE})")
+            else:
+                # If last sent is older than heartbeat interval, announce
+                if (now - state.last_sent_ts) >= (HEARTBEAT_MINUTES * 60):
+                    await channel.send(f"🫀 Heartbeat: No new logs since last check. (Filtering: {TARGET_TRIBE})")
+
+        except Exception as e:
+            log.error(f"Heartbeat error: {e}")
 
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (id={client.user.id})")
     try:
-        # Sync slash commands globally
-        await tree.sync()
-        print("Slash commands synced.")
+        synced = await tree.sync()
+        log.info(f"Slash commands synced: {len(synced)}")
     except Exception as e:
-        print(f"Slash command sync failed: {e}")
+        log.error(f"Failed to sync commands: {e}")
 
     # Start background tasks once
-    if not hasattr(client, "_tribe_tasks_started"):
-        client._tribe_tasks_started = True
-        client.loop.create_task(tribe_polling_loop())
-        client.loop.create_task(heartbeat_loop())
-        print("Tribe polling + heartbeat started.")
+    if not getattr(client, "_poll_task_started", False):
+        client._poll_task_started = True  # type: ignore
+        asyncio.create_task(poll_loop())
+        asyncio.create_task(heartbeat_loop())
 
 
 def main():
-    require_env()
-    print("Starting Container")
-    client.run(DISCORD_BOT_TOKEN)
+    client.run(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
