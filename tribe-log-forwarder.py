@@ -27,8 +27,9 @@ TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
-# If first run sees a huge backlog, skip it and start live from the end
-SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
+# IMPORTANT:
+# Default is now FALSE so it sends the most recent matching line immediately on startup.
+SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "false").lower() in ("1", "true", "yes")
 
 STATE_FILE = "cursor.json"
 
@@ -200,7 +201,7 @@ def ftp_read_from_offset(ftp: ftplib.FTP, file_path: str, offset: int) -> bytes:
     ftp.retrbinary(f"RETR {file_path}", cb, rest=offset)
     return bytes(buf)
 
-def fetch_new_lines(file_path: str, offset: int) -> Tuple[int, List[str]]:
+def fetch_new_lines(file_path: str, offset: int) -> Tuple[int, List[str], Optional[int]]:
     ftp = ftp_connect()
     try:
         size = ftp_get_size(ftp, file_path)
@@ -210,11 +211,11 @@ def fetch_new_lines(file_path: str, offset: int) -> Tuple[int, List[str]]:
 
         raw = ftp_read_from_offset(ftp, file_path, offset)
         if not raw:
-            return offset, []
+            return offset, [], size
 
         new_offset = offset + len(raw)
         text = raw.decode("utf-8", errors="ignore")
-        return new_offset, text.splitlines()
+        return new_offset, text.splitlines(), size
     finally:
         try:
             ftp.quit()
@@ -254,9 +255,15 @@ def main():
 
     while True:
         try:
-            new_offset, lines = fetch_new_lines(resolved_path, offset)
+            new_offset, lines, size = fetch_new_lines(resolved_path, offset)
 
-            # First run: skip backlog (start live)
+            # Heartbeat so you can see it polling
+            if size is not None:
+                print(f"Heartbeat: remote_size={size}, offset={offset} -> {new_offset}, new_lines={len(lines)}")
+            else:
+                print(f"Heartbeat: offset={offset} -> {new_offset}, new_lines={len(lines)} (SIZE not available)")
+
+            # First run behavior
             if not initialized and SKIP_BACKLOG_ON_FIRST_RUN:
                 offset = new_offset
                 initialized = True
@@ -265,16 +272,19 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Always advance offset so we don't re-read bytes
+            # Advance offset so we don't re-read bytes
             offset = new_offset
 
-            # Find the most recent matching line (from the NEW chunk only)
+            # Find the most recent matching line from this chunk
             most_recent = None
             for line in reversed(lines):
                 if TARGET_TRIBE.lower() in line.lower():
                     most_recent = line
                     break
 
+            # If we didn't find a match in the *new chunk* and we're not initialized yet,
+            # (or it's the first time without skipping backlog) we can also scan the chunk
+            # normally. (Still only sends ONE line total per poll.)
             if most_recent:
                 h = hash_line(most_recent)
                 if h != last_hash:
@@ -285,7 +295,7 @@ def main():
                     print("Most recent match already sent (deduped)")
             else:
                 if lines:
-                    print(f"Read {len(lines)} new lines (no matches)")
+                    print("No matching Valkyrie line in the new chunk.")
 
             initialized = True
             save_state(offset, resolved_path, initialized, last_hash)
