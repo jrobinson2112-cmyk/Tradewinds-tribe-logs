@@ -7,9 +7,6 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-# ======================
-# Config
-# ======================
 TRIBE_NAME = "Tribe Valkyrie"
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
@@ -20,7 +17,7 @@ FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
 
-# IMPORTANT: this is a DIRECTORY, not a file
+# Directory containing logs (your value is correct)
 FTP_LOG_DIR = os.getenv("FTP_LOG_DIR")  # e.g. arksa/ShooterGame/Saved/Logs
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -36,7 +33,6 @@ missing = [k for k, v in {
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# Discord embed colors (decimal ints)
 COLOR_CLAIM = 0x9B59B6   # purple
 COLOR_TAME  = 0x2ECC71   # green
 COLOR_DEATH = 0xE74C3C   # red
@@ -44,9 +40,6 @@ COLOR_DEST  = 0xF1C40F   # yellow
 COLOR_OTHER = 0x95A5A6   # grey
 
 
-# ======================
-# Helpers
-# ======================
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -102,22 +95,27 @@ def classify_color(line: str) -> int:
     return COLOR_OTHER
 
 def clean_line(line: str) -> str:
-    # remove ARK rich color tags, etc.
     line = re.sub(r"<[^>]+>", "", line)
     return line.strip()
 
 def ensure_dir(ftp: ftplib.FTP, directory: str):
-    # Some servers need absolute path / no leading slash differences; just try.
     ftp.cwd(directory)
+
+def basename(path: str) -> str:
+    # Works for both "/" and "\" just in case
+    return path.replace("\\", "/").split("/")[-1]
 
 def list_tribelog_files(ftp: ftplib.FTP) -> list[str]:
     """
-    Return TribeLog_*.log files only, ignoring restart.log and everything else.
+    Return entries that point to TribeLog_*.log.
+    The server may return either:
+      - "TribeLog_123.log"
+      - "arksa/ShooterGame/Saved/Logs/TribeLog_123.log"
+    We match on basename, but we return the original string so RETR works.
     """
     try:
         names = ftp.nlst()
     except Exception:
-        # fallback: try LIST parsing (less reliable)
         names = []
         lines = []
         ftp.retrlines("LIST", lines.append)
@@ -128,17 +126,16 @@ def list_tribelog_files(ftp: ftplib.FTP) -> list[str]:
 
     tribe_logs = []
     for n in names:
-        low = n.lower()
-        if low.startswith("tribelog_") and low.endswith(".log"):
+        b = basename(n).lower()
+        if b.startswith("tribelog_") and b.endswith(".log"):
             tribe_logs.append(n)
 
     return tribe_logs
 
-def mdtm(ftp: ftplib.FTP, filename: str) -> str | None:
+def mdtm(ftp: ftplib.FTP, path_or_name: str) -> str | None:
     try:
-        resp = ftp.sendcmd(f"MDTM {filename}")
-        # "213 20260110071234"
-        return resp.split()[-1].strip()
+        resp = ftp.sendcmd(f"MDTM {path_or_name}")
+        return resp.split()[-1].strip()  # "213 yyyymmddhhmmss"
     except Exception:
         return None
 
@@ -157,32 +154,26 @@ def pick_latest_tribelog(ftp: ftplib.FTP) -> str | None:
             best = f
             best_ts = ts
 
-    # If MDTM not supported, just use lexicographically last as a fallback
     if best is None:
-        return sorted(files)[-1]
+        # fallback: sort by basename to get the “last” one
+        return sorted(files, key=lambda x: basename(x).lower())[-1]
 
     return best
 
-def read_from_ftp_with_rest(ftp: ftplib.FTP, remote_file: str, start_offset: int) -> bytes:
-    """
-    Reads bytes starting from start_offset using REST (no SIZE needed).
-    If REST beyond EOF, server usually returns empty data.
-    """
+def read_from_ftp_with_rest(ftp: ftplib.FTP, remote_path: str, start_offset: int) -> bytes:
     data = bytearray()
 
     def cb(chunk):
         data.extend(chunk)
 
     try:
-        # Switch to binary for REST/RETR
         try:
-            ftp.voidcmd("TYPE I")
+            ftp.voidcmd("TYPE I")  # binary
         except Exception:
             pass
 
-        ftp.retrbinary(f"RETR {remote_file}", cb, rest=start_offset)
+        ftp.retrbinary(f"RETR {remote_path}", cb, rest=start_offset)
     except ftplib.error_perm as e:
-        # Some servers error if rest is beyond EOF; treat as no new data
         msg = str(e)
         if "550" in msg or "450" in msg or "426" in msg:
             return b""
@@ -206,22 +197,17 @@ def get_new_lines():
             print("No TribeLog_*.log files found in directory:", FTP_LOG_DIR)
             return []
 
-        # If we switched to a new log file, we start at 0 for that file (unless we have an offset saved)
         if state["file"] != latest:
             print(f"Log target changed: {state['file']} -> {latest}")
-        current_offset = int(offsets.get(latest, 0))
 
-        # Read from offset using REST (no SIZE)
+        current_offset = int(offsets.get(latest, 0))
         raw = read_from_ftp_with_rest(ftp, latest, current_offset)
 
         if not raw:
-            # No new bytes. Still persist current file so we keep tracking it.
             save_state(latest, offsets)
             return []
 
-        # Advance offset by number of bytes read
-        new_offset = current_offset + len(raw)
-        offsets[latest] = new_offset
+        offsets[latest] = current_offset + len(raw)
         save_state(latest, offsets)
 
         text = raw.decode(errors="ignore")
