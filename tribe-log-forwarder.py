@@ -1,382 +1,361 @@
 import os
 import re
-import time
 import json
-import ftplib
+import time
 import hashlib
+import logging
+from typing import List, Optional, Tuple
+
 import requests
-from collections import deque
-from typing import Dict, List, Optional, Tuple
+from rcon.source import Client  # pip install rcon
 
-# ============================================================
-# ENV CONFIG
-# ============================================================
 
-FTP_HOST = os.getenv("FTP_HOST", "").strip()
-FTP_PORT = int(os.getenv("FTP_PORT", "21"))
-FTP_USER = os.getenv("FTP_USER", "").strip()
-FTP_PASS = os.getenv("FTP_PASS", "").strip()
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("tribe-log-forwarder")
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "").strip()
-TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Valkyrie").strip()  # just "Valkyrie" is best
+# =========================
+# ENV / CONFIG
+# =========================
+RCON_HOST = os.getenv("RCON_HOST")
+RCON_PORT = int(os.getenv("RCON_PORT", "27020"))
+RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "10"))
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "10"))
-SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.4"))
+TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie").strip()
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "10"))
+HEARTBEAT_MINUTES = float(os.getenv("HEARTBEAT_MINUTES", "10"))
+MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "5"))
+SEND_BACKLOG = os.getenv("SEND_BACKLOG", "0").strip() == "1"
 
-STATE_FILE = os.getenv("STATE_FILE", "tribe_forwarder_state.json").strip()
-DEDUPE_CACHE_SIZE = int(os.getenv("DEDUPE_CACHE_SIZE", "4000"))
+RCON_COMMAND = os.getenv("RCON_COMMAND", "gettribelog").strip()
 
-SEND_BACKLOG_ON_FIRST_RUN = os.getenv("SEND_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
-FORCE_BACKLOG = os.getenv("FORCE_BACKLOG", "0").lower() in ("1", "true", "yes")
+STATE_PATH = os.getenv("STATE_PATH", "tribe_forwarder_state.json")
 
-INCLUDE_YOUR_TRIBE = os.getenv("INCLUDE_YOUR_TRIBE", "0").lower() in ("1", "true", "yes")
 
-EXCLUDE_KEYWORDS = ("backup", "failedwater", "failed", ".crash", "crashstack")
+def require_env():
+    missing = []
+    if not RCON_HOST:
+        missing.append("RCON_HOST")
+    if not RCON_PASSWORD:
+        missing.append("RCON_PASSWORD")
+    if not DISCORD_WEBHOOK_URL:
+        missing.append("DISCORD_WEBHOOK_URL")
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# ============================================================
-# VALIDATION
-# ============================================================
 
-missing = []
-for k, v in [
-    ("FTP_HOST", FTP_HOST),
-    ("FTP_USER", FTP_USER),
-    ("FTP_PASS", FTP_PASS),
-    ("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL),
-]:
-    if not v:
-        missing.append(k)
+# =========================
+# Discord helpers
+# =========================
+COLOR_DEFAULT = 0x95A5A6  # grey
+COLOR_PURPLE = 0x9B59B6
+COLOR_GREEN = 0x2ECC71
+COLOR_RED = 0xE74C3C
+COLOR_YELLOW = 0xF1C40F
 
-if missing:
-    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# ============================================================
-# PARSING / CLEANUP
-# ============================================================
+def pick_color(text: str) -> int:
+    t = text.lower()
+    if "claimed" in t or "unclaimed" in t or "claiming" in t:
+        return COLOR_PURPLE
+    if "tamed" in t or "taming" in t:
+        return COLOR_GREEN
+    if "killed" in t or "was killed" in t or "died" in t or "death" in t:
+        return COLOR_RED
+    if "demolished" in t or "destroyed" in t:
+        return COLOR_YELLOW
+    return COLOR_DEFAULT
 
-# Find "Day 222, 07:06:04:" anywhere in the line, then capture the remainder.
-DAY_TIME_ANYWHERE_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}:\d{2}:\d{2})\s*:\s*(.*)", re.IGNORECASE)
 
-RICHCOLOR_RE = re.compile(r"<\s*RichColor[^>]*>", re.IGNORECASE)
-TAG_CLOSE_RE = re.compile(r"</\s*>", re.IGNORECASE)
+def post_webhook_embed(message: str, color: int) -> bool:
+    """
+    Sends an embed with Discord webhook.
+    Handles rate limits (429) by sleeping retry_after.
+    Returns True if sent successfully.
+    """
+    payload = {
+        "embeds": [{"description": message, "color": color}]
+    }
 
-def normalize_line(raw: str) -> str:
-    s = raw.strip()
-    s = RICHCOLOR_RE.sub("", s)
-    s = TAG_CLOSE_RE.sub("", s)
+    for attempt in range(5):
+        try:
+            resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+            if resp.status_code in (200, 204):
+                return True
 
-    # remove trailing junk like </>), !)), )), etc
-    s = re.sub(r"\s*<\s*/\s*>\s*\)*\s*$", "", s)     # </>)
-    s = re.sub(r"\s*!\s*\)+\s*$", "", s)             # !))
-    s = re.sub(r"\s*\)+\s*$", "", s)                 # )))
-    return s.strip()
+            if resp.status_code == 429:
+                try:
+                    data = resp.json()
+                    retry_after = float(data.get("retry_after", 1.0))
+                except Exception:
+                    retry_after = 1.0
+                log.warning("Discord rate limited (429). Sleeping %.2fs then retrying...", retry_after)
+                time.sleep(retry_after)
+                continue
 
-def is_valkyrie_line(line: str) -> bool:
-    l = line.lower()
-    t = TARGET_TRIBE.lower()
-
-    # Most common formats
-    if f"tribe {t}" in l:
-        return True
-    if f"({t})" in l:
-        return True
-
-    # Optional: include "Your Tribe ..." lines (these can be Valkyrie events)
-    if INCLUDE_YOUR_TRIBE and "your tribe" in l:
-        return True
+            log.error("Discord webhook error %s: %s", resp.status_code, resp.text[:300])
+            return False
+        except Exception as e:
+            log.error("Discord send error: %s", e)
+            time.sleep(1.0)
 
     return False
 
-def extract_display_text(line: str) -> Optional[str]:
-    if not is_valkyrie_line(line):
+
+# =========================
+# Parsing + formatting
+# =========================
+
+DAY_TIME_RE = re.compile(r"Day\s+(\d+),\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2})")
+RICH_TAG_RE = re.compile(r"<\/?RichColor[^>]*>", re.IGNORECASE)
+GENERIC_TAG_RE = re.compile(r"<[^>]+>")  # strips any remaining XML-ish tags
+DOUBLE_TS_PREFIX_RE = re.compile(r"^\[[^\]]+\]\[\d+\]\s*\d{4}\.\d{2}\.\d{2}_[0-9]{2}\.[0-9]{2}\.[0-9]{2}:\s*")
+
+
+def clean_tail_junk(s: str) -> str:
+    """
+    Removes the annoying trailing characters we’ve seen: </>), !), !</>), etc.
+    Also removes extra closing parens if they’re just log artifacts.
+    """
+    s = s.strip()
+
+    # common trailing artifacts
+    for _ in range(6):
+        changed = False
+        for suffix in ["</>)", "</>)", "</>", "<//>", "/>)", "/>", ">)", "!)", "!))", "!) )"]:
+            if s.endswith(suffix):
+                s = s[: -len(suffix)].rstrip()
+                changed = True
+        if not changed:
+            break
+
+    # remove trailing stray punctuation that Ark logs add
+    s = s.rstrip("!").rstrip()
+    # If we end with a lonely ")" artifact, strip it
+    if s.endswith(")") and s.count("(") < s.count(")"):
+        s = s[:-1].rstrip()
+
+    return s
+
+
+def shorten_level_segment(s: str) -> str:
+    """
+    If the message has:  'Name - Lvl 150 (SomeType)'
+    we convert to:       'Name - Lvl 150'
+    """
+    # inside quoted section, remove the final " (Something)" if it exists.
+    # This keeps output cleaner like your example.
+    s = re.sub(r"(\'[^']* - Lvl \d+)\s*\([^)]*\)(\')", r"\1\2", s)
+    return s
+
+
+def format_line(raw: str) -> Optional[Tuple[str, int]]:
+    """
+    Returns (formatted_message, color) or None if it doesn't match.
+    Output format:
+      Day 221, 22:51:49 - Sir Magnus claimed 'Roan Pinto - Lvl 150'
+    """
+    line = raw.strip()
+    if not line:
         return None
 
-    cleaned = normalize_line(line)
+    # filter tribe
+    if TARGET_TRIBE.lower() not in line.lower():
+        return None
 
-    m = DAY_TIME_ANYWHERE_RE.search(cleaned)
+    # remove known prefixes like [timestamp][id]2026.01.10_...
+    line = DOUBLE_TS_PREFIX_RE.sub("", line)
+
+    # strip RichColor and any other tags
+    line = RICH_TAG_RE.sub("", line)
+    line = GENERIC_TAG_RE.sub("", line)
+
+    # Find day/time
+    m = DAY_TIME_RE.search(line)
     if not m:
-        return None
+        # If no Day/time, just return cleaned line
+        cleaned = clean_tail_junk(line)
+        cleaned = shorten_level_segment(cleaned)
+        color = pick_color(cleaned)
+        return cleaned, color
 
     day = m.group(1)
-    tm = m.group(2)
-    rest = (m.group(3) or "").strip()
+    t = m.group(2)
 
-    # Remove "Tribe Valkyrie, ID ...:" prefix if it still exists in the remainder (some lines do weird repeats)
-    rest = re.sub(r"^Tribe\s+[^:]+:\s*", "", rest, flags=re.IGNORECASE).strip()
+    # Take everything after the day/time portion
+    after = line[m.end():].lstrip()
+    # logs often have ": " right after time
+    if after.startswith(":"):
+        after = after[1:].lstrip()
 
-    # Make "Your Tribe killed ..." nicer (optional, doesn’t break other formats)
-    rest = rest.replace("Your Tribe", "Your Tribe")
+    # Clean tail + shorten "(Type)"
+    after = clean_tail_junk(after)
+    after = shorten_level_segment(after)
 
-    return f"Day {day}, {tm} - {rest}".strip()
+    # Final message
+    msg = f"Day {day}, {t} - {after}".strip()
+    msg = clean_tail_junk(msg)
 
-def color_for_text(text: str) -> int:
-    lower = text.lower()
-    if "claimed" in lower or "unclaimed" in lower or "claiming" in lower:
-        return 0x9B59B6  # purple
-    if "tamed" in lower or "taming" in lower:
-        return 0x2ECC71  # green
-    if "was killed" in lower or "killed" in lower or "died" in lower or "starved" in lower:
-        return 0xE74C3C  # red
-    if "demolished" in lower or "destroyed" in lower:
-        return 0xF1C40F  # yellow
-    return 0x95A5A6
+    color = pick_color(msg)
+    return msg, color
 
-def make_webhook_payload(text: str) -> dict:
-    return {"embeds": [{"description": text, "color": color_for_text(text)}]}
 
-# ============================================================
-# STATE
-# ============================================================
-
+# =========================
+# State (dedupe)
+# =========================
 def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {"offsets": {}, "dedupe": []}
+    if not os.path.exists(STATE_PATH):
+        return {"seen": [], "last_heartbeat": 0}
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        data.setdefault("offsets", {})
-        data.setdefault("dedupe", [])
-        return data
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return {"offsets": {}, "dedupe": []}
+        return {"seen": [], "last_heartbeat": 0}
+
 
 def save_state(state: dict) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.warning("Could not save state: %s", e)
 
-def line_sig(s: str) -> str:
+
+def stable_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
-# ============================================================
-# DISCORD WEBHOOK (rate limit aware)
-# ============================================================
 
-def webhook_post(payload: dict) -> Tuple[bool, str]:
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-    except Exception as e:
-        return False, f"Webhook request failed: {e}"
+# =========================
+# RCON fetch
+# =========================
+def rcon_get_lines() -> List[str]:
+    """
+    Connects to RCON, runs gettribelog, returns response lines.
+    """
+    with Client(RCON_HOST, RCON_PORT, passwd=RCON_PASSWORD, timeout=10) as client:
+        resp = client.run(RCON_COMMAND)
 
-    if r.status_code == 204 or (200 <= r.status_code < 300):
-        return True, "ok"
+    if resp is None:
+        return []
 
-    if r.status_code == 429:
-        try:
-            data = r.json()
-            retry_after = float(data.get("retry_after", 1.0))
-        except Exception:
-            retry_after = 1.0
-        time.sleep(max(retry_after, 0.25))
-        return False, f"Discord webhook 429 (rate limited). Slept {retry_after}s."
+    # resp can be bytes or str depending on server/library
+    if isinstance(resp, bytes):
+        text = resp.decode("utf-8", errors="ignore")
+    else:
+        text = str(resp)
 
-    return False, f"Discord webhook error {r.status_code}: {r.text}"
+    # normalize newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    return lines
 
-# ============================================================
-# FTP HELPERS
-# ============================================================
 
-CANDIDATE_LOG_DIRS = [
-    FTP_LOG_DIR,
-    "arksa/ShooterGame/Saved/Logs",
-    "ShooterGame/Saved/Logs",
-]
-
-def ftp_connect() -> ftplib.FTP:
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=20)
-    ftp.login(FTP_USER, FTP_PASS)
-    return ftp
-
-def find_logs_dir(ftp: ftplib.FTP) -> str:
-    for d in CANDIDATE_LOG_DIRS:
-        if not d:
-            continue
-        try:
-            ftp.cwd("/")
-            ftp.cwd(d)
-            return d
-        except Exception:
-            continue
-    raise RuntimeError("Could not find Logs directory. Tried: " + ", ".join([d for d in CANDIDATE_LOG_DIRS if d]))
-
-def list_log_files(ftp: ftplib.FTP, logs_dir: str) -> List[str]:
-    ftp.cwd("/")
-    ftp.cwd(logs_dir)
-    names = ftp.nlst()
-
-    out = []
-    for n in names:
-        nl = n.lower()
-        if not nl.endswith(".log"):
-            continue
-        if any(k in nl for k in EXCLUDE_KEYWORDS):
-            continue
-        out.append(f"{logs_dir}/{n}")
-    return sorted(out)
-
-def ftp_size_binary(ftp: ftplib.FTP, path: str) -> Optional[int]:
-    try:
-        ftp.sendcmd("TYPE I")
-        s = ftp.size(path)
-        return int(s) if s is not None else None
-    except Exception:
-        return None
-
-def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
-    ftp.sendcmd("TYPE I")
-    chunks: List[bytes] = []
-
-    def cb(data: bytes):
-        chunks.append(data)
-
-    ftp.retrbinary(f"RETR {path}", cb, rest=offset)
-    return b"".join(chunks)
-
-# ============================================================
-# MAIN
-# ============================================================
-
+# =========================
+# Main loop
+# =========================
 def main():
-    print(f"Polling every {POLL_INTERVAL}s")
-    print(f"Filtering target: {TARGET_TRIBE} | INCLUDE_YOUR_TRIBE={INCLUDE_YOUR_TRIBE}")
-    print(f"SEND_BACKLOG_ON_FIRST_RUN={SEND_BACKLOG_ON_FIRST_RUN} | FORCE_BACKLOG={FORCE_BACKLOG}")
+    require_env()
+
+    log.info("Starting Container")
+    log.info("RCON: %s:%s | cmd=%s", RCON_HOST, RCON_PORT, RCON_COMMAND)
+    log.info("Polling every %.1fs", POLL_SECONDS)
+    log.info("Filtering: %s", TARGET_TRIBE)
 
     state = load_state()
+    seen = state.get("seen", [])
+    seen_set = set(seen)
 
-    if FORCE_BACKLOG:
-        state = {"offsets": {}, "dedupe": []}
-        try:
-            if os.path.exists(STATE_FILE):
-                os.remove(STATE_FILE)
-        except Exception:
-            pass
-        print("FORCE_BACKLOG enabled: state cleared; backlog will be resent.")
+    last_heartbeat = float(state.get("last_heartbeat", 0))
+    heartbeat_every = HEARTBEAT_MINUTES * 60.0
 
-    offsets: Dict[str, int] = state.get("offsets", {})
-    dedupe_list = state.get("dedupe", [])
-    dedupe = deque(dedupe_list, maxlen=DEDUPE_CACHE_SIZE)
-    dedupe_set = set(dedupe_list)
-
-    last_any_sent_ts = time.time()
-    last_heartbeat_ts = 0.0
-
-    first_run = (len(offsets) == 0)
+    first_run = True
+    backlog_sent_any = False
 
     while True:
-        sent_this_loop = 0
-        found_this_loop = 0
+        sent_any_this_poll = False
+        sent_count = 0
 
         try:
-            ftp = ftp_connect()
-            logs_dir = find_logs_dir(ftp)
-            log_files = list_log_files(ftp, logs_dir)
+            lines = rcon_get_lines()
 
-            print(f"Logs dir: {logs_dir} | Files: {len(log_files)} | first_run={first_run}")
-
-            if not log_files:
-                ftp.quit()
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            if first_run and SEND_BACKLOG_ON_FIRST_RUN:
-                for p in log_files:
-                    offsets.setdefault(p, 0)
-                print("Backlog mode: reading from start of log files (offset=0).")
-
-            if not first_run:
-                for p in log_files:
-                    if p not in offsets:
-                        sz = ftp_size_binary(ftp, p) or 0
-                        offsets[p] = sz
-
-            for p in log_files:
-                if sent_this_loop >= MAX_SEND_PER_POLL:
-                    break
-
-                current_size = ftp_size_binary(ftp, p)
-                if current_size is None:
-                    current_size = offsets.get(p, 0)
-
-                off = offsets.get(p, 0)
-
-                if current_size < off:
-                    off = 0
-
-                if current_size == off:
+            # RCON tribe log outputs usually contain newest last; we’ll preserve order,
+            # but on SEND_BACKLOG first run we’ll send older -> newer.
+            parsed: List[Tuple[str, int, str]] = []
+            for raw in lines:
+                out = format_line(raw)
+                if not out:
                     continue
+                msg, color = out
+                h = stable_hash(msg)
+                parsed.append((msg, color, h))
 
-                data = ftp_read_from_offset(ftp, p, off)
-                offsets[p] = current_size
-
-                text = data.decode("utf-8", errors="ignore")
-                lines = [ln for ln in text.splitlines() if ln.strip()]
-
-                matching: List[str] = []
-                for ln in lines:
-                    disp = extract_display_text(ln)
-                    if disp:
-                        matching.append(disp)
-
-                if not matching:
-                    continue
-
-                found_this_loop += len(matching)
-
-                for disp in matching:
-                    if sent_this_loop >= MAX_SEND_PER_POLL:
-                        break
-
-                    sig = line_sig(disp)
-                    if sig in dedupe_set:
+            if first_run and SEND_BACKLOG:
+                # send everything we haven't seen yet (older -> newer)
+                for msg, color, h in parsed:
+                    if h in seen_set:
                         continue
+                    if sent_count >= MAX_SEND_PER_POLL:
+                        break
+                    if post_webhook_embed(msg, color):
+                        seen_set.add(h)
+                        seen.append(h)
+                        sent_any_this_poll = True
+                        backlog_sent_any = True
+                        sent_count += 1
 
-                    ok, msg = webhook_post(make_webhook_payload(disp))
-                    if not ok:
-                        print(f"Error: {msg}")
-                    else:
-                        sent_this_loop += 1
-                        last_any_sent_ts = time.time()
+                # Keep seen history bounded
+                if len(seen) > 5000:
+                    seen = seen[-5000:]
+                    seen_set = set(seen)
 
-                    dedupe.append(sig)
-                    dedupe_set.add(sig)
-                    if len(dedupe_set) > DEDUPE_CACHE_SIZE:
-                        dedupe_set = set(dedupe)
+            else:
+                # Normal mode: send only NEW entries, but prioritize MOST RECENT first
+                # (prevents spam if Nitrado/Ark dumps a bunch at once)
+                for msg, color, h in reversed(parsed):
+                    if h in seen_set:
+                        continue
+                    if sent_count >= MAX_SEND_PER_POLL:
+                        break
+                    if post_webhook_embed(msg, color):
+                        seen_set.add(h)
+                        seen.append(h)
+                        sent_any_this_poll = True
+                        sent_count += 1
 
-                    save_state({"offsets": offsets, "dedupe": list(dedupe)})
+                if len(seen) > 5000:
+                    seen = seen[-5000:]
+                    seen_set = set(seen)
 
-                    time.sleep(SEND_DELAY_SECONDS)
+            # heartbeat
+            now = time.time()
+            if now - last_heartbeat >= heartbeat_every:
+                if not sent_any_this_poll:
+                    post_webhook_embed("No new logs since last check.", COLOR_DEFAULT)
+                last_heartbeat = now
 
-            ftp.quit()
-
-            # Only flip out of backlog mode once we’ve actually processed at least one loop.
-            if first_run and SEND_BACKLOG_ON_FIRST_RUN:
-                first_run = False
-                save_state({"offsets": offsets, "dedupe": list(dedupe)})
-                print("Backlog scan complete. Now watching only newly appended logs.")
+            first_run = False
 
         except Exception as e:
-            print(f"Error: {e}")
+            log.error("Error: %s", e)
 
-        now = time.time()
-        hb_interval = HEARTBEAT_MINUTES * 60
-        if HEARTBEAT_MINUTES > 0 and (now - last_heartbeat_ts) >= hb_interval:
-            if now - last_any_sent_ts >= hb_interval:
-                ok, msg = webhook_post(make_webhook_payload("No new logs since last check."))
-                if not ok:
-                    print(f"Error: {msg}")
-            last_heartbeat_ts = now
+        state = {"seen": seen, "last_heartbeat": last_heartbeat}
+        save_state(state)
 
-        if found_this_loop or sent_this_loop:
-            print(f"Found {found_this_loop} matching lines; sent {sent_this_loop} this loop (cap {MAX_SEND_PER_POLL}).")
+        # If SEND_BACKLOG is enabled and there are more than MAX_SEND_PER_POLL unseen,
+        # keep polling quickly until backlog is drained a bit.
+        if first_run and SEND_BACKLOG and backlog_sent_any and sent_count >= MAX_SEND_PER_POLL:
+            time.sleep(2.0)
+        else:
+            time.sleep(POLL_SECONDS)
 
-        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
