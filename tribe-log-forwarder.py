@@ -1,297 +1,180 @@
 import os
 import time
 import ftplib
-import hashlib
-import json
-import logging
-import re
-from typing import Dict, List, Optional, Tuple
-
 import requests
+import re
+from datetime import datetime
 
-# ============================================================
-# CONFIG (ENV VARS)
-# ============================================================
+# ================== CONFIG ==================
 
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
+FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "arksa/ShooterGame/Saved/Logs")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Valkyrie")
 
-# Monitor ALL files in this directory
-FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs")
-
-# Tribe filter (must match log text)
-TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
-
-# Polling
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # seconds
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "10"))
 
-# State persistence
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+# ================== VALIDATION ==================
 
-# Discord safety
-SEND_MIN_DELAY = float(os.getenv("SEND_MIN_DELAY", "0.35"))
+required = [
+    FTP_HOST, FTP_USER, FTP_PASS,
+    DISCORD_WEBHOOK_URL, FTP_LOG_DIR
+]
 
-# ============================================================
-# LOGGING
-# ============================================================
+missing = [k for k, v in {
+    "FTP_HOST": FTP_HOST,
+    "FTP_USER": FTP_USER,
+    "FTP_PASS": FTP_PASS,
+    "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
+    "FTP_LOG_DIR": FTP_LOG_DIR
+}.items() if not v]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+if missing:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# ============================================================
-# VALIDATION
-# ============================================================
+# ================== HELPERS ==================
 
-def require_env():
-    missing = []
-    if not FTP_HOST: missing.append("FTP_HOST")
-    if not FTP_USER: missing.append("FTP_USER")
-    if not FTP_PASS: missing.append("FTP_PASS")
-    if not DISCORD_WEBHOOK_URL: missing.append("DISCORD_WEBHOOK_URL")
-    if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+def clean_ark_markup(text: str) -> str:
+    text = re.sub(r'<RichColor[^>]*>', '', text)
+    text = re.sub(r'</[^>]*>', '', text)
+    text = text.replace('</>)', '').replace('>)', ')')
+    return text.strip()
 
-# ============================================================
-# LOG FORMAT PARSING
-# ============================================================
-
-LOG_PATTERN = re.compile(
-    r"Day\s+(?P<day>\d+),\s+"
-    r"(?P<time>\d{2}:\d{2}:\d{2}):\s+"
-    r"(?P<rest>.+)"
-)
-
-RICH_COLOR_PATTERN = re.compile(r"<RichColor.*?>|</RichColor>")
-SPECIES_SUFFIX_PATTERN = re.compile(r"\s*\([^)]*\)")
-
-def format_ark_log(line: str) -> Optional[str]:
-    """
-    Converts raw ARK log line into:
-    Day XXX, HH:MM:SS - Player action
-    """
-    clean = RICH_COLOR_PATTERN.sub("", line)
-
-    match = LOG_PATTERN.search(clean)
-    if not match:
+def extract_summary(line: str) -> str | None:
+    m = re.search(
+        r'Day\s+(\d+),\s+(\d{2}:\d{2}:\d{2}):\s*(.+)',
+        line
+    )
+    if not m:
         return None
 
-    day = match.group("day")
-    time_str = match.group("time")
-    rest = match.group("rest").strip()
-
-    # Remove species info e.g. (Fire Wyvern)
-    rest = SPECIES_SUFFIX_PATTERN.sub("", rest)
-
+    day, time_str, rest = m.groups()
+    rest = clean_ark_markup(rest)
     return f"Day {day}, {time_str} - {rest}"
 
-# ============================================================
-# DISCORD FORMAT HELPERS
-# ============================================================
-
-def classify_color(text: str) -> int:
-    lower = text.lower()
-    if "claimed" in lower:
+def embed_color(text: str) -> int:
+    t = text.lower()
+    if "claimed" in t or "unclaimed" in t:
         return 0x9B59B6  # purple
-    if "tamed" in lower:
+    if "tamed" in t:
         return 0x2ECC71  # green
-    if "killed" in lower or "died" in lower:
+    if "killed" in t or "died" in t:
         return 0xE74C3C  # red
-    if "demolished" in lower or "destroyed" in lower:
+    if "demolished" in t or "destroyed" in t:
         return 0xF1C40F  # yellow
-    return 0x95A5A6  # grey
+    return 0x95A5A6      # grey
 
-def format_discord_payload(line: str) -> Optional[dict]:
-    formatted = format_ark_log(line)
-    if not formatted:
-        return None
-
-    return {
-        "embeds": [
-            {
-                "description": formatted,
-                "color": classify_color(formatted),
-            }
-        ]
+def send_discord(text: str, color: int):
+    payload = {
+        "embeds": [{
+            "description": text,
+            "color": color
+        }]
     }
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+    if r.status_code == 429:
+        retry = r.json().get("retry_after", 1)
+        time.sleep(float(retry))
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
 
-def send_to_discord(payload: dict) -> Tuple[bool, Optional[float], str]:
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-    except Exception as e:
-        return False, None, f"Webhook request failed: {e}"
+# ================== FTP ==================
 
-    if resp.status_code in (200, 204):
-        return True, None, "OK"
-
-    if resp.status_code == 429:
-        try:
-            data = resp.json()
-            retry_after = float(data.get("retry_after", 1.0))
-        except Exception:
-            retry_after = 1.0
-        return False, retry_after, "Rate limited"
-
-    return False, None, f"Webhook error {resp.status_code}: {resp.text}"
-
-# ============================================================
-# STATE (per-file offsets + dedupe)
-# ============================================================
-
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {
-            "offsets": {},
-            "seen": [],
-            "first_run_done": False,
-            "last_heartbeat_ts": 0.0,
-        }
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_state(state: dict):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-
-def line_fingerprint(line: str) -> str:
-    return hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest()
-
-# ============================================================
-# FTP HELPERS
-# ============================================================
-
-def ftp_connect() -> ftplib.FTP:
+def ftp_connect():
     ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
     ftp.login(FTP_USER, FTP_PASS)
     return ftp
 
-def ftp_type_binary(ftp: ftplib.FTP):
-    try:
-        ftp.voidcmd("TYPE I")
-    except Exception:
-        pass
+def list_logs(ftp):
+    files = []
+    ftp.retrlines("NLST", files.append)
+    return [
+        f for f in files
+        if f.endswith(".log")
+        and "backup" not in f.lower()
+        and "failed" not in f.lower()
+    ]
 
-def ftp_size(ftp: ftplib.FTP, name: str) -> Optional[int]:
-    try:
-        ftp_type_binary(ftp)
-        return ftp.size(name)
-    except Exception:
-        return None
+def read_from_offset(ftp, path, offset):
+    lines = []
+    def cb(line):
+        lines.append(line)
 
-def ftp_read_from_offset(ftp: ftplib.FTP, name: str, offset: int) -> Tuple[bytes, int]:
-    chunks: List[bytes] = []
+    ftp.sendcmd("TYPE I")
+    with ftp.transfercmd(f"RETR {path}", rest=offset) as conn:
+        buf = b""
+        while True:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+        for l in buf.decode("utf-8", errors="ignore").splitlines():
+            cb(l)
 
-    def cb(b):
-        chunks.append(b)
+    return lines, offset + len(buf)
 
-    ftp_type_binary(ftp)
-    if offset > 0:
-        ftp.retrbinary(f"RETR {name}", cb, rest=offset)
-    else:
-        ftp.retrbinary(f"RETR {name}", cb)
-
-    data = b"".join(chunks)
-    return data, offset + len(data)
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
+# ================== MAIN ==================
 
 def main():
-    require_env()
+    print("Starting Container")
+    print(f"Polling every {POLL_SECONDS}s")
+    print(f"Filtering: Tribe {TARGET_TRIBE}")
 
-    logging.info("Starting Container")
-    logging.info(f"Polling every {POLL_INTERVAL}s")
-    logging.info(f"Filtering: {TARGET_TRIBE}")
-    logging.info(f"Logs dir: {FTP_LOGS_DIR}")
-
-    state = load_state()
-    sent_since_heartbeat = 0
+    offsets = {}
+    last_heartbeat = time.time()
 
     while True:
-        most_recent_match = None
-
         try:
             ftp = ftp_connect()
-            ftp.cwd(FTP_LOGS_DIR)
+            ftp.cwd(FTP_LOG_DIR)
 
-            files = ftp.nlst()
-
-            # First run: skip backlog
-            if not state["first_run_done"]:
-                for f in files:
-                    size = ftp_size(ftp, f)
-                    if size is not None:
-                        state["offsets"][f] = size
-                state["first_run_done"] = True
-                save_state(state)
-                logging.info("First run: skipped backlog")
+            logs = list_logs(ftp)
+            if not logs:
                 ftp.quit()
-                time.sleep(POLL_INTERVAL)
+                time.sleep(POLL_SECONDS)
                 continue
 
-            for f in files:
-                size = ftp_size(ftp, f)
-                if size is None:
-                    continue
+            latest_log = max(logs)
+            if latest_log not in offsets:
+                size = ftp.size(latest_log)
+                offsets[latest_log] = size
+                print(f"Active log selected: {latest_log} (skipping backlog)")
+                ftp.quit()
+                time.sleep(POLL_SECONDS)
+                continue
 
-                offset = state["offsets"].get(f, 0)
-                if size < offset:
-                    offset = 0
+            offset = offsets[latest_log]
+            lines, new_offset = read_from_offset(ftp, latest_log, offset)
+            offsets[latest_log] = new_offset
 
-                if size == offset:
-                    continue
+            latest_match = None
+            for line in reversed(lines):
+                if TARGET_TRIBE.lower() in line.lower():
+                    summary = extract_summary(line)
+                    if summary:
+                        latest_match = summary
+                        break
 
-                data, new_offset = ftp_read_from_offset(ftp, f, offset)
-                state["offsets"][f] = new_offset
+            if latest_match:
+                send_discord(latest_match, embed_color(latest_match))
+            else:
+                if time.time() - last_heartbeat >= HEARTBEAT_MINUTES * 60:
+                    send_discord("No new logs since last check.", 0x95A5A6)
+                    last_heartbeat = time.time()
 
-                if data:
-                    text = data.decode("utf-8", errors="ignore")
-                    for line in text.splitlines():
-                        if TARGET_TRIBE.lower() in line.lower():
-                            most_recent_match = line
-
-            save_state(state)
             ftp.quit()
 
         except Exception as e:
-            logging.error(e)
+            print("Error:", e)
 
-        # Send most recent match only
-        if most_recent_match:
-            fp = line_fingerprint(most_recent_match)
-            if fp not in state["seen"]:
-                payload = format_discord_payload(most_recent_match)
-                if payload:
-                    ok, retry_after, _ = send_to_discord(payload)
-                    if not ok and retry_after:
-                        time.sleep(retry_after)
-                        send_to_discord(payload)
+        time.sleep(POLL_SECONDS)
 
-                    state["seen"].append(fp)
-                    state["seen"] = state["seen"][-3000:]
-                    save_state(state)
-                    sent_since_heartbeat += 1
-                    logging.info("Sent log to Discord")
-
-        # Heartbeat
-        now = time.time()
-        if now - state["last_heartbeat_ts"] >= HEARTBEAT_MINUTES * 60:
-            if sent_since_heartbeat == 0:
-                hb = {"embeds": [{"description": "No new logs since last check.", "color": 0x95A5A6}]}
-                send_to_discord(hb)
-            state["last_heartbeat_ts"] = now
-            sent_since_heartbeat = 0
-            save_state(state)
-
-        time.sleep(POLL_INTERVAL)
+# ================== RUN ==================
 
 if __name__ == "__main__":
     main()
