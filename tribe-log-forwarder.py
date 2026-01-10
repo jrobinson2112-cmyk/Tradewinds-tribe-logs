@@ -4,13 +4,13 @@ import json
 import re
 import ftplib
 import hashlib
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
-# ============================================================
+# =========================
 # ENV CONFIG
-# ============================================================
+# =========================
 
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
@@ -19,40 +19,37 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Can be either the file path OR the Logs directory
-FTP_LOG_PATH = os.getenv("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs")
+# Point this at the Logs DIRECTORY (recommended)
+FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "arksa/ShooterGame/Saved/Logs").rstrip("/")
 
-# Filter string (use exactly what appears in logs)
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
-
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
-
-# IMPORTANT:
-# Default is now FALSE so it sends the most recent matching line immediately on startup.
-SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "false").lower() in ("1", "true", "yes")
 
 STATE_FILE = "cursor.json"
 
-# ============================================================
+# If true, first run starts at end and sends nothing until a new matching line appears
+SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
+
+# =========================
 # VALIDATION
-# ============================================================
+# =========================
 
 missing = []
-if not FTP_HOST:
-    missing.append("FTP_HOST")
-if not FTP_USER:
-    missing.append("FTP_USER")
-if not FTP_PASS:
-    missing.append("FTP_PASS")
-if not DISCORD_WEBHOOK_URL:
-    missing.append("DISCORD_WEBHOOK_URL")
+for k, v in [
+    ("FTP_HOST", FTP_HOST),
+    ("FTP_USER", FTP_USER),
+    ("FTP_PASS", FTP_PASS),
+    ("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL),
+]:
+    if not v:
+        missing.append(k)
 
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# ============================================================
-# DISCORD FORMAT HELPERS
-# ============================================================
+# =========================
+# DISCORD FORMATTING
+# =========================
 
 RICH_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -71,22 +68,17 @@ def line_color(text: str) -> int:
         return 0xE74C3C  # red
     if "demolished" in lower or "destroyed" in lower:
         return 0xF1C40F  # yellow
-    return 0x95A5A6  # default grey
+    return 0x95A5A6      # grey
 
 def format_payload(line: str) -> dict:
-    text = clean_ark_text(line)
-    return {"embeds": [{"description": text[:4096], "color": line_color(text)}]}
+    txt = clean_ark_text(line)
+    return {"embeds": [{"description": txt[:4096], "color": line_color(txt)}]}
 
 def send_to_discord(payload: dict) -> None:
-    """
-    Sends to Discord webhook and respects rate-limit responses.
-    """
     while True:
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-
         if r.status_code in (200, 204):
             return
-
         if r.status_code == 429:
             try:
                 data = r.json()
@@ -95,121 +87,121 @@ def send_to_discord(payload: dict) -> None:
                 retry_after = 1.0
             time.sleep(max(0.05, retry_after))
             continue
-
         raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:500]}")
 
-# ============================================================
+def hash_line(line: str) -> str:
+    return hashlib.sha256(clean_ark_text(line).encode("utf-8", errors="ignore")).hexdigest()
+
+# =========================
 # STATE
-# ============================================================
+# =========================
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"offset": 0, "path": None, "initialized": False, "last_hash": None}
+        return {"path": None, "offset": 0, "initialized": False, "last_hash": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
         return {
+            "path": s.get("path"),
             "offset": int(s.get("offset", 0)),
-            "path": s.get("path", None),
             "initialized": bool(s.get("initialized", False)),
-            "last_hash": s.get("last_hash", None),
+            "last_hash": s.get("last_hash"),
         }
     except Exception:
-        return {"offset": 0, "path": None, "initialized": False, "last_hash": None}
+        return {"path": None, "offset": 0, "initialized": False, "last_hash": None}
 
-def save_state(offset: int, resolved_path: str, initialized: bool, last_hash: Optional[str]) -> None:
+def save_state(path: str, offset: int, initialized: bool, last_hash: Optional[str]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "offset": int(offset),
-                "path": resolved_path,
-                "initialized": bool(initialized),
-                "last_hash": last_hash,
-            },
+            {"path": path, "offset": int(offset), "initialized": bool(initialized), "last_hash": last_hash},
             f,
         )
 
-def hash_line(line: str) -> str:
-    clean = clean_ark_text(line)
-    return hashlib.sha256(clean.encode("utf-8", errors="ignore")).hexdigest()
-
-# ============================================================
+# =========================
 # FTP HELPERS
-# ============================================================
+# =========================
 
 def ftp_connect() -> ftplib.FTP:
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.set_pasv(True)
-    return ftp
-
-def ftp_type_binary(ftp: ftplib.FTP) -> None:
+    # Use binary mode so SIZE works on many servers
     try:
         ftp.voidcmd("TYPE I")
     except Exception:
         pass
+    return ftp
 
-def ftp_is_directory(ftp: ftplib.FTP, path: str) -> bool:
-    current = ftp.pwd()
+def ftp_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
     try:
-        ftp.cwd(path)
-        ftp.cwd(current)
-        return True
-    except Exception:
-        try:
-            ftp.cwd(current)
-        except Exception:
-            pass
-        return False
-
-def ftp_file_exists(ftp: ftplib.FTP, file_path: str) -> bool:
-    ftp_type_binary(ftp)
-    try:
-        ftp.sendcmd(f"SIZE {file_path}")
-        return True
-    except Exception:
-        return False
-
-def resolve_log_path(ftp: ftplib.FTP, configured: str) -> str:
-    path = configured.rstrip("/")
-    if ftp_is_directory(ftp, path):
-        candidate = f"{path}/ShooterGame.log"
-        if ftp_file_exists(ftp, candidate):
-            print(f"FTP_LOG_PATH is a directory; using: {candidate}")
-            return candidate
-        raise RuntimeError(f"FTP_LOG_PATH points to a directory ({path}) but ShooterGame.log was not found inside it.")
-    if not ftp_file_exists(ftp, path):
-        raise RuntimeError(f"Log file not found at: {path}")
-    return path
-
-def ftp_get_size(ftp: ftplib.FTP, file_path: str) -> Optional[int]:
-    ftp_type_binary(ftp)
-    try:
-        resp = ftp.sendcmd(f"SIZE {file_path}")
+        resp = ftp.sendcmd(f"SIZE {path}")
         return int(resp.split()[-1])
     except Exception:
         return None
 
-def ftp_read_from_offset(ftp: ftplib.FTP, file_path: str, offset: int) -> bytes:
-    ftp_type_binary(ftp)
-    buf = bytearray()
+def ftp_list_logs(ftp: ftplib.FTP, log_dir: str) -> List[str]:
+    names: List[str] = []
+    try:
+        ftp.cwd(log_dir)
+        ftp.retrlines("NLST", names.append)
+    finally:
+        # Return to root-ish isn't necessary, but harmless
+        pass
+    # Convert to full paths and keep only .log
+    full = []
+    for n in names:
+        n = n.strip()
+        if not n:
+            continue
+        # NLST might return full paths or names depending on server
+        if "/" in n:
+            path = n
+        else:
+            path = f"{log_dir}/{n}"
+        if path.lower().endswith(".log"):
+            full.append(path)
+    return full
 
+def choose_active_log(ftp: ftplib.FTP, log_dir: str, prefer_contains: Tuple[str, ...] = ("ShooterGame", "ServerGame")) -> Optional[str]:
+    logs = ftp_list_logs(ftp, log_dir)
+    if not logs:
+        return None
+
+    # Gather (path, size)
+    info = []
+    for p in logs:
+        sz = ftp_size(ftp, p)
+        # If SIZE unsupported, still keep it but with -1
+        info.append((p, sz if sz is not None else -1))
+
+    # Prefer known names first, but still pick the largest among them
+    preferred = [x for x in info if any(k.lower() in x[0].lower() for k in prefer_contains)]
+    if preferred:
+        preferred.sort(key=lambda t: t[1], reverse=True)
+        return preferred[0][0]
+
+    # Otherwise pick largest .log file
+    info.sort(key=lambda t: t[1], reverse=True)
+    return info[0][0]
+
+def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
+    buf = bytearray()
     def cb(chunk: bytes):
         buf.extend(chunk)
-
-    ftp.retrbinary(f"RETR {file_path}", cb, rest=offset)
+    ftp.retrbinary(f"RETR {path}", cb, rest=offset)
     return bytes(buf)
 
-def fetch_new_lines(file_path: str, offset: int) -> Tuple[int, List[str], Optional[int]]:
+def fetch_new_lines(path: str, offset: int) -> Tuple[int, List[str], Optional[int]]:
     ftp = ftp_connect()
     try:
-        size = ftp_get_size(ftp, file_path)
+        size = ftp_size(ftp, path)
         if size is not None and size < offset:
-            print(f"Log shrank (rotation?) size={size} < offset={offset}. Resetting offset to 0.")
+            print(f"Log shrank/rotated: size={size} < offset={offset}. Resetting to 0.")
             offset = 0
 
-        raw = ftp_read_from_offset(ftp, file_path, offset)
+        raw = ftp_read_from_offset(ftp, path, offset)
         if not raw:
             return offset, [], size
 
@@ -222,9 +214,9 @@ def fetch_new_lines(file_path: str, offset: int) -> Tuple[int, List[str], Option
         except Exception:
             pass
 
-# ============================================================
-# MAIN (ONLY SEND MOST RECENT MATCHING LOG)
-# ============================================================
+# =========================
+# MAIN
+# =========================
 
 def main():
     print("Starting Container")
@@ -232,59 +224,75 @@ def main():
     print(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
 
     state = load_state()
-    offset = int(state["offset"])
+    current_path = state.get("path")
+    offset = int(state.get("offset", 0))
     initialized = bool(state.get("initialized", False))
-    last_hash = state.get("last_hash", None)
+    last_hash = state.get("last_hash")
 
+    # Resolve an active log file on startup
     ftp = ftp_connect()
     try:
-        resolved_path = resolve_log_path(ftp, FTP_LOG_PATH)
+        chosen = choose_active_log(ftp, FTP_LOG_DIR)
     finally:
         try:
             ftp.quit()
         except Exception:
             pass
 
-    if state.get("path") and state["path"] != resolved_path:
-        print(f"Log target changed: {state['path']} -> {resolved_path} (resetting cursor)")
-        offset = 0
-        last_hash = None
-        initialized = False
+    if not chosen:
+        raise RuntimeError(f"No .log files found in directory: {FTP_LOG_DIR}")
 
-    print(f"Reading: {resolved_path}")
+    if current_path != chosen:
+        print(f"Active log selected: {chosen}")
+        current_path = chosen
+        offset = 0
+        initialized = False
+        last_hash = None
 
     while True:
         try:
-            new_offset, lines, size = fetch_new_lines(resolved_path, offset)
+            # Every loop, re-evaluate active log in case the server switched files
+            ftp = ftp_connect()
+            try:
+                latest = choose_active_log(ftp, FTP_LOG_DIR)
+            finally:
+                try:
+                    ftp.quit()
+                except Exception:
+                    pass
 
-            # Heartbeat so you can see it polling
+            if latest and latest != current_path:
+                print(f"Log target changed: {current_path} -> {latest} (resetting cursor)")
+                current_path = latest
+                offset = 0
+                initialized = False
+                last_hash = None
+
+            new_offset, lines, size = fetch_new_lines(current_path, offset)
+
             if size is not None:
-                print(f"Heartbeat: remote_size={size}, offset={offset} -> {new_offset}, new_lines={len(lines)}")
+                print(f"Heartbeat: file={os.path.basename(current_path)} size={size} offset={offset}->{new_offset} new_lines={len(lines)}")
             else:
-                print(f"Heartbeat: offset={offset} -> {new_offset}, new_lines={len(lines)} (SIZE not available)")
+                print(f"Heartbeat: file={os.path.basename(current_path)} offset={offset}->{new_offset} new_lines={len(lines)} (SIZE n/a)")
 
-            # First run behavior
+            # First run: optionally skip backlog
             if not initialized and SKIP_BACKLOG_ON_FIRST_RUN:
                 offset = new_offset
                 initialized = True
-                save_state(offset, resolved_path, initialized, last_hash)
+                save_state(current_path, offset, initialized, last_hash)
                 print("First run: skipped backlog and started live from the end.")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Advance offset so we don't re-read bytes
             offset = new_offset
 
-            # Find the most recent matching line from this chunk
+            # Send ONLY the most recent matching line from the NEW chunk
             most_recent = None
             for line in reversed(lines):
                 if TARGET_TRIBE.lower() in line.lower():
                     most_recent = line
                     break
 
-            # If we didn't find a match in the *new chunk* and we're not initialized yet,
-            # (or it's the first time without skipping backlog) we can also scan the chunk
-            # normally. (Still only sends ONE line total per poll.)
             if most_recent:
                 h = hash_line(most_recent)
                 if h != last_hash:
@@ -298,7 +306,7 @@ def main():
                     print("No matching Valkyrie line in the new chunk.")
 
             initialized = True
-            save_state(offset, resolved_path, initialized, last_hash)
+            save_state(current_path, offset, initialized, last_hash)
 
         except Exception as e:
             print(f"Error: {e}")
