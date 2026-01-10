@@ -1,13 +1,14 @@
 import os
 import time
-import ftplib
 import json
 import re
+import ftplib
+import hashlib
+from collections import deque
 import requests
-from fnmatch import fnmatch
 
 # ============================================================
-# CONFIG (ENV VARS)
+# ENV CONFIG
 # ============================================================
 
 FTP_HOST = os.getenv("FTP_HOST")
@@ -17,90 +18,104 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Can be a directory OR a file. If directory, we auto-pick newest tribe log.
-FTP_LOG_PATH = os.getenv("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs").rstrip("/")
-
-# Make pattern flexible by default (works with TribeLog.log, TribeLog_123.log, etc)
-LOG_PATTERN = os.getenv("LOG_PATTERN", "TribeLog*.log")
+# IMPORTANT: Your tribe events are in ShooterGame.log
+FTP_LOG_PATH = os.getenv("FTP_LOG_PATH", "arksa/ShooterGame/Saved/Logs/ShooterGame.log")
 
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
+
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
 STATE_FILE = "cursor.json"
-
-# If FTP_LOG_PATH is a directory and no matches are found, we also try these:
-FALLBACK_DIRS = [
-    "arksa/ShooterGame/Saved/Logs",
-    "arksa/ShooterGame/Saved/Logs/TribeLogs",
-    "arksa/ShooterGame/Saved/TribeLogs",
-]
+DEDUP_MAX = int(os.getenv("DEDUP_MAX", "500"))  # remember last 500 sent lines
 
 # ============================================================
 # VALIDATION
 # ============================================================
 
-missing = [k for k, v in {
-    "FTP_HOST": FTP_HOST,
-    "FTP_USER": FTP_USER,
-    "FTP_PASS": FTP_PASS,
-    "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
-}.items() if not v]
+missing = []
+if not FTP_HOST:
+    missing.append("FTP_HOST")
+if not FTP_USER:
+    missing.append("FTP_USER")
+if not FTP_PASS:
+    missing.append("FTP_PASS")
+if not DISCORD_WEBHOOK_URL:
+    missing.append("DISCORD_WEBHOOK_URL")
 
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
-
 
 # ============================================================
 # DISCORD FORMAT HELPERS
 # ============================================================
 
-def clean_ark_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+RICH_TAG_RE = re.compile(r"<[^>]+>")
 
-def format_log_line(line: str) -> dict:
-    text = clean_ark_tags(line)
+def clean_ark_text(s: str) -> str:
+    s = s.strip()
+    s = RICH_TAG_RE.sub("", s)  # remove <RichColor ...> etc
+    return s.strip()
+
+def line_color(text: str) -> int:
     lower = text.lower()
 
-    color = 0x95A5A6  # default grey
-
+    # Your requested colours
     if "claimed" in lower or "claiming" in lower:
-        color = 0x9B59B6  # purple
-    elif "tamed" in lower or "taming" in lower:
-        color = 0x2ECC71  # green
-    elif "was killed" in lower or "killed" in lower or "died" in lower:
-        color = 0xE74C3C  # red
-    elif "demolished" in lower or "destroyed" in lower:
-        color = 0xF1C40F  # yellow
+        return 0x9B59B6  # purple
+    if "tamed" in lower or "taming" in lower:
+        return 0x2ECC71  # green
+    if "was killed" in lower or "killed" in lower or "died" in lower:
+        return 0xE74C3C  # red
+    if "demolished" in lower or "destroyed" in lower:
+        return 0xF1C40F  # yellow
 
-    return {"embeds": [{"description": text[:4096], "color": color}]}
+    return 0x95A5A6  # default grey
 
-def send_to_discord(payload: dict):
+def format_payload(line: str) -> dict:
+    text = clean_ark_text(line)
+    return {
+        "embeds": [
+            {
+                "description": text[:4096],
+                "color": line_color(text),
+            }
+        ]
+    }
+
+def send_to_discord(payload: dict) -> None:
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
     if r.status_code >= 300:
         raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:300]}")
 
-
 # ============================================================
-# STATE
+# STATE (offset + dedupe)
 # ============================================================
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"file": None, "offset": 0}
+        return {"offset": 0, "sent": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
-        return {"file": s.get("file"), "offset": int(s.get("offset", 0))}
+        offset = int(s.get("offset", 0))
+        sent = s.get("sent", [])
+        if not isinstance(sent, list):
+            sent = []
+        return {"offset": offset, "sent": sent}
     except Exception:
-        return {"file": None, "offset": 0}
+        return {"offset": 0, "sent": []}
 
-def save_state(file_path: str, offset: int):
+def save_state(offset: int, sent_hashes: deque) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"file": file_path, "offset": int(offset)}, f)
+        json.dump({"offset": int(offset), "sent": list(sent_hashes)}, f)
 
+def hash_line(line: str) -> str:
+    # Hash the cleaned line so formatting tags don't cause dupes
+    clean = clean_ark_text(line)
+    return hashlib.sha256(clean.encode("utf-8", errors="ignore")).hexdigest()
 
 # ============================================================
-# FTP HELPERS
+# FTP TAIL (read only new bytes)
 # ============================================================
 
 def ftp_connect() -> ftplib.FTP:
@@ -110,71 +125,13 @@ def ftp_connect() -> ftplib.FTP:
     ftp.set_pasv(True)
     return ftp
 
-def ftp_is_directory(ftp: ftplib.FTP, path: str) -> bool:
-    cur = ftp.pwd()
-    try:
-        ftp.cwd(path)
-        ftp.cwd(cur)
-        return True
-    except Exception:
-        try:
-            ftp.cwd(cur)
-        except Exception:
-            pass
-        return False
-
-def ftp_list_files(ftp: ftplib.FTP, directory: str) -> list[str]:
-    directory = directory.rstrip("/")
-    try:
-        items = ftp.nlst(directory)
-        # Some servers return full paths, some return names; normalize:
-        normalized = []
-        for item in items:
-            if "/" in item:
-                normalized.append(item)
-            else:
-                normalized.append(f"{directory}/{item}")
-        return normalized
-    except Exception:
-        # fallback: cwd + nlst()
-        ftp.cwd(directory)
-        names = ftp.nlst()
-        return [f"{directory}/{n}" for n in names]
-
-def ftp_mdtm(ftp: ftplib.FTP, path: str) -> str | None:
-    try:
-        resp = ftp.sendcmd(f"MDTM {path}")
-        parts = resp.split()
-        return parts[1].strip() if len(parts) >= 2 else None
-    except Exception:
-        return None
-
-def pick_newest_matching(ftp: ftplib.FTP, directory: str, pattern: str) -> str | None:
-    files = ftp_list_files(ftp, directory)
-    matches = [p for p in files if fnmatch(os.path.basename(p), pattern)]
-    if not matches:
-        return None
-
-    scored = []
-    for p in matches:
-        ts = ftp_mdtm(ftp, p) or ""
-        scored.append((ts, p))
-
-    # Prefer MDTM
-    if any(ts for ts, _ in scored):
-        scored.sort(key=lambda x: x[0])
-        return scored[-1][1]
-
-    # fallback: filename sort
-    matches.sort()
-    return matches[-1]
-
 def ftp_get_size(ftp: ftplib.FTP, path: str) -> int | None:
+    # Ensure binary mode for SIZE on some servers
     try:
-        try:
-            ftp.voidcmd("TYPE I")
-        except Exception:
-            pass
+        ftp.voidcmd("TYPE I")
+    except Exception:
+        pass
+    try:
         resp = ftp.sendcmd(f"SIZE {path}")
         return int(resp.split()[-1])
     except Exception:
@@ -182,77 +139,36 @@ def ftp_get_size(ftp: ftplib.FTP, path: str) -> int | None:
 
 def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
     buf = bytearray()
-
-    def cb(chunk: bytes):
-        buf.extend(chunk)
-
     try:
         ftp.voidcmd("TYPE I")
     except Exception:
         pass
 
+    def cb(chunk: bytes):
+        buf.extend(chunk)
+
     ftp.retrbinary(f"RETR {path}", cb, rest=offset)
     return bytes(buf)
 
-def resolve_log_target(ftp: ftplib.FTP) -> str:
-    """
-    If FTP_LOG_PATH is a file, use it.
-    If it's a directory, pick newest matching LOG_PATTERN.
-    If none found, try fallback directories.
-    """
-    path = FTP_LOG_PATH.rstrip("/")
-
-    if not ftp_is_directory(ftp, path):
-        return path  # treat as file
-
-    # First try user-provided directory
-    newest = pick_newest_matching(ftp, path, LOG_PATTERN)
-    if newest:
-        return newest
-
-    # Then try fallback dirs
-    for d in FALLBACK_DIRS:
-        if ftp_is_directory(ftp, d):
-            newest = pick_newest_matching(ftp, d, LOG_PATTERN)
-            if newest:
-                print(f"Found tribe logs in fallback dir: {d}")
-                return newest
-
-    raise RuntimeError(f"No {LOG_PATTERN} files found in directory: {path} (and fallbacks)")
-
-
-# ============================================================
-# FETCH ONLY NEW LINES
-# ============================================================
-
-def fetch_new_lines() -> tuple[str, list[str]]:
-    state = load_state()
-    last_file = state.get("file")
-    offset = int(state.get("offset", 0))
-
+def fetch_new_lines(offset: int) -> tuple[int, list[str]]:
     ftp = ftp_connect()
     try:
-        target_file = resolve_log_target(ftp)
+        size = ftp_get_size(ftp, FTP_LOG_PATH)
 
-        if target_file != last_file:
-            print(f"Log target changed: {last_file} -> {target_file} (resetting cursor)")
-            offset = 0
-
-        size = ftp_get_size(ftp, target_file)
+        # Handle rotation/truncation
         if size is not None and size < offset:
             print(f"Log shrank (rotation?) size={size} < offset={offset}. Resetting offset to 0.")
             offset = 0
 
-        raw = ftp_read_from_offset(ftp, target_file, offset)
+        raw = ftp_read_from_offset(ftp, FTP_LOG_PATH, offset)
         if not raw:
-            save_state(target_file, offset)
-            return target_file, []
+            return offset, []
 
         new_offset = offset + len(raw)
-        save_state(target_file, new_offset)
 
         text = raw.decode("utf-8", errors="ignore")
-        return target_file, text.splitlines()
+        lines = text.splitlines()
+        return new_offset, lines
 
     finally:
         try:
@@ -260,34 +176,54 @@ def fetch_new_lines() -> tuple[str, list[str]]:
         except Exception:
             pass
 
-
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
 def main():
-    print("Tribe log forwarder started")
-    print("FTP_LOG_PATH:", FTP_LOG_PATH)
-    print("LOG_PATTERN:", LOG_PATTERN)
-    print("TARGET_TRIBE:", TARGET_TRIBE)
+    print("Starting Container")
     print(f"Polling every {POLL_INTERVAL:.1f} seconds")
+    print(f"Reading: {FTP_LOG_PATH}")
+    print(f"Filtering: {TARGET_TRIBE}")
+
+    state = load_state()
+    offset = int(state["offset"])
+    sent_hashes = deque(state["sent"], maxlen=DEDUP_MAX)
+    sent_set = set(sent_hashes)
 
     while True:
         try:
-            file_used, lines = fetch_new_lines()
+            new_offset, lines = fetch_new_lines(offset)
+
             if lines:
-                print(f"Read {len(lines)} new lines from {file_used}")
+                print(f"Read {len(lines)} new lines")
 
-            sent = 0
+            sent_count = 0
+
             for line in lines:
-                if TARGET_TRIBE.lower() in line.lower():
-                    send_to_discord(format_log_line(line))
-                    sent += 1
+                # Only lines that contain the tribe filter
+                if TARGET_TRIBE.lower() not in line.lower():
+                    continue
 
-            if lines and sent == 0:
-                print("No matching tribe lines found in new data.")
-            if sent:
-                print(f"Sent {sent} messages to Discord.")
+                h = hash_line(line)
+                if h in sent_set:
+                    continue
+
+                send_to_discord(format_payload(line))
+                sent_count += 1
+
+                sent_hashes.append(h)
+                sent_set.add(h)
+
+                # Keep set in sync with deque maxlen
+                while len(sent_set) > len(sent_hashes):
+                    sent_set = set(sent_hashes)
+
+            if sent_count:
+                print(f"Sent {sent_count} messages to Discord")
+
+            offset = new_offset
+            save_state(offset, sent_hashes)
 
         except Exception as e:
             print(f"Error: {e}")
