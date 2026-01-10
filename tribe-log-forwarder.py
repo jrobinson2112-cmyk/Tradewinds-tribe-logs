@@ -16,15 +16,11 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Directory containing logs (NOT a file path)
-FTP_LOGS_DIR = os.getenv("FTP_LOGS_DIR", "arksa/ShooterGame/Saved/Logs")
+# Optional: if you set this, the code will try it first
+FTP_LOGS_DIR_ENV = os.getenv("FTP_LOGS_DIR")
 
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
-
-# Only allow these log types (exclude backups etc)
-ALLOW_SHOOTERGAME = True
-ALLOW_SERVERGAME = True
 
 # =========================
 # VALIDATION
@@ -38,7 +34,6 @@ for k, v in [
 ]:
     if not v:
         missing.append(k)
-
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
@@ -58,8 +53,6 @@ def discord_color_for_line(text: str) -> int:
     return 0x95A5A6  # grey default
 
 def clean_line(line: str) -> str:
-    # Remove ARK RichColor tags etc (optional but makes Discord cleaner)
-    # Example: <RichColor Color="1, 0, 1, 1"> ... </>)
     line = re.sub(r"<\/?RichColor[^>]*>", "", line)
     return line.strip()
 
@@ -82,7 +75,6 @@ def send_to_discord(line: str) -> None:
         if r.status_code == 204:
             return
         if r.status_code == 429:
-            # Respect rate limit
             try:
                 data = r.json()
                 retry_after = float(data.get("retry_after", 1.0))
@@ -91,7 +83,6 @@ def send_to_discord(line: str) -> None:
             time.sleep(max(0.2, retry_after))
             continue
 
-        # Other errors: print body for debugging
         print(f"Error: Discord webhook error {r.status_code}: {r.text}")
         return
 
@@ -102,27 +93,84 @@ def ftp_connect() -> ftplib.FTP:
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, FTP_PORT, timeout=20)
     ftp.login(FTP_USER, FTP_PASS)
-    # Important for SIZE/MLSD reliability:
+    # Make SIZE/REST more reliable
     try:
-        ftp.voidcmd("TYPE I")  # binary mode
+        ftp.voidcmd("TYPE I")  # binary
     except Exception:
         pass
     return ftp
 
+def dir_exists(ftp: ftplib.FTP, path: str) -> bool:
+    cur = None
+    try:
+        cur = ftp.pwd()
+    except Exception:
+        cur = None
+
+    try:
+        ftp.cwd(path)
+        return True
+    except Exception:
+        return False
+    finally:
+        if cur:
+            try:
+                ftp.cwd(cur)
+            except Exception:
+                pass
+
+def discover_logs_dir(ftp: ftplib.FTP) -> str:
+    # Try user's configured dir first, then common Nitrado layouts
+    candidates = []
+    if FTP_LOGS_DIR_ENV:
+        candidates.append(FTP_LOGS_DIR_ENV.strip("/"))
+
+    candidates += [
+        "arksa/ShooterGame/Saved/Logs",
+        "ShooterGame/Saved/Logs",
+        "Saved/Logs",
+    ]
+
+    # De-dupe while preserving order
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    print(f"FTP PWD: {safe_pwd(ftp)}")
+    for c in ordered:
+        if dir_exists(ftp, c):
+            print(f"Using logs dir: {c}")
+            return c
+
+    # If none work, give a helpful debug dump
+    print("Could not find a working Logs directory. Top-level listing:")
+    try:
+        print(ftp.nlst())
+    except Exception as e:
+        print(f"Could not NLST root: {e}")
+
+    raise RuntimeError("No valid logs directory found. Set FTP_LOGS_DIR to the correct path for your FTP root.")
+
+def safe_pwd(ftp: ftplib.FTP) -> str:
+    try:
+        return ftp.pwd()
+    except Exception:
+        return "(unknown)"
+
 def ftp_listdir(ftp: ftplib.FTP, path: str) -> List[str]:
-    # Use NLST for max compatibility
     try:
         return ftp.nlst(path)
-    except ftplib.error_perm as e:
-        # Sometimes NLST needs cwd then nlst() with no args
+    except ftplib.error_perm:
         ftp.cwd(path)
         return ftp.nlst()
 
-def is_allowed_log(name: str) -> bool:
-    base = os.path.basename(name)
-
-    # exclude noisy stuff
+def is_allowed_log(full_path: str) -> bool:
+    base = os.path.basename(full_path)
     lower = base.lower()
+
     if "backup" in lower:
         return False
     if "failedwater" in lower:
@@ -130,68 +178,58 @@ def is_allowed_log(name: str) -> bool:
     if lower.endswith(".crashstack"):
         return False
 
-    if ALLOW_SHOOTERGAME and base == "ShooterGame.log":
+    if base == "ShooterGame.log":
         return True
-    if ALLOW_SERVERGAME and base.startswith("ServerGame.") and base.endswith(".log"):
+    if base.startswith("ServerGame.") and base.endswith(".log"):
         return True
 
     return False
 
-def pick_active_log(ftp: ftplib.FTP) -> Optional[str]:
-    """
-    Pick the most recently modified allowed log from FTP_LOGS_DIR.
-    Prefers MLSD timestamps; falls back to filename preference.
-    Returns full path.
-    """
-    # Try MLSD for timestamps (best)
-    candidates: List[Tuple[str, str]] = []  # (path, modify)
+def pick_active_log(ftp: ftplib.FTP, logs_dir: str) -> Optional[str]:
+    # Best: MLSD for timestamps
     try:
-        ftp.cwd(FTP_LOGS_DIR)
+        ftp.cwd(logs_dir)
+        candidates: List[Tuple[str, str]] = []
         for name, facts in ftp.mlsd():
-            if not is_allowed_log(name):
+            p = f"{logs_dir.rstrip('/')}/{name}"
+            if not is_allowed_log(p):
                 continue
-            modify = facts.get("modify", "")
-            candidates.append((f"{FTP_LOGS_DIR.rstrip('/')}/{name}", modify))
+            candidates.append((p, facts.get("modify", "")))
         if candidates:
-            # Sort by modify time (YYYYMMDDHHMMSS)
             candidates.sort(key=lambda x: x[1], reverse=True)
             return candidates[0][0]
     except Exception:
         pass
 
-    # Fallback: NLST + preference order (ShooterGame.log first, else latest ServerGame.* lexicographically)
-    try:
-        items = ftp_listdir(ftp, FTP_LOGS_DIR)
-        allowed = [p for p in items if is_allowed_log(p)]
-        if not allowed:
-            return None
-
-        # Prefer ShooterGame.log if present
-        for p in allowed:
-            if os.path.basename(p) == "ShooterGame.log":
-                # Ensure full path
-                if "/" not in p:
-                    return f"{FTP_LOGS_DIR.rstrip('/')}/{p}"
-                return p
-
-        # Else pick "largest-looking" / last in sort
-        allowed.sort()
-        p = allowed[-1]
+    # Fallback: NLST + preference
+    items = ftp_listdir(ftp, logs_dir)
+    allowed = []
+    for p in items:
+        # NLST may return absolute-ish or just names depending on server
         if "/" not in p:
-            return f"{FTP_LOGS_DIR.rstrip('/')}/{p}"
-        return p
-    except Exception:
+            p = f"{logs_dir.rstrip('/')}/{p}"
+        if is_allowed_log(p):
+            allowed.append(p)
+
+    if not allowed:
         return None
+
+    # Prefer ShooterGame.log if present
+    for p in allowed:
+        if os.path.basename(p) == "ShooterGame.log":
+            return p
+
+    allowed.sort()
+    return allowed[-1]
 
 def get_remote_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
     try:
-        ftp.voidcmd("TYPE I")  # binary mode for SIZE
+        ftp.voidcmd("TYPE I")
     except Exception:
         pass
     try:
         return ftp.size(path)
     except Exception as e:
-        # You were seeing "No such file or directory" here
         print(f"Could not get remote file size: {e}")
         return None
 
@@ -205,9 +243,6 @@ def read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
     ftp.retrbinary(f"RETR {path}", _cb, rest=offset)
     return bytes(buf)
 
-# =========================
-# DEDUPE HELPERS
-# =========================
 def fingerprint(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest()
 
@@ -216,11 +251,10 @@ def fingerprint(line: str) -> str:
 # =========================
 def main():
     print("Starting Container")
-    print(f"Logs dir: {FTP_LOGS_DIR}")
-    print("Allowed logs: ShooterGame.log and ServerGame*.log (excluding backups/FailedWater/etc)")
     print(f"Polling every {POLL_INTERVAL:.1f} seconds")
-    print(f"Filtering: {TARGET_TRIBE}")
+    print(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
 
+    logs_dir: Optional[str] = None
     active_log: Optional[str] = None
     offset = 0
     first_run = True
@@ -230,9 +264,12 @@ def main():
         try:
             ftp = ftp_connect()
             try:
-                chosen = pick_active_log(ftp)
+                if logs_dir is None:
+                    logs_dir = discover_logs_dir(ftp)
+
+                chosen = pick_active_log(ftp, logs_dir)
                 if not chosen:
-                    print(f"No ShooterGame.log / ServerGame*.log files found in directory: {FTP_LOGS_DIR}")
+                    print(f"No ShooterGame.log / ServerGame*.log found in: {logs_dir}")
                     time.sleep(POLL_INTERVAL)
                     continue
 
@@ -244,11 +281,9 @@ def main():
 
                 size = get_remote_size(ftp, active_log)
                 if size is None:
-                    # file missing right now
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # If first run, skip backlog and start from end
                 if first_run:
                     offset = size
                     first_run = False
@@ -256,13 +291,11 @@ def main():
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # If file shrank (rotation), reset offset
                 if size < offset:
                     print(f"Log rotated (size {size} < offset {offset}) -> resetting offset")
                     offset = 0
 
                 if size == offset:
-                    # nothing new
                     time.sleep(POLL_INTERVAL)
                     continue
 
@@ -272,11 +305,6 @@ def main():
                 text = data.decode("utf-8", errors="ignore")
                 lines = [ln for ln in text.splitlines() if ln.strip()]
 
-                if not lines:
-                    time.sleep(POLL_INTERVAL)
-                    continue
-
-                # Find newest matching line only (to avoid webhook spam)
                 newest_match = None
                 for ln in reversed(lines):
                     if TARGET_TRIBE.lower() in ln.lower():
@@ -289,9 +317,6 @@ def main():
                         send_to_discord(newest_match)
                         last_sent_fp = fp
                         print("Sent 1 message to Discord (most recent matching log)")
-                    else:
-                        # same newest line as last time
-                        pass
 
             finally:
                 try:
@@ -299,8 +324,6 @@ def main():
                 except Exception:
                     pass
 
-        except ftplib.error_perm as e:
-            print(f"Error: FTP permission/error: {e}")
         except Exception as e:
             print(f"Error: {e}")
 
