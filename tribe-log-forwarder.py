@@ -1,17 +1,13 @@
 import os
 import time
-import json
-import re
 import ftplib
 import hashlib
-from typing import List, Optional, Tuple, Dict
-
 import requests
+from typing import List, Optional, Tuple
 
 # =========================
 # ENV CONFIG
 # =========================
-
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER")
@@ -19,380 +15,368 @@ FTP_PASS = os.getenv("FTP_PASS")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "arksa/ShooterGame/Saved/Logs").rstrip("/")
+# Nitrado Logs folder (ASA)
+FTP_LOG_DIR = os.getenv("FTP_LOG_DIR", "arksa/ShooterGame/Saved/Logs")
 
+# Tribe filter
 TARGET_TRIBE = os.getenv("TARGET_TRIBE", "Tribe Valkyrie")
+
+# Polling
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))
 
-STATE_FILE = "cursor.json"
+# Heartbeat (minutes) - sends "still alive / no new log data" if nothing new comes in
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "30"))
 
-# Behavior toggles
-SKIP_BACKLOG_ON_FIRST_RUN = os.getenv("SKIP_BACKLOG_ON_FIRST_RUN", "true").lower() in ("1", "true", "yes")
-SEND_LATEST_ON_START = os.getenv("SEND_LATEST_ON_START", "true").lower() in ("1", "true", "yes")
-
-# How many bytes from the end to inspect when sending "latest on start"
-TAIL_BYTES = int(os.getenv("TAIL_BYTES", "200000"))  # ~200 KB
-
-# Only these log types are allowed
-ALLOW_EXACT = {"shootergame.log"}
-ALLOW_PREFIX = ("servergame",)
-
-# Always ignore these patterns
-DENY_SUBSTRINGS = (
-    "-backup-",
-    "failedwaterdinospawns",
-    ".crashstack",
-)
+# If true, skip backlog on first run (recommended)
+SKIP_BACKLOG_ON_START = os.getenv("SKIP_BACKLOG_ON_START", "true").lower() in ("1", "true", "yes", "y")
 
 # =========================
 # VALIDATION
 # =========================
-
 missing = []
-for k, v in [
-    ("FTP_HOST", FTP_HOST),
-    ("FTP_USER", FTP_USER),
-    ("FTP_PASS", FTP_PASS),
-    ("DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL),
-]:
-    if not v:
-        missing.append(k)
+if not FTP_HOST:
+    missing.append("FTP_HOST")
+if not FTP_USER:
+    missing.append("FTP_USER")
+if not FTP_PASS:
+    missing.append("FTP_PASS")
+if not DISCORD_WEBHOOK_URL:
+    missing.append("DISCORD_WEBHOOK_URL")
+
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
+
 # =========================
-# DISCORD FORMATTING
+# DISCORD HELPERS
 # =========================
-
-RICH_TAG_RE = re.compile(r"<[^>]+>")
-
-def clean_ark_text(s: str) -> str:
-    s = s.strip()
-    s = RICH_TAG_RE.sub("", s)
-    return s.strip()
-
-def line_color(text: str) -> int:
+def pick_color(text: str) -> int:
     lower = text.lower()
+
+    # Purple: claiming/unclaiming
     if "claimed" in lower or "unclaimed" in lower or "claiming" in lower:
-        return 0x9B59B6  # purple
+        return 0x9B59B6
+
+    # Green: taming/tamed
     if "tamed" in lower or "taming" in lower:
-        return 0x2ECC71  # green
-    if "was killed" in lower or "killed" in lower or "died" in lower or "starved to death" in lower:
-        return 0xE74C3C  # red
+        return 0x2ECC71
+
+    # Red: deaths
+    if (
+        "was killed" in lower
+        or "killed" in lower
+        or "died" in lower
+        or "starved to death" in lower
+        or "was slain" in lower
+    ):
+        return 0xE74C3C
+
+    # Yellow: demolished/destroyed
     if "demolished" in lower or "destroyed" in lower:
-        return 0xF1C40F  # yellow
-    return 0x95A5A6      # default
+        return 0xF1C40F
 
-def format_payload(line: str) -> dict:
-    txt = clean_ark_text(line)
-    return {"embeds": [{"description": txt[:4096], "color": line_color(txt)}]}
+    # Default grey
+    return 0x95A5A6
 
-def send_to_discord(payload: dict) -> None:
-    while True:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
-        if r.status_code in (200, 204):
+
+def discord_payload(message: str, color: int, username: str = "Valkyrie Tribe Logs") -> dict:
+    return {
+        "username": username,
+        "embeds": [
+            {
+                "description": message,
+                "color": color,
+            }
+        ],
+    }
+
+
+def send_to_discord(payload: dict, max_retries: int = 3) -> None:
+    """
+    Handles Discord 429 rate limiting using retry_after.
+    """
+    for attempt in range(max_retries):
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+
+        # Success
+        if 200 <= resp.status_code < 300:
             return
-        if r.status_code == 429:
+
+        # Rate limited
+        if resp.status_code == 429:
             try:
-                data = r.json()
+                data = resp.json()
                 retry_after = float(data.get("retry_after", 1.0))
             except Exception:
                 retry_after = 1.0
-            time.sleep(max(0.05, retry_after))
+            time.sleep(max(0.2, retry_after))
             continue
-        raise RuntimeError(f"Discord webhook error {r.status_code}: {r.text[:500]}")
 
-def hash_line(line: str) -> str:
-    return hashlib.sha256(clean_ark_text(line).encode("utf-8", errors="ignore")).hexdigest()
+        # Other errors
+        raise RuntimeError(f"Discord webhook error {resp.status_code}: {resp.text}")
 
-# =========================
-# STATE
-# =========================
+    raise RuntimeError("Discord webhook error: exceeded retry attempts (rate limited)")
 
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {"path": None, "offset": 0, "initialized": False, "last_hash": None, "sizes": {}}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        return {
-            "path": s.get("path"),
-            "offset": int(s.get("offset", 0)),
-            "initialized": bool(s.get("initialized", False)),
-            "last_hash": s.get("last_hash"),
-            "sizes": s.get("sizes", {}) or {},
-        }
-    except Exception:
-        return {"path": None, "offset": 0, "initialized": False, "last_hash": None, "sizes": {}}
-
-def save_state(path: str, offset: int, initialized: bool, last_hash: Optional[str], sizes: Dict[str, int]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "path": path,
-                "offset": int(offset),
-                "initialized": bool(initialized),
-                "last_hash": last_hash,
-                "sizes": sizes,
-            },
-            f,
-        )
 
 # =========================
 # FTP HELPERS
 # =========================
-
 def ftp_connect() -> ftplib.FTP:
     ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
     ftp.login(FTP_USER, FTP_PASS)
-    ftp.set_pasv(True)
-    try:
-        ftp.voidcmd("TYPE I")  # binary mode (helps SIZE)
-    except Exception:
-        pass
     return ftp
 
-def ftp_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
+
+def list_allowed_logs(ftp: ftplib.FTP, logs_dir: str) -> List[str]:
+    """
+    Only allow:
+      - ShooterGame.log
+      - ServerGame*.log
+    Exclude backups, crashstack, FailedWater, etc.
+    """
+    ftp.cwd(logs_dir)
+    names = ftp.nlst()
+
+    allowed = []
+    for name in names:
+        base = name.split("/")[-1]
+
+        # Exclusions
+        lower = base.lower()
+        if "backup" in lower:
+            continue
+        if "failedwater" in lower:
+            continue
+        if lower.endswith(".crashstack"):
+            continue
+
+        # Allowed patterns
+        if base == "ShooterGame.log":
+            allowed.append(base)
+        elif base.startswith("ServerGame") and base.endswith(".log"):
+            allowed.append(base)
+
+    return allowed
+
+
+def ftp_size_binary(ftp: ftplib.FTP, remote_path: str) -> int:
+    """
+    Some FTP servers require binary mode for SIZE.
+    """
     try:
-        resp = ftp.sendcmd(f"SIZE {path}")
-        return int(resp.split()[-1])
+        ftp.voidcmd("TYPE I")
     except Exception:
+        pass
+    return ftp.size(remote_path)
+
+
+def read_from_offset(ftp: ftplib.FTP, remote_path: str, offset: int) -> bytes:
+    """
+    Reads bytes from remote_path starting at offset using REST + RETR.
+    """
+    chunks: List[bytes] = []
+
+    def _cb(data: bytes) -> None:
+        chunks.append(data)
+
+    try:
+        ftp.voidcmd("TYPE I")
+    except Exception:
+        pass
+
+    ftp.retrbinary(f"RETR {remote_path}", _cb, rest=offset)
+    return b"".join(chunks)
+
+
+def select_active_log(ftp: ftplib.FTP, logs_dir: str, allowed: List[str]) -> Optional[str]:
+    """
+    Prefer ShooterGame.log if present; otherwise pick the largest ServerGame*.log.
+    """
+    if not allowed:
         return None
 
-def is_allowed_log(path: str) -> bool:
-    base = path.split("/")[-1].lower()
-    for bad in DENY_SUBSTRINGS:
-        if bad in base:
-            return False
-    if base in ALLOW_EXACT:
-        return True
-    if any(base.startswith(pfx) for pfx in ALLOW_PREFIX) and base.endswith(".log"):
-        return True
-    return False
+    if "ShooterGame.log" in allowed:
+        return f"{logs_dir}/ShooterGame.log"
 
-def ftp_list_allowed_logs(ftp: ftplib.FTP, log_dir: str) -> List[str]:
-    names: List[str] = []
-    ftp.cwd(log_dir)
-    ftp.retrlines("NLST", names.append)
-
-    full_paths: List[str] = []
-    for n in names:
-        n = n.strip()
-        if not n:
+    # Pick largest servergame log
+    best_path = None
+    best_size = -1
+    for base in allowed:
+        p = f"{logs_dir}/{base}"
+        try:
+            s = ftp_size_binary(ftp, p)
+        except Exception:
             continue
-        path = n if "/" in n else f"{log_dir}/{n}"
-        if is_allowed_log(path):
-            full_paths.append(path)
-    return full_paths
+        if s > best_size:
+            best_size = s
+            best_path = p
 
-def ftp_read_from_offset(ftp: ftplib.FTP, path: str, offset: int) -> bytes:
-    buf = bytearray()
-    def cb(chunk: bytes):
-        buf.extend(chunk)
-    ftp.retrbinary(f"RETR {path}", cb, rest=offset)
-    return bytes(buf)
+    return best_path
 
-def fetch_new_lines(path: str, offset: int) -> Tuple[int, List[str], Optional[int]]:
-    ftp = ftp_connect()
-    try:
-        size = ftp_size(ftp, path)
-        if size is not None and size < offset:
-            print(f"Log shrank/rotated: size={size} < offset={offset}. Resetting to 0.")
-            offset = 0
-
-        raw = ftp_read_from_offset(ftp, path, offset)
-        if not raw:
-            return offset, [], size
-
-        new_offset = offset + len(raw)
-        text = raw.decode("utf-8", errors="ignore")
-        return new_offset, text.splitlines(), size
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
-
-def fetch_tail_lines(path: str, tail_bytes: int) -> Tuple[int, List[str], Optional[int]]:
-    ftp = ftp_connect()
-    try:
-        size = ftp_size(ftp, path)
-        if size is None:
-            # fallback: read from 0 (not ideal)
-            start = 0
-        else:
-            start = max(0, size - tail_bytes)
-
-        raw = ftp_read_from_offset(ftp, path, start)
-        text = raw.decode("utf-8", errors="ignore")
-        return (size if size is not None else start + len(raw)), text.splitlines(), size
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
 
 # =========================
-# LOG SELECTION (FOLLOW THE GROWING LOG)
+# LOG PARSING / DEDUPE
 # =========================
+def normalize_line(line: str) -> str:
+    # Strip and collapse weird whitespace
+    return " ".join(line.strip().split())
 
-def pick_growing_log(logs: List[str], sizes_now: Dict[str, int], sizes_prev: Dict[str, int], current: Optional[str]) -> Optional[str]:
-    # Choose log with biggest positive growth since last check
-    best = None
-    best_delta = 0
 
-    for p in logs:
-        now = sizes_now.get(p, -1)
-        prev = sizes_prev.get(p, -1)
-        if now >= 0 and prev >= 0:
-            delta = now - prev
-            if delta > best_delta:
-                best_delta = delta
-                best = p
+def line_hash(line: str) -> str:
+    return hashlib.sha256(normalize_line(line).encode("utf-8", errors="ignore")).hexdigest()
 
-    # If something grew, follow it
-    if best and best_delta > 0:
-        return best
 
-    # Otherwise keep current if it still exists
-    if current in logs:
-        return current
+def find_last_matching_line(lines: List[str], needle: str) -> Optional[str]:
+    """
+    Return the last line that contains the target tribe string.
+    """
+    n = needle.lower()
+    for line in reversed(lines):
+        if n in line.lower():
+            return line
+    return None
 
-    # Fallback: prefer ShooterGame.log if present
-    for p in logs:
-        if p.split("/")[-1].lower() == "shootergame.log":
-            return p
-
-    # Otherwise pick largest
-    biggest = None
-    biggest_sz = -1
-    for p in logs:
-        sz = sizes_now.get(p, -1)
-        if sz > biggest_sz:
-            biggest_sz = sz
-            biggest = p
-    return biggest
 
 # =========================
 # MAIN
 # =========================
-
-def main():
+def main() -> None:
     print("Starting Container")
     print(f"Polling every {POLL_INTERVAL:.1f} seconds")
     print(f"Filtering: {TARGET_TRIBE} (sending ONLY the most recent matching log)")
     print(f"Logs dir: {FTP_LOG_DIR}")
     print("Allowed logs: ShooterGame.log and ServerGame*.log (excluding backups/FailedWater/etc)")
 
-    state = load_state()
-    current_path = state.get("path")
-    offset = int(state.get("offset", 0))
-    initialized = bool(state.get("initialized", False))
-    last_hash = state.get("last_hash")
-    sizes_prev: Dict[str, int] = {k: int(v) for k, v in (state.get("sizes") or {}).items()}
+    # Cursor state
+    active_log: Optional[str] = None
+    offset: int = 0
+    partial_buf: bytes = b""
+    last_sent: Optional[str] = None  # hash of last sent line
+
+    # Heartbeat state
+    last_any_new_data_ts = time.time()
+    last_heartbeat_sent_ts = 0.0
+
+    first_run = True
 
     while True:
         try:
             ftp = ftp_connect()
-            try:
-                allowed = ftp_list_allowed_logs(ftp, FTP_LOG_DIR)
-                if not allowed:
-                    print(f"No allowed logs found in directory: {FTP_LOG_DIR}")
-                    time.sleep(POLL_INTERVAL)
-                    continue
 
-                sizes_now: Dict[str, int] = {}
-                for p in allowed:
-                    sz = ftp_size(ftp, p)
-                    if sz is not None:
-                        sizes_now[p] = sz
-
-                chosen = pick_growing_log(allowed, sizes_now, sizes_prev, current_path)
-            finally:
-                try:
-                    ftp.quit()
-                except Exception:
-                    pass
+            # Find allowed logs and choose active
+            allowed = list_allowed_logs(ftp, FTP_LOG_DIR)
+            chosen = select_active_log(ftp, FTP_LOG_DIR, allowed)
 
             if not chosen:
-                print("No chosen log this poll.")
+                print(f"No allowed logs found in directory: {FTP_LOG_DIR}")
+                ftp.quit()
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if chosen != current_path:
-                print(f"Log target changed: {current_path} -> {chosen} (resetting cursor)")
-                current_path = chosen
+            if chosen != active_log:
+                print(f"Active log selected: {chosen}")
+                active_log = chosen
                 offset = 0
-                initialized = False
-                # keep last_hash so we still dedupe the “latest” line if it repeats across logs
+                partial_buf = b""
+                first_run = True
 
-            base = current_path.split("/")[-1]
-
-            # Startup behavior: skip backlog BUT send the latest matching line once
-            if not initialized and SKIP_BACKLOG_ON_FIRST_RUN and SEND_LATEST_ON_START:
-                end_offset, tail_lines, size = fetch_tail_lines(current_path, TAIL_BYTES)
-                most_recent = None
-                for line in reversed(tail_lines):
-                    if TARGET_TRIBE.lower() in line.lower():
-                        most_recent = line
-                        break
-                if most_recent:
-                    h = hash_line(most_recent)
-                    if h != last_hash:
-                        send_to_discord(format_payload(most_recent))
-                        last_hash = h
-                        print("Sent latest matching line on startup.")
-                    else:
-                        print("Startup latest already sent (deduped).")
-                else:
-                    print("No matching Valkyrie line found in tail on startup.")
-
-                offset = end_offset
-                initialized = True
-                sizes_prev = sizes_now
-                save_state(current_path, offset, initialized, last_hash, sizes_prev)
-                print("First run: started live from the end.")
+            # Get remote size
+            try:
+                remote_size = ftp_size_binary(ftp, active_log)
+            except Exception as e:
+                ftp.quit()
+                print(f"Could not get remote file size: {e}")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Normal polling
-            new_offset, lines, size = fetch_new_lines(current_path, offset)
+            # On first run, optionally skip backlog and start from end
+            if first_run and SKIP_BACKLOG_ON_START:
+                offset = remote_size
+                first_run = False
+                ftp.quit()
+                print("First run: skipped backlog and started live from the end.")
+                time.sleep(POLL_INTERVAL)
+                continue
 
-            if size is not None:
-                print(f"Heartbeat: file={base} size={size} offset={offset}->{new_offset} new_lines={len(lines)}")
-            else:
-                print(f"Heartbeat: file={base} offset={offset}->{new_offset} new_lines={len(lines)} (SIZE n/a)")
+            # If no new bytes, heartbeat logic
+            if remote_size <= offset:
+                ftp.quit()
 
-            offset = new_offset
+                now = time.time()
+                minutes_since_new = (now - last_any_new_data_ts) / 60.0
 
-            # Send ONLY the most recent matching line from the NEW chunk
-            most_recent = None
-            for line in reversed(lines):
-                if TARGET_TRIBE.lower() in line.lower():
-                    most_recent = line
-                    break
+                if HEARTBEAT_MINUTES > 0 and (now - last_heartbeat_sent_ts) >= (HEARTBEAT_MINUTES * 60):
+                    hb_msg = f"No new log data from Nitrado yet (last change ~{int(minutes_since_new)} min ago). Still running."
+                    try:
+                        send_to_discord(discord_payload(hb_msg, 0x95A5A6))
+                        print("Heartbeat sent to Discord")
+                        last_heartbeat_sent_ts = now
+                    except Exception as e:
+                        print(f"Heartbeat send failed: {e}")
 
-            if most_recent:
-                h = hash_line(most_recent)
-                if h != last_hash:
-                    send_to_discord(format_payload(most_recent))
-                    last_hash = h
-                    print("Sent 1 message to Discord (most recent match)")
-                else:
-                    print("Most recent match already sent (deduped)")
-            else:
-                if lines:
-                    print("No matching Valkyrie line in the new chunk.")
+                time.sleep(POLL_INTERVAL)
+                continue
 
-            initialized = True
-            sizes_prev = sizes_now
-            save_state(current_path, offset, initialized, last_hash, sizes_prev)
+            # Read new bytes
+            data = read_from_offset(ftp, active_log, offset)
+            ftp.quit()
+
+            offset = remote_size
+
+            if not data:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            last_any_new_data_ts = time.time()
+
+            # Combine with any partial line from last poll
+            combined = partial_buf + data
+
+            # Split into lines safely
+            lines_bytes = combined.split(b"\n")
+
+            # Last element may be an incomplete line
+            partial_buf = lines_bytes[-1]
+            complete_lines = lines_bytes[:-1]
+
+            decoded_lines = []
+            for bline in complete_lines:
+                try:
+                    decoded_lines.append(bline.decode("utf-8", errors="ignore"))
+                except Exception:
+                    continue
+
+            # Find ONLY the most recent matching line
+            last_match = find_last_matching_line(decoded_lines, TARGET_TRIBE)
+            if not last_match:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            cleaned = normalize_line(last_match)
+            h = line_hash(cleaned)
+
+            # Dedupe: don't resend same line
+            if last_sent == h:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # Send it
+            color = pick_color(cleaned)
+            payload = discord_payload(cleaned, color)
+
+            try:
+                send_to_discord(payload)
+                print("Sent 1 message to Discord")
+                last_sent = h
+            except Exception as e:
+                print(f"Error sending to Discord: {e}")
 
         except Exception as e:
             print(f"Error: {e}")
 
         time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
