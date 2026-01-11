@@ -1,165 +1,179 @@
 import os
-import time
 import json
+import time
 import asyncio
+import hashlib
 import re
 import aiohttp
 
-# =========================
+# =====================
 # ENV
-# =========================
+# =====================
 RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = int(os.getenv("RCON_PORT", "27020"))
+RCON_PORT = int(os.getenv("RCON_PORT", "0"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
 
 TRIBE_ROUTES_RAW = os.getenv("TRIBE_ROUTES")
 
 missing = []
-for k in ["RCON_HOST", "RCON_PASSWORD", "TRIBE_ROUTES"]:
+for k in ["RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "TRIBE_ROUTES"]:
     if not os.getenv(k):
         missing.append(k)
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-def load_routes(raw: str):
-    """
-    Railway sometimes stores JSON as a quoted string (double-encoded).
-    This unwraps JSON up to 3 times until it becomes a list/dict.
-    """
-    val = raw
-    for _ in range(3):
-        if isinstance(val, (list, dict)):
-            break
-        if isinstance(val, str):
-            val = val.strip()
-            val = json.loads(val)
-        else:
-            break
+TRIBE_ROUTES = json.loads(TRIBE_ROUTES_RAW)
+print("Routing tribes:", ", ".join(TRIBE_ROUTES.keys()))
 
-    if isinstance(val, dict):
-        val = [val]
-    if not isinstance(val, list):
-        raise RuntimeError("TRIBE_ROUTES must be a JSON list of objects (or a single object).")
-
-    # basic validation
-    for i, r in enumerate(val):
-        if not isinstance(r, dict):
-            raise RuntimeError(f"TRIBE_ROUTES item {i} is not an object.")
-        if "tribe" not in r or "webhook" not in r:
-            raise RuntimeError(f"TRIBE_ROUTES item {i} must include 'tribe' and 'webhook'.")
-        # thread_id optional
-    return val
-
-TRIBE_ROUTES = load_routes(TRIBE_ROUTES_RAW)
-print("Routing tribes:", ", ".join(r["tribe"] for r in TRIBE_ROUTES))
-
-# =========================
-# COLOURS
-# =========================
+# =====================
+# COLORS (as requested)
+# =====================
 COLORS = {
-    "RED": 0xE74C3C,
-    "YELLOW": 0xF1C40F,
-    "PURPLE": 0x9B59B6,
-    "GREEN": 0x2ECC71,
-    "BLUE": 0x5DADE2,
-    "WHITE": 0xECF0F1,
+    "RED": 0xE74C3C,      # killed/died/death/destroyed
+    "YELLOW": 0xF1C40F,   # demolished
+    "PURPLE": 0x9B59B6,   # claimed/unclaimed
+    "GREEN": 0x2ECC71,    # tamed
+    "BLUE": 0x5DADE2,     # alliance
+    "WHITE": 0xECF0F1,    # everything else (froze)
 }
 
-# =========================
-# HELPERS
-# =========================
-RICHCOLOR_RE = re.compile(r"<RichColor[^>]*>")
+# =====================
+# CLEANUP + FORMAT
+# =====================
+RICHCOLOR_RE = re.compile(r"<RichColor[^>]*>", re.IGNORECASE)
+ENDTAG_RE = re.compile(r"</>", re.IGNORECASE)
 
-def clean_text(text: str) -> str:
-    # remove RichColor tags
-    text = RICHCOLOR_RE.sub("", text)
+DAYSTAMP_RE = re.compile(r"^Day\s+(?P<day>\d+),\s*(?P<time>\d{2}:\d{2}:\d{2})\s*:\s*(?P<msg>.+)$")
 
-    # remove trailing Ark formatting artifacts
-    text = text.replace("</>)", "").replace("</>", "")
-    text = text.replace("!)", ")").replace("!'","'").replace("!'", "'")
+def clean_ark_markup(s: str) -> str:
+    # remove RichColor + </>
+    s = RICHCOLOR_RE.sub("", s)
+    s = ENDTAG_RE.sub("", s)
+    return s.strip()
 
-    # remove lingering extra ! at end like ...')!
-    text = re.sub(r"'\)\!$", "')", text)
-
-    # collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def classify_color(text: str) -> int:
-    t = text.lower()
-
-    # Red - Killed / Died / Death / Destroyed
-    if any(x in t for x in ["killed", "died", "death", "destroyed", "starved"]):
-        return COLORS["RED"]
-
-    # Yellow - Demolished + Unclaimed (your change)
-    if "demolished" in t or "unclaimed" in t:
-        return COLORS["YELLOW"]
-
-    # Purple - Claimed
-    if "claimed" in t:
-        return COLORS["PURPLE"]
-
-    # Green - Tamed
-    if "tamed" in t:
-        return COLORS["GREEN"]
-
-    # Light blue - Alliance
-    if "alliance" in t:
-        return COLORS["BLUE"]
-
-    # White - Anything else (froze etc.)
-    return COLORS["WHITE"]
-
-def extract_core(line: str) -> str | None:
+def tidy_trailing_punct(s: str) -> str:
     """
-    Output ONLY:
-    Day XXX, HH:MM:SS - WHO ACTION
+    Removes the annoying ARK endings like:
+      ... (Thing)!)
+      ... (Thing)!))
+      ... 'Name'!)
+    while keeping the meaningful final ')', quotes, etc.
     """
-    m = re.search(r"Day\s+(\d+),\s+(\d{2}:\d{2}:\d{2}):\s+(.*)", line)
+    s = s.strip()
+
+    # common endings: ")!)", ")!))" -> ")"
+    s = re.sub(r"\)\s*!+\s*\)+\s*$", ")", s)
+
+    # endings like "'!)" or "'!))" -> "'"
+    s = re.sub(r"'\s*!+\s*\)+\s*$", "'", s)
+
+    # fallback: trailing "!))" -> ""
+    s = re.sub(r"\s*!+\s*\)+\s*$", "", s)
+
+    return s.strip()
+
+def extract_day_time_who_what(raw_line: str) -> str | None:
+    """
+    Returns exactly:
+      Day X, HH:MM:SS: Who What
+    or None if no in-game day/time stamp exists.
+    """
+    s = clean_ark_markup(raw_line)
+
+    # Find the FIRST "Day " occurrence and take from there
+    idx = s.lower().find("day ")
+    if idx == -1:
+        return None
+
+    tail = s[idx:].strip()
+
+    m = DAYSTAMP_RE.match(tail)
     if not m:
         return None
 
-    day, time_, rest = m.groups()
-    rest = clean_text(rest)
-    return f"Day {day}, {time_} - {rest}"
+    day = m.group("day")
+    t = m.group("time")
+    msg = tidy_trailing_punct(m.group("msg").strip())
 
-# =========================
-# RCON (minimal Source RCON)
-# =========================
-def rcon_packet(req_id, ptype, body):
-    data = body.encode("utf-8", errors="ignore") + b"\x00"
-    pkt = req_id.to_bytes(4, "little", signed=True)
-    pkt += ptype.to_bytes(4, "little", signed=True)
-    pkt += data + b"\x00"
+    # Final output exactly like your "froze" example
+    return f"Day {day}, {t}: {msg}"
+
+def classify_color(formatted_line: str) -> int:
+    t = formatted_line.lower()
+
+    # Red
+    if any(x in t for x in ["killed", "died", "death", "destroyed", "starved"]):
+        return COLORS["RED"]
+
+    # Yellow
+    if "demolished" in t:
+        return COLORS["YELLOW"]
+
+    # Purple
+    if any(x in t for x in ["claimed", "unclaimed"]):
+        return COLORS["PURPLE"]
+
+    # Green
+    if "tamed" in t:
+        return COLORS["GREEN"]
+
+    # Light blue
+    if "alliance" in t:
+        return COLORS["BLUE"]
+
+    # White for everything else (froze etc)
+    return COLORS["WHITE"]
+
+# =====================
+# RCON
+# =====================
+def _rcon_packet(req_id: int, ptype: int, body: str) -> bytes:
+    data = body.encode("utf-8") + b"\x00"
+    pkt = (
+        req_id.to_bytes(4, "little", signed=True)
+        + ptype.to_bytes(4, "little", signed=True)
+        + data
+        + b"\x00"
+    )
     return len(pkt).to_bytes(4, "little", signed=True) + pkt
 
-async def rcon_command(cmd: str) -> str:
+async def rcon_command(cmd: str, timeout: float = 6.0) -> str:
     reader, writer = await asyncio.open_connection(RCON_HOST, RCON_PORT)
     try:
         # auth
-        writer.write(rcon_packet(1, 3, RCON_PASSWORD))
+        writer.write(_rcon_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
         await reader.read(4096)
 
         # command
-        writer.write(rcon_packet(2, 2, cmd))
+        writer.write(_rcon_packet(2, 2, cmd))
         await writer.drain()
 
-        out = b""
+        data = b""
         while True:
             try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.3)
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=0.3)
             except asyncio.TimeoutError:
                 break
-            if not part:
+            if not chunk:
                 break
-            out += part
+            data += chunk
 
-        return out.decode("utf-8", errors="ignore")
+        out = []
+        i = 0
+        while i + 4 <= len(data):
+            size = int.from_bytes(data[i:i+4], "little", signed=True)
+            i += 4
+            if size < 10 or i + size > len(data):
+                break
+            pkt = data[i:i+size]
+            i += size
+            out.append(pkt[8:-2].decode("utf-8", errors="ignore"))
+
+        return "\n".join(out).strip()
     finally:
         try:
             writer.close()
@@ -167,73 +181,93 @@ async def rcon_command(cmd: str) -> str:
         except Exception:
             pass
 
-# =========================
-# DISCORD WEBHOOK
-# =========================
-async def send_webhook(session, route, text, color):
+# =====================
+# STATE
+# =====================
+seen_hashes = set()
+last_activity_ts = time.time()
+last_heartbeat_ts = 0.0
+
+# =====================
+# DISCORD SEND
+# =====================
+async def send_to_discord(tribe: str, text: str, color: int):
+    route = TRIBE_ROUTES[tribe]
     payload = {"embeds": [{"description": text, "color": color}]}
 
-    params = {}
-    if route.get("thread_id"):
-        params["thread_id"] = str(route["thread_id"])
+    params = {"wait": "true"}
+    thread_id = route.get("thread_id")
+    if thread_id:
+        params["thread_id"] = str(thread_id)
 
-    async with session.post(route["webhook"], json=payload, params=params) as r:
-        if r.status >= 300:
-            body = await r.text()
-            print("Discord webhook error", r.status, body)
+    async with aiohttp.ClientSession() as s:
+        async with s.post(route["webhook"], params=params, json=payload) as r:
+            if r.status >= 400:
+                body = await r.text()
+                print(f"Discord webhook error {r.status}: {body}")
 
-# =========================
-# MAIN LOOP
-# =========================
+async def heartbeat_if_idle():
+    global last_heartbeat_ts
+    now = time.time()
+
+    # Only if NO activity for HEARTBEAT_MINUTES
+    if (now - last_activity_ts) < (HEARTBEAT_MINUTES * 60):
+        return
+
+    # Don’t spam; once per HEARTBEAT_MINUTES while idle
+    if (now - last_heartbeat_ts) < (HEARTBEAT_MINUTES * 60):
+        return
+
+    for tribe in TRIBE_ROUTES:
+        await send_to_discord(
+            tribe,
+            f"⏱️ No new logs since last check. (Tribe: {tribe})",
+            COLORS["WHITE"]
+        )
+
+    last_heartbeat_ts = now
+
+# =====================
+# MAIN
+# =====================
 async def main():
-    last_seen = set()
-    last_activity = time.time()
+    global last_activity_ts
 
-    async with aiohttp.ClientSession() as session:
-        print("Starting RCON GetGameLog loop")
+    print("Starting RCON GetGameLog polling…")
 
-        while True:
-            try:
-                raw = await rcon_command("GetGameLog")
-                lines = raw.splitlines()
+    # Seed dedupe so we don’t backlog spam on boot
+    seed = await rcon_command("GetGameLog")
+    for line in seed.splitlines():
+        seen_hashes.add(hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest())
 
-                sent_any = False
+    print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
 
-                for line in lines:
-                    for route in TRIBE_ROUTES:
-                        tribe = route["tribe"]
+    while True:
+        try:
+            output = await rcon_command("GetGameLog")
 
-                        if f"Tribe {tribe}" not in line:
-                            continue
+            for raw in output.splitlines():
+                h = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
 
-                        core = extract_core(line)
-                        if not core:
-                            continue
+                formatted = extract_day_time_who_what(raw)
+                if not formatted:
+                    continue
 
-                        if core in last_seen:
-                            continue
+                # route by tribe name presence (use raw to detect tribe, formatted to display)
+                for tribe in TRIBE_ROUTES:
+                    if f"Tribe {tribe}".lower() in raw.lower() or f"({tribe}".lower() in raw.lower():
+                        color = classify_color(formatted)
+                        await send_to_discord(tribe, formatted, color)
+                        last_activity_ts = time.time()
 
-                        last_seen.add(core)
-                        color = classify_color(core)
+            await heartbeat_if_idle()
 
-                        await send_webhook(session, route, core, color)
-                        last_activity = time.time()
-                        sent_any = True
+        except Exception as e:
+            print("Error:", e)
 
-                # Heartbeat ONLY if no activity for HEARTBEAT_MINUTES
-                if (not sent_any) and (time.time() - last_activity >= HEARTBEAT_MINUTES * 60):
-                    for route in TRIBE_ROUTES:
-                        await send_webhook(
-                            session,
-                            route,
-                            f"⏱️ No new logs since last check. (Tribe: {route['tribe']})",
-                            COLORS["WHITE"],
-                        )
-                    last_activity = time.time()
-
-            except Exception as e:
-                print("Error:", e)
-
-            await asyncio.sleep(POLL_SECONDS)
+        await asyncio.sleep(POLL_SECONDS)
 
 asyncio.run(main())
