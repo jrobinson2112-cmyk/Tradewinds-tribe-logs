@@ -1,273 +1,201 @@
 import os
-import json
 import time
+import json
 import asyncio
-import hashlib
 import re
 import aiohttp
 
-# =====================
+# =========================
 # ENV
-# =====================
+# =========================
 RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = int(os.getenv("RCON_PORT", "0"))
+RCON_PORT = int(os.getenv("RCON_PORT", "27020"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
 
-TRIBE_ROUTES_RAW = os.getenv("TRIBE_ROUTES")
+TRIBE_ROUTES = os.getenv("TRIBE_ROUTES")
 
-missing = []
-for k in ["RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "TRIBE_ROUTES"]:
-    if not os.getenv(k):
-        missing.append(k)
-if missing:
-    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+if not all([RCON_HOST, RCON_PASSWORD, TRIBE_ROUTES]):
+    raise RuntimeError("Missing required environment variables")
 
-TRIBE_ROUTES = json.loads(TRIBE_ROUTES_RAW)
-print("Routing tribes:", ", ".join(TRIBE_ROUTES.keys()))
+TRIBE_ROUTES = json.loads(TRIBE_ROUTES)
 
-# =====================
-# COLORS (as requested)
-# =====================
+print("Routing tribes:", ", ".join(t["tribe"] for t in TRIBE_ROUTES))
+
+# =========================
+# COLOURS
+# =========================
 COLORS = {
-    "RED": 0xE74C3C,      # killed/died/death/destroyed
-    "YELLOW": 0xF1C40F,   # demolished
-    "PURPLE": 0x9B59B6,   # claimed/unclaimed
-    "GREEN": 0x2ECC71,    # tamed
-    "BLUE": 0x5DADE2,     # alliance
-    "WHITE": 0xECF0F1,    # everything else (froze)
+    "RED": 0xE74C3C,
+    "YELLOW": 0xF1C40F,
+    "PURPLE": 0x9B59B6,
+    "GREEN": 0x2ECC71,
+    "BLUE": 0x5DADE2,
+    "WHITE": 0xECF0F1,
 }
 
-# =====================
-# CLEANUP + FORMAT
-# =====================
-RICHCOLOR_RE = re.compile(r"<RichColor[^>]*>", re.IGNORECASE)
-ENDTAG_RE = re.compile(r"</>", re.IGNORECASE)
+# =========================
+# HELPERS
+# =========================
+RICHCOLOR_RE = re.compile(r"<RichColor[^>]*>")
 
-DAYSTAMP_RE = re.compile(r"^Day\s+(?P<day>\d+),\s*(?P<time>\d{2}:\d{2}:\d{2})\s*:\s*(?P<msg>.+)$")
+def clean_text(text: str) -> str:
+    text = RICHCOLOR_RE.sub("", text)
+    text = text.replace("!)", ")").replace("!)", ")")
+    return text.strip()
 
-def clean_ark_markup(s: str) -> str:
-    # remove RichColor + </>
-    s = RICHCOLOR_RE.sub("", s)
-    s = ENDTAG_RE.sub("", s)
-    return s.strip()
+def classify_color(text: str) -> int:
+    t = text.lower()
 
-def tidy_trailing_punct(s: str) -> str:
-    """
-    Removes the annoying ARK endings like:
-      ... (Thing)!)
-      ... (Thing)!))
-      ... 'Name'!)
-    while keeping the meaningful final ')', quotes, etc.
-    """
-    s = s.strip()
-
-    # common endings: ")!)", ")!))" -> ")"
-    s = re.sub(r"\)\s*!+\s*\)+\s*$", ")", s)
-
-    # endings like "'!)" or "'!))" -> "'"
-    s = re.sub(r"'\s*!+\s*\)+\s*$", "'", s)
-
-    # fallback: trailing "!))" -> ""
-    s = re.sub(r"\s*!+\s*\)+\s*$", "", s)
-
-    return s.strip()
-
-def extract_day_time_who_what(raw_line: str) -> str | None:
-    """
-    Returns exactly:
-      Day X, HH:MM:SS: Who What
-    or None if no in-game day/time stamp exists.
-    """
-    s = clean_ark_markup(raw_line)
-
-    # Find the FIRST "Day " occurrence and take from there
-    idx = s.lower().find("day ")
-    if idx == -1:
-        return None
-
-    tail = s[idx:].strip()
-
-    m = DAYSTAMP_RE.match(tail)
-    if not m:
-        return None
-
-    day = m.group("day")
-    t = m.group("time")
-    msg = tidy_trailing_punct(m.group("msg").strip())
-
-    # Final output exactly like your "froze" example
-    return f"Day {day}, {t}: {msg}"
-
-def classify_color(formatted_line: str) -> int:
-    t = formatted_line.lower()
-
-    # Red
     if any(x in t for x in ["killed", "died", "death", "destroyed", "starved"]):
         return COLORS["RED"]
 
-    # Yellow
+    # UNCLAIMED → YELLOW (changed)
+    if "unclaimed" in t:
+        return COLORS["YELLOW"]
+
     if "demolished" in t:
         return COLORS["YELLOW"]
 
-    # Purple
-    if any(x in t for x in ["claimed", "unclaimed"]):
+    # CLAIMED → PURPLE
+    if "claimed" in t:
         return COLORS["PURPLE"]
 
-    # Green
     if "tamed" in t:
         return COLORS["GREEN"]
 
-    # Light blue
     if "alliance" in t:
         return COLORS["BLUE"]
 
-    # White for everything else (froze etc)
     return COLORS["WHITE"]
 
-# =====================
-# RCON
-# =====================
-def _rcon_packet(req_id: int, ptype: int, body: str) -> bytes:
-    data = body.encode("utf-8") + b"\x00"
-    pkt = (
-        req_id.to_bytes(4, "little", signed=True)
-        + ptype.to_bytes(4, "little", signed=True)
-        + data
-        + b"\x00"
+def extract_core(line: str) -> str | None:
+    """
+    Extract only:
+    Day XXX, HH:MM:SS - WHO ACTION
+    """
+    m = re.search(
+        r"Day\s+(\d+),\s+(\d{2}:\d{2}:\d{2}):\s+(.*)",
+        line,
     )
+    if not m:
+        return None
+
+    day, time_, rest = m.groups()
+    rest = clean_text(rest)
+
+    return f"Day {day}, {time_} - {rest}"
+
+# =========================
+# RCON
+# =========================
+def rcon_packet(req_id, ptype, body):
+    data = body.encode() + b"\x00"
+    pkt = req_id.to_bytes(4, "little", signed=True)
+    pkt += ptype.to_bytes(4, "little", signed=True)
+    pkt += data + b"\x00"
     return len(pkt).to_bytes(4, "little", signed=True) + pkt
 
-async def rcon_command(cmd: str, timeout: float = 6.0) -> str:
+async def rcon_command(cmd: str) -> str:
     reader, writer = await asyncio.open_connection(RCON_HOST, RCON_PORT)
     try:
-        # auth
-        writer.write(_rcon_packet(1, 3, RCON_PASSWORD))
+        writer.write(rcon_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
         await reader.read(4096)
 
-        # command
-        writer.write(_rcon_packet(2, 2, cmd))
+        writer.write(rcon_packet(2, 2, cmd))
         await writer.drain()
 
-        data = b""
+        out = b""
         while True:
             try:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=0.3)
+                part = await asyncio.wait_for(reader.read(4096), timeout=0.3)
             except asyncio.TimeoutError:
                 break
-            if not chunk:
+            if not part:
                 break
-            data += chunk
+            out += part
 
-        out = []
-        i = 0
-        while i + 4 <= len(data):
-            size = int.from_bytes(data[i:i+4], "little", signed=True)
-            i += 4
-            if size < 10 or i + size > len(data):
-                break
-            pkt = data[i:i+size]
-            i += size
-            out.append(pkt[8:-2].decode("utf-8", errors="ignore"))
-
-        return "\n".join(out).strip()
+        text = out.decode(errors="ignore")
+        return text
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+        writer.close()
+        await writer.wait_closed()
 
-# =====================
-# STATE
-# =====================
-seen_hashes = set()
-last_activity_ts = time.time()
-last_heartbeat_ts = 0.0
+# =========================
+# DISCORD
+# =========================
+async def send_webhook(session, route, text, color):
+    payload = {
+        "embeds": [{
+            "description": text,
+            "color": color
+        }]
+    }
 
-# =====================
-# DISCORD SEND
-# =====================
-async def send_to_discord(tribe: str, text: str, color: int):
-    route = TRIBE_ROUTES[tribe]
-    payload = {"embeds": [{"description": text, "color": color}]}
+    params = {}
+    if route.get("thread_id"):
+        params["thread_id"] = route["thread_id"]
 
-    params = {"wait": "true"}
-    thread_id = route.get("thread_id")
-    if thread_id:
-        params["thread_id"] = str(thread_id)
+    async with session.post(route["webhook"], json=payload, params=params) as r:
+        if r.status >= 300:
+            body = await r.text()
+            print("Discord webhook error", r.status, body)
 
-    async with aiohttp.ClientSession() as s:
-        async with s.post(route["webhook"], params=params, json=payload) as r:
-            if r.status >= 400:
-                body = await r.text()
-                print(f"Discord webhook error {r.status}: {body}")
-
-async def heartbeat_if_idle():
-    global last_heartbeat_ts
-    now = time.time()
-
-    # Only if NO activity for HEARTBEAT_MINUTES
-    if (now - last_activity_ts) < (HEARTBEAT_MINUTES * 60):
-        return
-
-    # Don’t spam; once per HEARTBEAT_MINUTES while idle
-    if (now - last_heartbeat_ts) < (HEARTBEAT_MINUTES * 60):
-        return
-
-    for tribe in TRIBE_ROUTES:
-        await send_to_discord(
-            tribe,
-            f"⏱️ No new logs since last check. (Tribe: {tribe})",
-            COLORS["WHITE"]
-        )
-
-    last_heartbeat_ts = now
-
-# =====================
-# MAIN
-# =====================
+# =========================
+# MAIN LOOP
+# =========================
 async def main():
-    global last_activity_ts
+    last_seen = set()
+    last_activity = time.time()
 
-    print("Starting RCON GetGameLog polling…")
+    async with aiohttp.ClientSession() as session:
+        print("Starting RCON GetGameLog loop")
 
-    # Seed dedupe so we don’t backlog spam on boot
-    seed = await rcon_command("GetGameLog")
-    for line in seed.splitlines():
-        seen_hashes.add(hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest())
+        while True:
+            try:
+                raw = await rcon_command("GetGameLog")
+                lines = raw.splitlines()
 
-    print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
+                sent = False
 
-    while True:
-        try:
-            output = await rcon_command("GetGameLog")
+                for line in lines:
+                    for route in TRIBE_ROUTES:
+                        tribe = route["tribe"]
 
-            for raw in output.splitlines():
-                h = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
-                if h in seen_hashes:
-                    continue
-                seen_hashes.add(h)
+                        if f"Tribe {tribe}" not in line:
+                            continue
 
-                formatted = extract_day_time_who_what(raw)
-                if not formatted:
-                    continue
+                        core = extract_core(line)
+                        if not core:
+                            continue
 
-                # route by tribe name presence (use raw to detect tribe, formatted to display)
-                for tribe in TRIBE_ROUTES:
-                    if f"Tribe {tribe}".lower() in raw.lower() or f"({tribe}".lower() in raw.lower():
-                        color = classify_color(formatted)
-                        await send_to_discord(tribe, formatted, color)
-                        last_activity_ts = time.time()
+                        if core in last_seen:
+                            continue
 
-            await heartbeat_if_idle()
+                        last_seen.add(core)
 
-        except Exception as e:
-            print("Error:", e)
+                        color = classify_color(core)
+                        await send_webhook(session, route, core, color)
+                        last_activity = time.time()
+                        sent = True
 
-        await asyncio.sleep(POLL_SECONDS)
+                # Heartbeat ONLY if no activity
+                if not sent and time.time() - last_activity >= HEARTBEAT_MINUTES * 60:
+                    for route in TRIBE_ROUTES:
+                        await send_webhook(
+                            session,
+                            route,
+                            f"⏱️ No new logs since last check. (Tribe: {route['tribe']})",
+                            COLORS["WHITE"],
+                        )
+                    last_activity = time.time()
+
+            except Exception as e:
+                print("Error:", e)
+
+            await asyncio.sleep(POLL_SECONDS)
 
 asyncio.run(main())
