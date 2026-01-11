@@ -29,6 +29,11 @@ DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "5000"))
 # Optional: set to "1" if you want to forward backlog on first start (can spam)
 FORWARD_BACKLOG = os.getenv("FORWARD_BACKLOG", "0") == "1"
 
+# OPTIONAL: forward ALL GetGameLog lines (deduped) to this webhook so you can "just see the log"
+RAWLOG_WEBHOOK = os.getenv("RAWLOG_WEBHOOK", "").strip()
+RAWLOG_MAX_PER_POLL = int(os.getenv("RAWLOG_MAX_PER_POLL", "15"))
+RAWLOG_FILTER = os.getenv("RAWLOG_FILTER", "").strip()  # optional substring filter
+
 # ============================================================
 # VALIDATION
 # ============================================================
@@ -51,9 +56,11 @@ except Exception as e:
 TRIBES = {str(k): str(v) for k, v in TRIBE_WEBHOOKS.items()}
 TRIBES_LOWER = {k.lower(): k for k in TRIBES.keys()}
 
-print("Starting RCON tribe log forwarder")
+print("Starting RCON tribe log forwarder + GetGameLog raw viewer")
 print(f"Polling every {POLL_SECONDS:.1f}s | Heartbeat every {HEARTBEAT_MINUTES:.1f}m")
 print("Routing tribes:", ", ".join(TRIBES.keys()))
+if RAWLOG_WEBHOOK:
+    print("RAWLOG_WEBHOOK enabled (forwarding all new GetGameLog lines).")
 
 # ============================================================
 # DISCORD EMBED COLORING (Ark-like)
@@ -106,25 +113,38 @@ def clean_unicode(s: str) -> str:
     return s
 
 # ============================================================
-# FORMAT: "Day 221, 22:51:49 - Sir Magnus claimed 'Roan Pinto - Lvl 150'"
+# FORMATS
+# - ASE style: "Day 221, 22:51:49: ..."
+# - ASA style: "[2026.01.11-07.54.32] ..."
 # ============================================================
-DAY_TIME_RE = re.compile(r"Day\s+(?P<day>\d+),\s*(?P<time>\d{2}:\d{2}:\d{2})\s*:\s*(?P<body>.+)$")
-# Matches lines like:
-# "... Tribe Valkyrie, ID 123: Day 216, 17:42:24: Sir Magnus claimed 'X - Lvl 150 (Thing)'!"
-# or already compact "Day 229, 06:10:28: Øðîn froze Baby Desmodus - Lvl 224 (Desmodus)"
+DAY_TIME_RE = re.compile(
+    r"Day\s+(?P<day>\d+),\s*(?P<time>\d{2}:\d{2}:\d{2})\s*:\s*(?P<body>.+)$",
+    re.IGNORECASE
+)
+ASA_TS_RE = re.compile(
+    r"^\[(?P<ts>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})\]\s*(?P<body>.+)$"
+)
+
 def format_line_compact(line: str) -> str:
     line = clean_unicode(line)
 
-    # Find the "Day X, HH:MM:SS:" portion anywhere in the line
+    # ASA style first: [YYYY.MM.DD-HH.MM.SS] message
+    m2 = ASA_TS_RE.match(line)
+    if m2:
+        # Make it more readable: "YYYY-MM-DD HH:MM:SS"
+        ts_raw = m2.group("ts")
+        yyyy, mm, dd = ts_raw[0:4], ts_raw[5:7], ts_raw[8:10]
+        hh, mi, ss = ts_raw[11:13], ts_raw[14:16], ts_raw[17:19]
+        ts = f"{yyyy}-{mm}-{dd} {hh}:{mi}:{ss}"
+        body = m2.group("body").strip()
+        return f"{ts} - {body}"
+
+    # ASE style: find "Day X, HH:MM:SS:" anywhere in the line
     idx = line.lower().find("day ")
-    if idx != -1:
-        candidate = line[idx:]
-    else:
-        candidate = line
+    candidate = line[idx:] if idx != -1 else line
 
     m = DAY_TIME_RE.search(candidate)
     if not m:
-        # Fallback: just return cleaned text
         return line
 
     day = m.group("day")
@@ -135,21 +155,24 @@ def format_line_compact(line: str) -> str:
     body = re.sub(r"^Tribe\s+[^:]+:\s*", "", body, flags=re.IGNORECASE).strip()
     body = re.sub(r"^Tribe\s+[^,]+,\s*ID\s*\d+\s*:\s*", "", body, flags=re.IGNORECASE).strip()
 
-    # If the log includes "(Valkyrie!)" at end etc, remove trailing "(TribeName...)" chunks
-    body = re.sub(r"\(\s*[^)]*\b(?:%s)\b[^)]*\)\s*$" % "|".join(re.escape(k) for k in TRIBES.keys()), "", body, flags=re.IGNORECASE).strip()
+    # Remove trailing "(TribeName...)" chunks
+    body = re.sub(
+        r"\(\s*[^)]*\b(?:%s)\b[^)]*\)\s*$" % "|".join(re.escape(k) for k in TRIBES.keys()),
+        "",
+        body,
+        flags=re.IGNORECASE
+    ).strip()
 
-    # Remove extra duplicate right-parens
     body = body.rstrip(") ").strip()
-
-    # If you want to remove the final species bracket e.g. "(Desmodus)" keep it? (leave as-is)
-    # If you want ONLY "... - Lvl 150" (no species), uncomment:
-    # body = re.sub(r"\s*\([^)]*\)\s*$", "", body).strip()
-
     return f"Day {day}, {t} - {body}"
 
 # ============================================================
-# RCON (Minimal RCON implementation)
+# RCON (Robust Source-style implementation, supports multi-packet)
+# ptype: 3=AUTH, 2=EXEC
 # ============================================================
+PT_AUTH = 3
+PT_EXEC = 2
+
 def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     data = body.encode("utf-8") + b"\x00"
     packet = (
@@ -161,52 +184,83 @@ def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     size = len(packet)
     return size.to_bytes(4, "little", signed=True) + packet
 
-async def rcon_command(command: str, timeout: float = 6.0) -> str:
+async def _read_exact(reader: asyncio.StreamReader, n: int, timeout: float) -> bytes:
+    return await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
+
+async def _read_packet(reader: asyncio.StreamReader, timeout: float) -> tuple[int, int, str] | None:
+    """
+    Returns (req_id, ptype, body) or None on EOF/timeout.
+    """
+    try:
+        header = await _read_exact(reader, 4, timeout)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+
+    size = int.from_bytes(header, "little", signed=True)
+    if size < 10 or size > 10_000_000:
+        return None
+
+    try:
+        payload = await _read_exact(reader, size, timeout)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        return None
+
+    req_id = int.from_bytes(payload[0:4], "little", signed=True)
+    ptype = int.from_bytes(payload[4:8], "little", signed=True)
+    body_bytes = payload[8:-2]  # strip 2 null bytes
+    body = body_bytes.decode("utf-8", errors="replace")
+    return req_id, ptype, body
+
+async def rcon_command(command: str, timeout: float = 8.0) -> str:
     reader, writer = await asyncio.wait_for(asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout)
     try:
-        # auth
-        writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if len(raw) < 12:
-            raise RuntimeError("RCON auth failed (short response)")
-
-        # command
-        writer.write(_rcon_make_packet(2, 2, command))
+        # AUTH
+        auth_id = 1001
+        writer.write(_rcon_make_packet(auth_id, PT_AUTH, RCON_PASSWORD))
         await writer.drain()
 
-        chunks = []
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.35)
-            except asyncio.TimeoutError:
+        # Read until we see auth response for auth_id, or failure (-1)
+        authed = False
+        end = time.time() + timeout
+        while time.time() < end:
+            pkt = await _read_packet(reader, timeout=0.75)
+            if pkt is None:
                 break
-            if not part:
+            req_id, ptype, body = pkt
+            if req_id == -1:
+                raise RuntimeError("RCON auth failed (bad password or protocol mismatch)")
+            if req_id == auth_id:
+                authed = True
                 break
-            chunks.append(part)
 
-        if not chunks:
-            return ""
+        if not authed:
+            raise RuntimeError("RCON auth failed (no auth response)")
 
-        data = b"".join(chunks)
+        # EXEC with terminator trick (helps multi-packet responses)
+        cmd_id = 2001
+        term_id = 2002
 
-        out = []
-        i = 0
-        while i + 4 <= len(data):
-            size = int.from_bytes(data[i:i+4], "little", signed=True)
-            i += 4
-            if i + size > len(data) or size < 10:
+        writer.write(_rcon_make_packet(cmd_id, PT_EXEC, command))
+        writer.write(_rcon_make_packet(term_id, PT_EXEC, ""))  # terminator
+        await writer.drain()
+
+        out_parts: list[str] = []
+        end = time.time() + timeout
+
+        while time.time() < end:
+            pkt = await _read_packet(reader, timeout=0.75)
+            if pkt is None:
                 break
-            pkt = data[i:i+size]
-            i += size
-            body = pkt[8:-2]
-            # IMPORTANT: keep unicode; don't ascii-sanitize
-            txt = body.decode("utf-8", errors="replace")
-            if txt:
-                out.append(txt)
+            req_id, ptype, body = pkt
 
-        return "".join(out).strip()
+            if req_id == term_id and body.strip() == "":
+                break
+
+            if req_id == cmd_id and body:
+                out_parts.append(body)
+
+        return "".join(out_parts).strip()
+
     finally:
         try:
             writer.close()
@@ -294,11 +348,10 @@ async def main():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                out = await rcon_command("GetGameLog", timeout=8.0)
+                out = await rcon_command("GetGameLog", timeout=10.0)
 
                 lines = []
                 if out:
-                    # Split and clean
                     for raw in out.splitlines():
                         raw = raw.strip()
                         if not raw:
@@ -307,21 +360,46 @@ async def main():
                         if raw:
                             lines.append(raw)
 
-                # On first run, you can either:
-                # - skip backlog (default) and only send new things that appear later
-                # - OR forward backlog (FORWARD_BACKLOG=1)
+                # On first run, either seed dedupe or forward backlog
                 if first_run and not FORWARD_BACKLOG:
-                    # Just seed dedupe with what's currently visible
                     for ln in lines:
-                        h = _stable_hash(ln)
-                        _remember(h)
+                        _remember(_stable_hash(ln))
+                        if RAWLOG_WEBHOOK:
+                            _remember(_stable_hash("RAW:" + ln))
                     print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
                     first_run = False
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
+                # ------------------------------------------------------------
+                # RAWLOG: forward ALL new lines to one webhook (optional)
+                # ------------------------------------------------------------
+                if RAWLOG_WEBHOOK and lines:
+                    raw_new = []
+                    for ln in lines:
+                        if RAWLOG_FILTER and RAWLOG_FILTER.lower() not in ln.lower():
+                            continue
+                        h = _stable_hash("RAW:" + ln)
+                        if h in sent_set:
+                            continue
+                        raw_new.append(ln)
+                        _remember(h)
+
+                    if raw_new:
+                        raw_new = raw_new[-RAWLOG_MAX_PER_POLL:]
+                        text_block = "\n".join(format_line_compact(x) for x in raw_new)
+
+                        # Discord embed description max ~4096 chars; keep under that
+                        if len(text_block) > 3500:
+                            text_block = text_block[-3500:]
+
+                        await webhook_send(session, RAWLOG_WEBHOOK, text_block, COL_DEFAULT)
+                        print(f"RawLog: sent {len(raw_new)} line(s).")
+
+                # ------------------------------------------------------------
+                # Tribe routing (your original behaviour)
+                # ------------------------------------------------------------
                 to_send = []
-                # We only send lines we haven't seen before
                 for ln in lines:
                     h = _stable_hash(ln)
                     if h in sent_set:
@@ -343,11 +421,10 @@ async def main():
                     for tribe, text, color in to_send:
                         await webhook_send(session, TRIBES[tribe], text, color)
                         last_any_sent_ts = time.time()
-                    print(f"Sent {len(to_send)} new log(s).")
+                    print(f"Sent {len(to_send)} new tribe log(s).")
                 else:
                     now = time.time()
                     if now - last_heartbeat >= HEARTBEAT_MINUTES * 60:
-                        # Send heartbeat once per interval to EACH tribe webhook
                         msg = "No new logs since last check."
                         for tribe, url in TRIBES.items():
                             await webhook_send(session, url, msg, COL_DEFAULT)
