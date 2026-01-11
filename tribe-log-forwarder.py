@@ -1,15 +1,15 @@
 import os
+import re
 import time
 import json
-import re
 import asyncio
 import hashlib
-from typing import Dict, Any, List, Optional, Tuple
 import aiohttp
 
-# =========================
+# ============================================================
 # ENV
-# =========================
+# ============================================================
+
 RCON_HOST = os.getenv("RCON_HOST")
 RCON_PORT = os.getenv("RCON_PORT")
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
@@ -17,87 +17,47 @@ RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 TRIBE_ROUTES_RAW = os.getenv("TRIBE_ROUTES")
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "10"))
-MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "12"))
-
 HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
+MAX_SEND_PER_POLL = int(os.getenv("MAX_SEND_PER_POLL", "5"))
 
-# Optional: send backlog on first run (default off to avoid spam)
-SEND_BACKLOG_ON_START = os.getenv("SEND_BACKLOG_ON_START", "0").strip().lower() in ("1", "true", "yes")
+# If true, sends old matching lines on first run (can spam). Default false.
+SEND_BACKLOG_FIRST_RUN = os.getenv("SEND_BACKLOG_FIRST_RUN", "false").strip().lower() in ("1", "true", "yes", "y")
 
-# =========================
+# ============================================================
 # VALIDATION
-# =========================
+# ============================================================
+
 missing = []
-for k in ("RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "TRIBE_ROUTES"):
+for k in ["RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "TRIBE_ROUTES"]:
     if not os.getenv(k):
         missing.append(k)
+
 if missing:
     raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 RCON_PORT = int(RCON_PORT)
 
-# =========================
-# ROUTES PARSING
-# TRIBE_ROUTES supports:
-# 1) JSON list:
-#    [{"tribe":"Valkyrie","webhook":"https://discord.com/api/webhooks/...","thread_id":"123"}]
-# 2) Pipe lines fallback:
-#    Valkyrie|https://discord.com/api/webhooks/...|1459805053379547199
-# =========================
-def parse_routes(raw: str) -> List[Dict[str, str]]:
-    raw = raw.strip()
+try:
+    TRIBE_ROUTES = json.loads(TRIBE_ROUTES_RAW)
+except Exception as e:
+    raise RuntimeError(f"TRIBE_ROUTES must be valid JSON. Error: {e}")
 
-    # JSON form
-    if raw.startswith("[") or raw.startswith("{"):
-        obj = json.loads(raw)
-        routes = []
-        if isinstance(obj, dict):
-            # allow {"Valkyrie": {"webhook": "...", "thread_id":"..."}}
-            for tribe, cfg in obj.items():
-                routes.append({
-                    "tribe": str(tribe),
-                    "webhook": str(cfg.get("webhook", "")),
-                    "thread_id": str(cfg.get("thread_id", "")).strip() or "",
-                })
-        elif isinstance(obj, list):
-            for item in obj:
-                if not isinstance(item, dict):
-                    continue
-                routes.append({
-                    "tribe": str(item.get("tribe", "")).strip(),
-                    "webhook": str(item.get("webhook", "")).strip(),
-                    "thread_id": str(item.get("thread_id", "")).strip() or "",
-                })
-        # validate
-        routes = [r for r in routes if r["tribe"] and r["webhook"]]
-        return routes
+if not isinstance(TRIBE_ROUTES, list) or not TRIBE_ROUTES:
+    raise RuntimeError("TRIBE_ROUTES must be a JSON array with at least one route.")
 
-    # Pipe fallback (one per line)
-    routes = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 2:
-            continue
-        tribe = parts[0]
-        webhook = parts[1]
-        thread_id = parts[2] if len(parts) >= 3 else ""
-        routes.append({"tribe": tribe, "webhook": webhook, "thread_id": thread_id})
-    return routes
+for i, r in enumerate(TRIBE_ROUTES):
+    if not isinstance(r, dict):
+        raise RuntimeError(f"TRIBE_ROUTES[{i}] must be an object.")
+    for key in ("tribe", "webhook", "thread_id"):
+        if key not in r or not str(r[key]).strip():
+            raise RuntimeError(f"TRIBE_ROUTES[{i}] is missing '{key}'.")
 
-
-TRIBE_ROUTES = parse_routes(TRIBE_ROUTES_RAW)
-
-if not TRIBE_ROUTES:
-    raise RuntimeError("TRIBE_ROUTES parsed to an empty list. Check your env var format.")
-
+print("Starting Container")
 print("Routing tribes:", ", ".join(r["tribe"] for r in TRIBE_ROUTES))
 
-# =========================
-# DISCORD COLORS
-# =========================
+# ============================================================
+# COLORS (Discord embed sidebar)
+# ============================================================
 COLOR_RED = 0xE74C3C
 COLOR_YELLOW = 0xF1C40F
 COLOR_PURPLE = 0x9B59B6
@@ -105,108 +65,10 @@ COLOR_GREEN = 0x2ECC71
 COLOR_LIGHT_BLUE = 0x5DADE2
 COLOR_WHITE = 0xFFFFFF
 
-# =========================
-# CLEANING + PARSING
-# =========================
-RICHCOLOR_RE = re.compile(r"<\s*RichColor[^>]*>", re.IGNORECASE)
-RICHCOLOR_CLOSE_RE = re.compile(r"<\s*/\s*>", re.IGNORECASE)  # matches </> and similar
-ANGLE_TAG_RE = re.compile(r"<[^>]+>")  # any other tags
-LEADING_TIMESTAMP_RE = re.compile(r"^\s*\[\d{4}\.\d{2}\.\d{2}-.*?\]\[\d+\]\s*")  # [2026.01.10-...][123]
-DOUBLE_TIMESTAMP_RE = re.compile(r"^\s*\d{4}\.\d{2}\.\d{2}[_-]\d{2}\.\d{2}\.\d{2}:\s*")  # 2026.01.10_08.22.17:
-TRIBE_PREFIX_RE = re.compile(r"^Tribe\s+.*?:\s*", re.IGNORECASE)  # "Tribe X, ID ...: " (we'll handle via Day extraction)
+# ============================================================
+# RCON (Source-style minimal)
+# ============================================================
 
-DAY_LINE_RE = re.compile(r"Day\s+(\d+)\s*,\s*(\d{2}:\d{2}:\d{2})\s*:\s*(.+)", re.IGNORECASE)
-
-def strip_noise(s: str) -> str:
-    s = s.strip()
-
-    # remove leading bracket timestamps + internal prefix
-    s = LEADING_TIMESTAMP_RE.sub("", s)
-    s = DOUBLE_TIMESTAMP_RE.sub("", s)
-
-    # remove richcolor and other tags
-    s = RICHCOLOR_RE.sub("", s)
-    s = RICHCOLOR_CLOSE_RE.sub("", s)
-    s = ANGLE_TAG_RE.sub("", s)
-
-    # collapse whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-
-    return s
-
-def remove_trailing_junk(msg: str, tribe: str) -> str:
-    # remove trailing (TribeName) or (Valkyrie)! etc
-    # Example: "... (Valkyrie)!)" or "... (Valkyrie)!"
-    msg = re.sub(rf"\s*\(\s*{re.escape(tribe)}\s*\)\s*[!)]*\s*$", "", msg, flags=re.IGNORECASE)
-
-    # remove any trailing ! ) combinations
-    msg = re.sub(r"[!)]\s*$", "", msg).strip()
-
-    return msg
-
-def summarize_line(line: str, tribe: str) -> Optional[str]:
-    """
-    Returns: "Day N, HH:MM:SS - <who + what>"
-    or None if line doesn't include a Day timestamp.
-    """
-    line = strip_noise(line)
-
-    # If it contains "Day ..." anywhere, slice from there so we don't include other prefixes
-    idx = line.lower().find("day ")
-    if idx != -1:
-        line = line[idx:].strip()
-
-    m = DAY_LINE_RE.search(line)
-    if not m:
-        return None
-
-    day = m.group(1)
-    ts = m.group(2)
-    rest = m.group(3).strip()
-
-    rest = remove_trailing_junk(rest, tribe)
-
-    # Final output only day/time/who/what
-    return f"Day {day}, {ts} - {rest}"
-
-def pick_color(text: str) -> int:
-    t = text.lower()
-
-    # Yellow first for unclaimed/demolished
-    if "unclaimed" in t:
-        return COLOR_YELLOW
-    if "demolished" in t:
-        return COLOR_YELLOW
-
-    # Red
-    if ("killed" in t) or ("died" in t) or ("death" in t) or ("destroyed" in t):
-        return COLOR_RED
-
-    # Purple
-    if "claimed" in t:
-        return COLOR_PURPLE
-
-    # Green
-    if "tamed" in t:
-        return COLOR_GREEN
-
-    # Light blue
-    if "alliance" in t:
-        return COLOR_LIGHT_BLUE
-
-    # White (froze etc)
-    return COLOR_WHITE
-
-def is_for_tribe(line: str, tribe: str) -> bool:
-    # Most reliable is simply checking the tribe name appears somewhere (since GetGameLog includes it in many lines)
-    return tribe.lower() in line.lower()
-
-def stable_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="surrogatepass")).hexdigest()
-
-# =========================
-# RCON (Source-style packets)
-# =========================
 def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     data = body.encode("utf-8") + b"\x00"
     packet = (
@@ -218,22 +80,15 @@ def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     size = len(packet)
     return size.to_bytes(4, "little", signed=True) + packet
 
-def _decode_rcon_text(b: bytes) -> str:
+def _decode_rcon_bytes(b: bytes) -> str:
     """
-    Fixes special characters (Øðîñ etc) by trying utf-8 first,
-    then cp1252/latin-1 fallback (common for game servers).
+    Best-effort decode without intentionally replacing characters.
+    If server sends non-UTF8, fall back to latin-1.
     """
     try:
-        s = b.decode("utf-8")
-        # If it contains replacement chars, try fallback
-        if "\ufffd" in s:
-            raise UnicodeDecodeError("utf-8", b, 0, 1, "replacement found")
-        return s
-    except Exception:
-        try:
-            return b.decode("cp1252")
-        except Exception:
-            return b.decode("latin-1", errors="ignore")
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("latin-1", errors="strict")
 
 async def rcon_command(command: str, timeout: float = 6.0) -> str:
     reader, writer = await asyncio.wait_for(
@@ -243,6 +98,7 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         # auth
         writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
+
         raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
         if len(raw) < 12:
             raise RuntimeError("RCON auth failed (short response)")
@@ -272,12 +128,13 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         while i + 4 <= len(data):
             size = int.from_bytes(data[i:i+4], "little", signed=True)
             i += 4
-            if i + size > len(data) or size < 10:
+            if size < 10 or i + size > len(data):
                 break
             pkt = data[i:i+size]
             i += size
-            body = pkt[8:-2]  # strip id/type and two nulls
-            txt = _decode_rcon_text(body)
+            # pkt: req_id(4) + type(4) + body + \x00\x00
+            body = pkt[8:-2]
+            txt = _decode_rcon_bytes(body)
             if txt:
                 out.append(txt)
 
@@ -289,140 +146,260 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         except Exception:
             pass
 
-# =========================
-# DISCORD WEBHOOK POST
-# =========================
-def normalize_webhook_url(base: str, thread_id: str) -> str:
+# ============================================================
+# PARSING / CLEANING
+# ============================================================
+
+# Matches:
+# Day 233, 17:45:33: Sir Magnus froze [Ø] - Lvl 215 (Pyromane)
+DAY_LINE_RE = re.compile(r"(Day\s+\d+,\s+\d{2}:\d{2}:\d{2}):\s*(.*)")
+
+# Remove RichColor tags and any remaining angle-tag fragments
+RICHCOLOR_RE = re.compile(r"<\s*RichColor[^>]*>", re.IGNORECASE)
+TAG_RE = re.compile(r"</\s*>", re.IGNORECASE)
+
+# Remove noisy prefixes sometimes included in server logs
+# Examples:
+# 2026.01.11_14.36.10: Tribe Valkyrie, ID 123...: Day 233, 13:30:26: ...
+PREFIX_TO_DAY_RE = re.compile(r".*?(Day\s+\d+,\s+\d{2}:\d{2}:\d{2}:)", re.IGNORECASE)
+
+def strip_trailing_punct(s: str) -> str:
+    # remove annoying log endings like "!)", "! )", "'))", "</>)", etc
+    s = s.strip()
+
+    # remove closing tag fragments
+    s = TAG_RE.sub("", s).strip()
+
+    # common trailing noise
+    while s.endswith("!)") or s.endswith("')!") or s.endswith("!)") or s.endswith("!)") or s.endswith("!)"):
+        s = s[:-2].rstrip()
+
+    # remove a single trailing "!))" style junk
+    s = re.sub(r"[!]+[)\]]+$", "", s).strip()
+    # remove trailing unmatched ')' if it’s from junk, but keep real "(Rex)" etc
+    s = re.sub(r"</\s*\)\s*>$", "", s).strip()
+
+    # final tidy: remove trailing lone "!" only (keep normal punctuation inside)
+    s = re.sub(r"!+$", "", s).strip()
+    return s
+
+def clean_line_to_day_time_who_what(raw_line: str) -> str | None:
+    line = raw_line.strip()
+    if not line:
+        return None
+
+    # If line contains a Day... later, cut to that
+    m = PREFIX_TO_DAY_RE.match(line)
+    if m:
+        idx = m.start(1)
+        line = line[idx:]
+
+    # Remove RichColor open tags anywhere
+    line = RICHCOLOR_RE.sub("", line)
+
+    # Now try to isolate "Day X, HH:MM:SS: rest"
+    m2 = re.search(r"(Day\s+\d+,\s+\d{2}:\d{2}:\d{2}):\s*(.*)", line)
+    if not m2:
+        return None
+
+    day_time = m2.group(1).strip()
+    rest = m2.group(2).strip()
+
+    # Remove extra "Tribe Valkyrie, ID ...:" that sometimes appears before the action
+    # If rest begins with "Tribe X, ID ...: Day ..." we already handled above,
+    # but sometimes it begins with "Tribe Valkyrie, ID ...: Sir ..."
+    rest = re.sub(r"^Tribe\s+.*?ID\s+\d+:\s*", "", rest, flags=re.IGNORECASE).strip()
+
+    # Remove remaining closing RichColor tags
+    rest = TAG_RE.sub("", rest).strip()
+
+    # Final punctuation cleanup
+    rest = strip_trailing_punct(rest)
+
+    # Final output format
+    return f"{day_time} - {rest}"
+
+def classify_color(text: str) -> int:
+    t = text.lower()
+
+    # Red: killed / died / death / destroyed (also "starved to death")
+    if any(k in t for k in ["killed", "died", "death", "destroyed", "starved to death"]):
+        return COLOR_RED
+
+    # Yellow: demolished OR unclaimed
+    if "demolished" in t or "unclaimed" in t:
+        return COLOR_YELLOW
+
+    # Purple: claimed (but NOT unclaimed)
+    if "claimed" in t and "unclaimed" not in t:
+        return COLOR_PURPLE
+
+    # Green: tamed
+    if "tamed" in t:
+        return COLOR_GREEN
+
+    # Light blue: alliance
+    if "alliance" in t:
+        return COLOR_LIGHT_BLUE
+
+    # White: everything else (froze, etc)
+    return COLOR_WHITE
+
+# ============================================================
+# DISCORD WEBHOOK SENDER (Forum thread support)
+# ============================================================
+
+def build_thread_webhook_url(base_webhook: str, thread_id: str) -> str:
     """
-    Ensures we post to forum thread properly:
-    - remove any existing querystring
-    - append ?thread_id=... if provided
+    Discord expects thread_id query param (lowercase).
+    If the user pasted a webhook with ?Thread=... we ignore that and enforce thread_id properly.
     """
-    base = base.strip()
-    base = base.split("?", 1)[0]
-    if thread_id:
-        return f"{base}?thread_id={thread_id}"
-    return base
+    base = base_webhook.split("?", 1)[0].strip()
+    return f"{base}?thread_id={thread_id}&wait=true"
 
-async def post_webhook(session: aiohttp.ClientSession, url: str, payload: dict):
-    while True:
-        async with session.post(url, json=payload) as r:
-            if r.status == 429:
-                try:
-                    data = await r.json()
-                    retry_after = float(data.get("retry_after", 1.0))
-                except Exception:
-                    retry_after = 1.0
-                await asyncio.sleep(max(0.2, retry_after))
-                continue
-
-            if 200 <= r.status < 300:
-                return
-
-            # log error
-            try:
-                txt = await r.text()
-            except Exception:
-                txt = ""
-            print(f"Discord webhook error {r.status}: {txt}")
-            return
-
-def make_embed_line(text: str) -> dict:
-    return {
-        "embeds": [
-            {
-                "description": text,
-                "color": pick_color(text),
-            }
-        ]
+async def post_embed(session: aiohttp.ClientSession, webhook_url: str, thread_id: str, content: str, color: int):
+    url = build_thread_webhook_url(webhook_url, thread_id)
+    payload = {
+        "embeds": [{
+            "description": content,
+            "color": color
+        }]
     }
 
-# =========================
-# MAIN LOOP
-# =========================
-async def main():
-    print("Starting RCON tribe log forwarder")
-    print(f"Polling every {POLL_SECONDS:.1f}s | Heartbeat {HEARTBEAT_MINUTES}m (only on inactivity)")
+    # basic rate limit handling
+    for _ in range(5):
+        async with session.post(url, json=payload) as r:
+            if r.status in (200, 204):
+                return True
+            if r.status == 429:
+                data = await r.json()
+                retry_after = float(data.get("retry_after", 1.0))
+                await asyncio.sleep(max(0.2, retry_after))
+                continue
+            txt = await r.text()
+            print(f"Discord webhook error {r.status}: {txt}")
+            return False
 
-    # per-tribe dedupe set
-    seen: Dict[str, set] = {r["tribe"]: set() for r in TRIBE_ROUTES}
+    return False
 
-    # last activity timestamps
-    last_activity_ts: Dict[str, float] = {r["tribe"]: time.time() for r in TRIBE_ROUTES}
-    last_heartbeat_ts: Dict[str, float] = {r["tribe"]: 0.0 for r in TRIBE_ROUTES}
+# ============================================================
+# MAIN LOOP (GetGameLog poll + dedupe)
+# ============================================================
+
+class DedupeLRU:
+    def __init__(self, max_items: int = 4000):
+        self.max_items = max_items
+        self.order = []
+        self.set = set()
+
+    def seen(self, key: str) -> bool:
+        return key in self.set
+
+    def add(self, key: str):
+        if key in self.set:
+            return
+        self.set.add(key)
+        self.order.append(key)
+        if len(self.order) > self.max_items:
+            old = self.order.pop(0)
+            self.set.discard(old)
+
+def hash_line(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+async def run():
+    dedupe = DedupeLRU(max_items=6000)
+    first_run = True
+
+    # Track last activity per tribe for heartbeat
+    last_activity_ts = {r["tribe"]: time.time() for r in TRIBE_ROUTES}
+    heartbeat_seconds = HEARTBEAT_MINUTES * 60
 
     async with aiohttp.ClientSession() as session:
-        # Seed dedupe so we don't spam on start unless SEND_BACKLOG_ON_START=1
-        try:
-            out = await rcon_command("GetGameLog", timeout=10.0)
-        except Exception as e:
-            print(f"[ERROR] Initial GetGameLog failed: {e}")
-            out = ""
-
-        lines = out.splitlines() if out else []
-        if not SEND_BACKLOG_ON_START:
-            for r in TRIBE_ROUTES:
-                tribe = r["tribe"]
-                for line in lines:
-                    if not is_for_tribe(line, tribe):
-                        continue
-                    summary = summarize_line(line, tribe)
-                    if not summary:
-                        continue
-                    seen[tribe].add(stable_hash(summary))
-            print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
-        else:
-            print("First run: backlog enabled, forwarding existing matching logs (capped per poll).")
-
         while True:
+            sent_anything = False
+
             try:
-                out = await rcon_command("GetGameLog", timeout=10.0)
-                raw_lines = out.splitlines() if out else []
-
-                for r in TRIBE_ROUTES:
-                    tribe = r["tribe"]
-                    wh = normalize_webhook_url(r["webhook"], r.get("thread_id", ""))
-
-                    # Collect new summaries for this tribe
-                    new_summaries: List[str] = []
-                    for line in raw_lines:
-                        if not is_for_tribe(line, tribe):
-                            continue
-
-                        summary = summarize_line(line, tribe)
-                        if not summary:
-                            continue
-
-                        h = stable_hash(summary)
-                        if h in seen[tribe]:
-                            continue
-
-                        seen[tribe].add(h)
-                        new_summaries.append(summary)
-
-                    # Send only the most recent N this poll (avoid spam)
-                    if new_summaries:
-                        # In backlog mode, do oldest->newest; otherwise newest->oldest is fine too
-                        # We'll send oldest->newest for nicer order.
-                        to_send = new_summaries[-MAX_SEND_PER_POLL:]
-                        for s in to_send:
-                            await post_webhook(session, wh, make_embed_line(s))
-                            last_activity_ts[tribe] = time.time()
-                            await asyncio.sleep(0.15)  # small spacing
-
-                    # Heartbeat only if no activity for HEARTBEAT_MINUTES
-                    now = time.time()
-                    inactivity = now - last_activity_ts[tribe]
-                    if inactivity >= (HEARTBEAT_MINUTES * 60):
-                        if now - last_heartbeat_ts[tribe] >= (HEARTBEAT_MINUTES * 60):
-                            payload = make_embed_line(f"⏱️ No new logs since last check. (Tribe: {tribe})")
-                            await post_webhook(session, wh, payload)
-                            last_heartbeat_ts[tribe] = now
-
+                raw = await rcon_command("GetGameLog", timeout=8.0)
             except Exception as e:
-                print(f"[ERROR] Loop error: {e}")
+                print(f"[ERROR] RCON GetGameLog failed: {e}")
+                await asyncio.sleep(POLL_SECONDS)
+                continue
+
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+            # Build per-tribe candidate list (newest-first, so we prefer most recent)
+            # We still allow multiple sends per poll, limited by MAX_SEND_PER_POLL.
+            to_send = []  # (tribe, route, cleaned_text, color)
+
+            for ln in reversed(lines):
+                cleaned = clean_line_to_day_time_who_what(ln)
+                if not cleaned:
+                    continue
+
+                h = hash_line(cleaned)
+                if dedupe.seen(h):
+                    continue
+
+                # Match to tribe routes by tribe name appearing in original line OR cleaned line
+                for route in TRIBE_ROUTES:
+                    tribe = str(route["tribe"])
+                    if tribe.lower() in ln.lower() or tribe.lower() in cleaned.lower():
+                        color = classify_color(cleaned)
+                        to_send.append((tribe, route, cleaned, color))
+                        dedupe.add(h)
+                        break  # one tribe per line
+
+                if len(to_send) >= MAX_SEND_PER_POLL:
+                    break
+
+            # First run behavior
+            if first_run and not SEND_BACKLOG_FIRST_RUN:
+                # Seed dedupe from current output to avoid backlog spam
+                for ln in lines:
+                    cleaned = clean_line_to_day_time_who_what(ln)
+                    if cleaned:
+                        dedupe.add(hash_line(cleaned))
+                print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
+                first_run = False
+            else:
+                first_run = False
+
+                # Send
+                for tribe, route, cleaned, color in to_send:
+                    ok = await post_embed(
+                        session=session,
+                        webhook_url=str(route["webhook"]),
+                        thread_id=str(route["thread_id"]),
+                        content=cleaned,
+                        color=color
+                    )
+                    if ok:
+                        sent_anything = True
+                        last_activity_ts[tribe] = time.time()
+
+            # Heartbeat: ONLY if no activity for HEARTBEAT_MINUTES
+            now = time.time()
+            for route in TRIBE_ROUTES:
+                tribe = str(route["tribe"])
+                idle = now - last_activity_ts.get(tribe, now)
+                if idle >= heartbeat_seconds:
+                    hb_text = f"⏱️ No new logs since last check. (Tribe: {tribe})"
+                    await post_embed(
+                        session=session,
+                        webhook_url=str(route["webhook"]),
+                        thread_id=str(route["thread_id"]),
+                        content=hb_text,
+                        color=COLOR_WHITE
+                    )
+                    last_activity_ts[tribe] = time.time()
+                    print(f"Heartbeat sent for {tribe} (idle {int(idle)}s).")
 
             await asyncio.sleep(POLL_SECONDS)
 
+# ============================================================
+# ENTRY
+# ============================================================
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())
