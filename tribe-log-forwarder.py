@@ -1,164 +1,191 @@
 import os
-import time
 import json
+import time
 import asyncio
 import hashlib
+import re
 import aiohttp
 
 # =====================
-# ENV VALIDATION
+# ENV
 # =====================
 RCON_HOST = os.getenv("RCON_HOST")
 RCON_PORT = int(os.getenv("RCON_PORT", "0"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "60"))
+
 TRIBE_ROUTES_RAW = os.getenv("TRIBE_ROUTES")
 
-if not all([RCON_HOST, RCON_PORT, RCON_PASSWORD, TRIBE_ROUTES_RAW]):
-    raise RuntimeError("Missing required environment variables")
+missing = []
+for k in ["RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "TRIBE_ROUTES"]:
+    if not os.getenv(k):
+        missing.append(k)
 
-try:
-    TRIBE_ROUTES = json.loads(TRIBE_ROUTES_RAW)
-except Exception as e:
-    raise RuntimeError("TRIBE_ROUTES must be valid JSON") from e
+if missing:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-POLL_INTERVAL = 10.0
+TRIBE_ROUTES = json.loads(TRIBE_ROUTES_RAW)
 
-# =====================
-# RCON (Source protocol)
-# =====================
-def _rcon_packet(req_id: int, ptype: int, body: str) -> bytes:
-    data = body.encode("utf-8") + b"\x00"
-    packet = (
-        req_id.to_bytes(4, "little", signed=True)
-        + ptype.to_bytes(4, "little", signed=True)
-        + data
-        + b"\x00"
-    )
-    return len(packet).to_bytes(4, "little", signed=True) + packet
-
-
-async def rcon_command(command: str, timeout: float = 6.0) -> str:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
-    )
-    try:
-        writer.write(_rcon_packet(1, 3, RCON_PASSWORD))
-        await writer.drain()
-        await reader.read(4096)
-
-        writer.write(_rcon_packet(2, 2, command))
-        await writer.drain()
-
-        chunks = []
-        end = time.time() + timeout
-        while time.time() < end:
-            try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.3)
-            except asyncio.TimeoutError:
-                break
-            if not part:
-                break
-            chunks.append(part)
-
-        data = b"".join(chunks)
-        out = []
-        i = 0
-        while i + 4 <= len(data):
-            size = int.from_bytes(data[i:i+4], "little", signed=True)
-            i += 4
-            pkt = data[i:i+size]
-            i += size
-            body = pkt[8:-2]
-            txt = body.decode("utf-8", errors="ignore")
-            if txt:
-                out.append(txt)
-
-        return "".join(out).strip()
-    finally:
-        writer.close()
-        await writer.wait_closed()
+print("Routing tribes:", ", ".join(TRIBE_ROUTES.keys()))
 
 # =====================
-# COLOR LOGIC
+# COLORS
 # =====================
-def event_color(text: str) -> int:
+COLORS = {
+    "RED": 0xE74C3C,
+    "YELLOW": 0xF1C40F,
+    "PURPLE": 0x9B59B6,
+    "GREEN": 0x2ECC71,
+    "BLUE": 0x5DADE2,
+    "WHITE": 0xECF0F1,
+}
+
+# =====================
+# CLEANUP
+# =====================
+RICHCOLOR_RE = re.compile(r"<\/?>|<RichColor[^>]*>", re.IGNORECASE)
+
+def clean_ark_text(text: str) -> str:
+    return RICHCOLOR_RE.sub("", text).strip()
+
+def classify_color(text: str) -> int:
     t = text.lower()
-
-    if any(k in t for k in ["killed", "died", "death", "destroyed"]):
-        return 0xE74C3C  # Red
+    if any(x in t for x in ["killed", "died", "death", "destroyed", "starved"]):
+        return COLORS["RED"]
     if "demolished" in t:
-        return 0xF1C40F  # Yellow
-    if "claimed" in t or "unclaimed" in t:
-        return 0x9B59B6  # Purple
-    if "tamed" in t or "taming" in t:
-        return 0x2ECC71  # Green
-    if "alliance" in t or "allied" in t:
-        return 0x5DADE2  # Light Blue
-
-    return 0xECF0F1  # White
+        return COLORS["YELLOW"]
+    if any(x in t for x in ["claimed", "unclaimed"]):
+        return COLORS["PURPLE"]
+    if "tamed" in t:
+        return COLORS["GREEN"]
+    if "alliance" in t:
+        return COLORS["BLUE"]
+    return COLORS["WHITE"]
 
 # =====================
-# LOG CLEANING
+# RCON
 # =====================
-def clean_line(line: str) -> str:
-    if "Tribe " in line:
-        line = line.split("Tribe ", 1)[1]
-    if ": Day " in line:
-        line = "Day " + line.split(": Day ", 1)[1]
+def _rcon_packet(req_id, ptype, body):
+    data = body.encode("utf-8") + b"\x00"
+    pkt = req_id.to_bytes(4,"little",signed=True) + ptype.to_bytes(4,"little",signed=True) + data + b"\x00"
+    return len(pkt).to_bytes(4,"little",signed=True) + pkt
 
-    return (
-        line.replace("</>)", "")
-            .replace("))", ")")
-            .strip()
-    )
+async def rcon_command(cmd, timeout=6):
+    reader, writer = await asyncio.open_connection(RCON_HOST, RCON_PORT)
+    writer.write(_rcon_packet(1, 3, RCON_PASSWORD))
+    await writer.drain()
+    await reader.read(4096)
+
+    writer.write(_rcon_packet(2, 2, cmd))
+    await writer.drain()
+
+    data = b""
+    while True:
+        try:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=0.3)
+        except asyncio.TimeoutError:
+            break
+        if not chunk:
+            break
+        data += chunk
+
+    writer.close()
+    await writer.wait_closed()
+
+    out = []
+    i = 0
+    while i + 4 <= len(data):
+        size = int.from_bytes(data[i:i+4], "little", signed=True)
+        i += 4
+        pkt = data[i:i+size]
+        i += size
+        out.append(pkt[8:-2].decode("utf-8", errors="ignore"))
+
+    return "\n".join(out)
+
+# =====================
+# STATE
+# =====================
+seen_hashes = set()
+last_activity_ts = time.time()
+last_heartbeat_ts = 0
+
+# =====================
+# DISCORD
+# =====================
+async def send_log(tribe, text, color):
+    route = TRIBE_ROUTES[tribe]
+    payload = {
+        "embeds": [{
+            "description": text,
+            "color": color
+        }]
+    }
+
+    params = {"wait": "true"}
+    if route.get("thread_id"):
+        params["thread_id"] = route["thread_id"]
+
+    async with aiohttp.ClientSession() as s:
+        async with s.post(route["webhook"], params=params, json=payload) as r:
+            if r.status >= 400:
+                body = await r.text()
+                print("Discord error:", r.status, body)
+
+async def send_heartbeat():
+    global last_heartbeat_ts
+    now = time.time()
+    if now - last_activity_ts < HEARTBEAT_MINUTES * 60:
+        return
+    if now - last_heartbeat_ts < HEARTBEAT_MINUTES * 60:
+        return
+
+    for tribe in TRIBE_ROUTES:
+        await send_log(
+            tribe,
+            f"⏱️ No new logs since last check. (Tribe: {tribe})",
+            COLORS["WHITE"]
+        )
+
+    last_heartbeat_ts = now
 
 # =====================
 # MAIN LOOP
 # =====================
 async def main():
-    print("Routing tribes:", ", ".join(TRIBE_ROUTES.keys()))
-    sent_hashes = set()
+    global last_activity_ts
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                raw = await rcon_command("GetGameLog")
-                lines = raw.splitlines()
+    print("Starting RCON GetGameLog polling…")
+    seed = await rcon_command("GetGameLog")
+    for line in seed.splitlines():
+        seen_hashes.add(hashlib.sha256(line.encode()).hexdigest())
 
-                for tribe, cfg in TRIBE_ROUTES.items():
-                    matches = [l for l in lines if f"Tribe {tribe}" in l]
-                    if not matches:
-                        continue
+    print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
 
-                    latest = matches[-1]
-                    cleaned = clean_line(latest)
-                    h = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+    while True:
+        try:
+            output = await rcon_command("GetGameLog")
+            for line in output.splitlines():
+                h = hashlib.sha256(line.encode()).hexdigest()
+                if h in seen_hashes:
+                    continue
 
-                    if h in sent_hashes:
-                        continue
+                seen_hashes.add(h)
+                clean = clean_ark_text(line)
 
-                    sent_hashes.add(h)
+                for tribe in TRIBE_ROUTES:
+                    if f"Tribe {tribe}" in clean:
+                        color = classify_color(clean)
+                        await send_log(tribe, clean, color)
+                        last_activity_ts = time.time()
 
-                    payload = {
-                        "embeds": [{
-                            "description": cleaned,
-                            "color": event_color(cleaned),
-                        }]
-                    }
+            await send_heartbeat()
 
-                    async with session.post(
-                        cfg["webhook"],
-                        params={"thread_id": cfg["thread_id"]},
-                        json=payload
-                    ) as r:
-                        if r.status >= 400:
-                            print("Discord error:", await r.text())
+        except Exception as e:
+            print("Error:", e)
 
-            except Exception as e:
-                print("Error:", e)
+        await asyncio.sleep(POLL_SECONDS)
 
-            await asyncio.sleep(POLL_INTERVAL)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
