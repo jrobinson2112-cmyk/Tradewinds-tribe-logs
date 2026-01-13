@@ -1,55 +1,71 @@
 import os
-import json
 import time
+import json
 import asyncio
 import aiohttp
 
-# =====================
+# =========================
 # ENV
-# =====================
-PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")  # normal webhook (NOT forum-only)
-RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = int(os.getenv("RCON_PORT", "0") or 0)
-RCON_PASSWORD = os.getenv("RCON_PASSWORD")
+# =========================
+RCON_HOST = os.getenv("RCON_HOST", "")
+RCON_PORT = int(os.getenv("RCON_PORT", "0") or "0")
+RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 
-PLAYER_CAP = int(os.getenv("PLAYER_CAP", "42") or 42)
-STATUS_POLL_SECONDS = float(os.getenv("STATUS_POLL_SECONDS", "15") or 15)
+PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL", "")  # REQUIRED
+PLAYER_CAP = int(os.getenv("PLAYER_CAP", "42") or "42")
 
+# Poll interval
+PLAYERS_POLL_SECONDS = float(os.getenv("PLAYERS_POLL_SECONDS", "60") or "60")
+
+# Persistent storage (Railway Volume mount)
 DATA_DIR = os.getenv("DATA_DIR", "/data")
-STATE_PATH = os.path.join(DATA_DIR, "players_state.json")
+STATE_FILE = os.path.join(DATA_DIR, "players_state.json")
 
+# =========================
+# VALIDATION
+# =========================
+def _ensure_env():
+    missing = []
+    if not RCON_HOST:
+        missing.append("RCON_HOST")
+    if not RCON_PORT:
+        missing.append("RCON_PORT")
+    if not RCON_PASSWORD:
+        missing.append("RCON_PASSWORD")
+    if not PLAYERS_WEBHOOK_URL:
+        missing.append("PLAYERS_WEBHOOK_URL")
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# =====================
-# STATE (persist message id)
-# =====================
 def _ensure_data_dir():
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        pass
+    os.makedirs(DATA_DIR, exist_ok=True)
 
+# =========================
+# STATE
+# =========================
 def load_state():
     _ensure_data_dir()
-    if not os.path.exists(STATE_PATH):
+    if not os.path.exists(STATE_FILE):
         return {"message_id": None}
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {"message_id": None}
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return {"message_id": None}
+        return {"message_id": d.get("message_id")}
     except Exception:
         return {"message_id": None}
 
-def save_state(state: dict):
+def save_state(s):
     _ensure_data_dir()
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
 
+_state = load_state()
 
-# =====================
-# RCON (minimal)
-# =====================
+# =========================
+# RCON
+# =========================
 def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     data = body.encode("utf-8") + b"\x00"
     packet = (
@@ -61,7 +77,7 @@ def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     size = len(packet)
     return size.to_bytes(4, "little", signed=True) + packet
 
-async def rcon_command(command: str, timeout: float = 6.0) -> str:
+async def rcon_command(command: str, timeout: float = 8.0) -> str:
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
     )
@@ -69,9 +85,12 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         # auth
         writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
-        _ = await asyncio.wait_for(reader.read(4096), timeout=timeout)
 
-        # cmd
+        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+        if len(raw) < 12:
+            raise RuntimeError("RCON auth failed (short response)")
+
+        # command
         writer.write(_rcon_make_packet(2, 2, command))
         await writer.drain()
 
@@ -79,7 +98,7 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         end_time = time.time() + timeout
         while time.time() < end_time:
             try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.4)
+                part = await asyncio.wait_for(reader.read(4096), timeout=0.35)
             except asyncio.TimeoutError:
                 break
             if not part:
@@ -95,12 +114,14 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         while i + 4 <= len(data):
             size = int.from_bytes(data[i:i+4], "little", signed=True)
             i += 4
-            if i + size > len(data) or size < 10:
+            if size < 10 or i + size > len(data):
                 break
             pkt = data[i:i+size]
             i += size
             body = pkt[8:-2]
-            txt = body.decode("utf-8", errors="ignore")
+            txt = body.decode("utf-8", errors="replace")
+            if txt.count("\ufffd") > 2:
+                txt = body.decode("latin-1", errors="replace")
             if txt:
                 out.append(txt)
 
@@ -112,8 +133,11 @@ async def rcon_command(command: str, timeout: float = 6.0) -> str:
         except Exception:
             pass
 
-
 def parse_listplayers(output: str):
+    """
+    Typical output lines:
+      1. PlayerName, SteamID/EOS...
+    """
     players = []
     if not output:
         return players
@@ -123,116 +147,112 @@ def parse_listplayers(output: str):
         if not line:
             continue
 
-        # Common outputs include "1. Name, SteamID" etc.
+        # strip "1. "
         if ". " in line:
             line = line.split(". ", 1)[1]
 
+        # take name before comma if present
         if "," in line:
             name = line.split(",", 1)[0].strip()
         else:
             name = line.strip()
 
-        bad = {"executing", "listplayers", "done"}
-        if name and name.lower() not in bad:
+        low = name.lower()
+        if name and low not in ("executing", "listplayers", "done"):
             players.append(name)
 
     return players
 
+# =========================
+# DISCORD WEBHOOK UPSERT
+# =========================
+async def _webhook_post(session: aiohttp.ClientSession, embed: dict) -> str | None:
+    url = PLAYERS_WEBHOOK_URL
+    joiner = "&" if "?" in url else "?"
+    url = f"{url}{joiner}wait=true"
 
-# =====================
-# Webhook upsert (edit if exists)
-# =====================
-async def upsert_webhook(session: aiohttp.ClientSession, embed: dict, state: dict):
-    if not PLAYERS_WEBHOOK_URL:
-        raise RuntimeError("PLAYERS_WEBHOOK_URL is missing")
+    async with session.post(url, json={"embeds": [embed]}) as r:
+        try:
+            data = await r.json()
+        except Exception:
+            data = None
 
-    mid = state.get("message_id")
-
-    # Try edit existing message
-    if mid:
-        async with session.patch(
-            f"{PLAYERS_WEBHOOK_URL}/messages/{mid}",
-            json={"embeds": [embed]},
-        ) as r:
-            if r.status == 404:
-                # message id invalid (deleted or different webhook) -> recreate
-                state["message_id"] = None
-                save_state(state)
-            elif r.status >= 300:
-                try:
-                    data = await r.json()
-                except Exception:
-                    data = await r.text()
-                raise RuntimeError(f"Webhook edit failed: {r.status} {data}")
-            else:
-                return
-
-    # Create new message
-    async with session.post(
-        PLAYERS_WEBHOOK_URL + "?wait=true",
-        json={"embeds": [embed]},
-    ) as r:
-        if r.status >= 300:
-            try:
-                data = await r.json()
-            except Exception:
-                data = await r.text()
+        if r.status not in (200, 204):
             raise RuntimeError(f"Webhook post failed: {r.status} {data}")
 
-        data = await r.json()
-        # Discord returns {"id": "..."} on success
-        if "id" not in data:
-            raise RuntimeError(f"Webhook post succeeded but no id returned: {data}")
+        if isinstance(data, dict) and "id" in data:
+            return str(data["id"])
+        return None
 
-        state["message_id"] = data["id"]
-        save_state(state)
+async def _webhook_patch(session: aiohttp.ClientSession, message_id: str, embed: dict) -> None:
+    url = f"{PLAYERS_WEBHOOK_URL}/messages/{message_id}"
+    joiner = "&" if "?" in url else "?"
+    url = f"{url}{joiner}wait=true"
 
+    async with session.patch(url, json={"embeds": [embed]}) as r:
+        if r.status in (200, 204):
+            return
+        try:
+            data = await r.json()
+        except Exception:
+            data = None
+        raise RuntimeError(f"Webhook patch failed: {r.status} {data}")
 
-def build_players_embed(names: list[str]):
+async def upsert_players_embed(session: aiohttp.ClientSession, embed: dict):
+    """
+    Create once (store id), then edit forever.
+    If edit fails (message deleted), recreate.
+    """
+    mid = _state.get("message_id")
+    if mid:
+        try:
+            await _webhook_patch(session, mid, embed)
+            return
+        except Exception:
+            _state["message_id"] = None
+            save_state(_state)
+
+    new_id = await _webhook_post(session, embed)
+    _state["message_id"] = new_id
+    save_state(_state)
+
+# =========================
+# EMBED BUILD
+# =========================
+def build_players_embed(names: list[str], cap: int) -> dict:
     count = len(names)
     lines = [f"{idx+1:02d}) {n}" for idx, n in enumerate(names[:50])]
-    desc = f"**{count}/{PLAYER_CAP}** online\n\n" + ("\n".join(lines) if lines else "*No players returned.*")
+    desc = f"**{count}/{cap}** online\n\n" + ("\n".join(lines) if lines else "*(No players returned.)*")
 
     return {
         "title": "Online Players",
         "description": desc,
         "color": 0x2ECC71,
-        "footer": {"text": f"Last update: {time.strftime('%H:%M:%S')}"},
+        "footer": {"text": f"Last update: {time.strftime('%H:%M:%S')}"}
     }
 
+# =========================
+# LOOP
+# =========================
+async def run_players_loop():
+    _ensure_env()
 
-# =====================
-# Public entrypoint
-# =====================
-_task = None
-
-def run_players_loop():
-    global _task
-    if _task and not _task.done():
-        return _task
-    _task = asyncio.create_task(_players_loop())
-    return _task
-
-
-async def _players_loop():
-    # Hard env check
-    if not (RCON_HOST and RCON_PORT and RCON_PASSWORD):
-        print("❌ Players loop missing RCON env vars (RCON_HOST/RCON_PORT/RCON_PASSWORD).")
-        return
-
-    state = load_state()
+    # simple backoff for RCON issues
+    backoff = 0.0
 
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                out = await rcon_command("ListPlayers", timeout=8.0)
+                out = await rcon_command("ListPlayers", timeout=10.0)
                 names = parse_listplayers(out)
+                embed = build_players_embed(names, PLAYER_CAP)
+                await upsert_players_embed(session, embed)
 
-                embed = build_players_embed(names)
-                await upsert_webhook(session, embed, state)
+                backoff = 0.0  # reset on success
 
             except Exception as e:
-                # IMPORTANT: never let the loop die
+                # don’t crash loop; back off a bit
                 print(f"Players loop error: {e}")
+                backoff = min(300.0, backoff + 15.0)  # up to 5 min
 
-            await asyncio.sleep(STATUS_POLL_SECONDS)
+            await asyncio.sleep(PLAYERS_POLL_SECONDS + backoff)
