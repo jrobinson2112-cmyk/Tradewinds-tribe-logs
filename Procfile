@@ -1,2 +1,1 @@
-web: python tribe-log-forwarder.py
-worker: python tribe-log-forwarder.py
+web: python main.py
