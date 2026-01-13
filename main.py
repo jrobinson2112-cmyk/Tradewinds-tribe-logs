@@ -5,6 +5,7 @@ from discord import app_commands
 
 from tribelogs_module import setup_tribelog_commands, run_tribelogs_loop
 from players_module import run_players_loop
+from vcstatus_module import run_vcstatus_loop
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1430388266393276509
@@ -21,7 +22,8 @@ async def on_ready():
 
     asyncio.create_task(run_tribelogs_loop())
     asyncio.create_task(run_players_loop())
+    asyncio.create_task(run_vcstatus_loop(client))
 
-    print("✅ Solunaris bot online (tribelogs + players)")
+    print("✅ Solunaris bot online (tribelogs + players + vcstatus)")
 
 client.run(DISCORD_TOKEN)
