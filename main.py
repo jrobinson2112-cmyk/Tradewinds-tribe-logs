@@ -1,11 +1,11 @@
+import asyncio
 import discord
 from discord import app_commands
-from config import require_env, DISCORD_TOKEN, GUILD_ID
-from time_module import run_time_loop
-from players_module import run_players_loop
-from tribelogs_module import run_tribelogs_loop
 
-require_env()
+from tribelogs_module import run_tribelogs_loop, setup_tribelog_commands
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = 1430388266393276509  # your server ID
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -13,10 +13,13 @@ tree = app_commands.CommandTree(client)
 
 @client.event
 async def on_ready():
+    # Register slash commands
+    setup_tribelog_commands(tree, discord.Object(id=GUILD_ID))
     await tree.sync(guild=discord.Object(id=GUILD_ID))
-    client.loop.create_task(run_time_loop(client))
-    client.loop.create_task(run_players_loop(client))
-    client.loop.create_task(run_tribelogs_loop(client))
-    print("✅ Solunaris bot online (modules separated)")
+
+    # Start tribe log loop
+    asyncio.create_task(run_tribelogs_loop(client))
+
+    print("✅ Solunaris Tribe Logs bot online")
 
 client.run(DISCORD_TOKEN)
