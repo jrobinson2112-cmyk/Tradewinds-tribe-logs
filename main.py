@@ -23,7 +23,7 @@ async def on_ready():
     await tree.sync(guild=discord.Object(id=GUILD_ID))
 
     # start loops
-    asyncio.create_task(run_tribelogs_loop(client))
+    asyncio.create_task(run_tribelogs_loop())
     asyncio.create_task(run_players_loop())
 
     print("✅ Solunaris bot online")
