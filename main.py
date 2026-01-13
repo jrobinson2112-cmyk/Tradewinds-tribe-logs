@@ -1,5 +1,4 @@
 import os
-import asyncio
 import discord
 from discord import app_commands
 
@@ -16,15 +15,14 @@ tree = app_commands.CommandTree(client)
 
 @client.event
 async def on_ready():
-    # setup commands (tribelogs_module expects an int guild_id)
     setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
 
-    # sync to your guild so commands appear instantly
+    # Sync commands to your guild so they show up immediately
     await tree.sync(guild=discord.Object(id=GUILD_ID))
 
-    # start loops
-    asyncio.create_task(run_tribelogs_loop())
-    asyncio.create_task(run_players_loop())
+    # IMPORTANT: these functions already start their own tasks internally
+    run_tribelogs_loop()
+    run_players_loop()
 
     print("✅ Solunaris bot online")
 
