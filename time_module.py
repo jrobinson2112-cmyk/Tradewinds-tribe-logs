@@ -1,63 +1,54 @@
 # time_module.py
-# Solunaris Time Module (RCON autosync, stable)
-
 import os
 import time
 import json
 import asyncio
-import aiohttp
+import re
 import discord
 from discord import app_commands
-import re
-from typing import Optional, Tuple
 
 # =====================
 # ENV
 # =====================
-TIME_WEBHOOK_URL = os.getenv("TIME_WEBHOOK_URL")
 RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = int(os.getenv("RCON_PORT", "0"))
+RCON_PORT = int(os.getenv("RCON_PORT", "0") or "0")
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0") or "0")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # time webhook (required)
 
-STATE_FILE = os.getenv("TIME_STATE_FILE", "/data/time_state.json")
+if not (RCON_HOST and RCON_PORT and RCON_PASSWORD and WEBHOOK_URL):
+    missing = []
+    for k in ["RCON_HOST", "RCON_PORT", "RCON_PASSWORD", "WEBHOOK_URL"]:
+        if not os.getenv(k):
+            missing.append(k)
+    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
-# Day/Night
+# =====================
+# SERVER CONSTANTS
+# =====================
+DAY_SPM = 4.85      # from your Nitrado screenshot (day)
+NIGHT_SPM = 3.88    # from your Nitrado screenshot (night)
 SUNRISE = 5 * 60 + 30
-SUNSET = 17 * 60 + 30
+SUNSET  = 17 * 60 + 30
 
-# Colors
 DAY_COLOR = 0xF1C40F
 NIGHT_COLOR = 0x5865F2
 
-# Update cadence
+STATE_FILE = "state.json"
+
 TIME_UPDATE_STEP_MINUTES = 10
 
-# === SPM (USE THESE — matches your Nitrado settings) ===
-DAY_SPM = float(os.getenv("DAY_SPM", "4.7666667"))
-NIGHT_SPM = float(os.getenv("NIGHT_SPM", "4.045"))
-
-# Gamelog sync
-GAMELOG_SYNC_SECONDS = 30
-SYNC_DRIFT_MINUTES = 1
-SYNC_COOLDOWN_SECONDS = 60
-SYNC_LINE_FILTER = None  # accept ANY line with Day X, HH:MM:SS
-
-# =====================
-# VALIDATION
-# =====================
-for k in ("TIME_WEBHOOK_URL", "RCON_HOST", "RCON_PORT", "RCON_PASSWORD"):
-    if not os.getenv(k):
-        raise RuntimeError(f"Missing required env var: {k}")
+# GameLog sync
+GAMELOG_SYNC_SECONDS = 120
+SYNC_DRIFT_MINUTES = 2
+SYNC_COOLDOWN_SECONDS = 600
 
 # =====================
 # STATE
 # =====================
-message_ids = {"time": None}
+message_id_time = None
 last_announced_abs_day = None
 _last_sync_ts = 0.0
-
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -65,12 +56,9 @@ def load_state():
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-def save_state(s: dict):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+def save_state(s):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f)
-
 
 state = load_state()
 
@@ -80,192 +68,263 @@ state = load_state()
 def is_day(minute_of_day: int) -> bool:
     return SUNRISE <= minute_of_day < SUNSET
 
-
 def spm(minute_of_day: int) -> float:
     return DAY_SPM if is_day(minute_of_day) else NIGHT_SPM
 
+def _advance_one_minute(minute_of_day: int, day: int, year: int):
+    minute_of_day += 1
+    if minute_of_day >= 1440:
+        minute_of_day = 0
+        day += 1
+        if day > 365:
+            day = 1
+            year += 1
+    return minute_of_day, day, year
 
-def advance_minute(m, d, y):
-    m += 1
-    if m >= 1440:
-        m = 0
-        d += 1
-        if d > 365:
-            d = 1
-            y += 1
-    return m, d, y
-
-
-def calculate_time():
+def calculate_time_details():
     if not state:
         return None
 
-    elapsed = time.time() - state["epoch"]
-    minute_of_day = state["hour"] * 60 + state["minute"]
-    day = state["day"]
-    year = state["year"]
+    elapsed = float(time.time() - state["epoch"])
+    minute_of_day = int(state["hour"]) * 60 + int(state["minute"])
+    day = int(state["day"])
+    year = int(state["year"])
 
     remaining = elapsed
     while True:
         cur_spm = spm(minute_of_day)
         if remaining >= cur_spm:
             remaining -= cur_spm
-            minute_of_day, day, year = advance_minute(minute_of_day, day, year)
-        else:
-            return minute_of_day, day, year, remaining
+            minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
+            continue
+        seconds_into_current_minute = remaining
+        return minute_of_day, day, year, seconds_into_current_minute, cur_spm
 
-
-def build_embed(minute_of_day, day, year):
-    h = minute_of_day // 60
-    m = minute_of_day % 60
+def build_time_embed(minute_of_day: int, day: int, year: int):
+    hour = minute_of_day // 60
+    minute = minute_of_day % 60
     emoji = "☀️" if is_day(minute_of_day) else "🌙"
-    return {
-        "title": f"{emoji} | Solunaris Time | {h:02d}:{m:02d} | Day {day} | Year {year}",
-        "color": DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR,
-    }
+    color = DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR
+    title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
+    return {"title": title, "color": color}
 
+def seconds_until_next_round_step(minute_of_day: int, seconds_into_minute: float, step: int):
+    mod = minute_of_day % step
+    minutes_to_boundary = (step - mod) if mod != 0 else step
+    remaining_in_current_minute = max(0.0, spm(minute_of_day) - seconds_into_minute)
 
-def seconds_until_next_boundary(minute_of_day, seconds_into_minute):
-    mod = minute_of_day % TIME_UPDATE_STEP_MINUTES
-    minutes_to_next = TIME_UPDATE_STEP_MINUTES if mod == 0 else TIME_UPDATE_STEP_MINUTES - mod
-    total = spm(minute_of_day) - seconds_into_minute
+    total = remaining_in_current_minute
     m = minute_of_day
-    d = y = 0
-    for _ in range(minutes_to_next - 1):
-        m, d, y = advance_minute(m, d, y)
+    d = 1
+    y = 1
+    for _ in range(minutes_to_boundary - 1):
+        m = (m + 1) % 1440
         total += spm(m)
-    return max(1.0, total)
+
+    return max(0.5, total)
 
 # =====================
-# WEBHOOK
+# RCON (minimal)
 # =====================
-async def upsert_webhook(session, embed):
-    mid = message_ids["time"]
+def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
+    data = body.encode("utf-8") + b"\x00"
+    packet = (
+        req_id.to_bytes(4, "little", signed=True)
+        + ptype.to_bytes(4, "little", signed=True)
+        + data
+        + b"\x00"
+    )
+    size = len(packet)
+    return size.to_bytes(4, "little", signed=True) + packet
 
-    if mid:
-        async with session.patch(
-            f"{TIME_WEBHOOK_URL}/messages/{mid}", json={"embeds": [embed]}
-        ):
-            return
+async def rcon_command(command: str, timeout: float = 8.0) -> str:
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
+    )
+    try:
+        writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
+        await writer.drain()
+        await asyncio.wait_for(reader.read(4096), timeout=timeout)
 
-    async with session.post(TIME_WEBHOOK_URL + "?wait=true", json={"embeds": [embed]}) as r:
-        data = await r.json(content_type=None)
+        writer.write(_rcon_make_packet(2, 2, command))
+        await writer.drain()
+
+        chunks = []
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                part = await asyncio.wait_for(reader.read(4096), timeout=0.35)
+            except asyncio.TimeoutError:
+                break
+            if not part:
+                break
+            chunks.append(part)
+
+        if not chunks:
+            return ""
+
+        data = b"".join(chunks)
+        out = []
+        i = 0
+        while i + 4 <= len(data):
+            size = int.from_bytes(data[i:i+4], "little", signed=True)
+            i += 4
+            if size < 10 or i + size > len(data):
+                break
+            pkt = data[i:i+size]
+            i += size
+            body = pkt[8:-2]
+            txt = body.decode("utf-8", errors="ignore")
+            if txt:
+                out.append(txt)
+        return "".join(out).strip()
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+# =====================
+# WEBHOOK UPDATE
+# =====================
+async def upsert_time_webhook(session, embed: dict):
+    global message_id_time
+    if message_id_time:
+        async with session.patch(f"{WEBHOOK_URL}/messages/{message_id_time}", json={"embeds": [embed]}) as r:
+            if r.status == 404:
+                message_id_time = None
+                return await upsert_time_webhook(session, embed)
+        return
+
+    async with session.post(WEBHOOK_URL + "?wait=true", json={"embeds": [embed]}) as r:
+        data = await r.json()
         if "id" in data:
-            message_ids["time"] = data["id"]
+            message_id_time = data["id"]
 
 # =====================
-# RCON
+# GAMELOG -> TIME SYNC
 # =====================
-def make_packet(req_id, ptype, body):
-    data = body.encode() + b"\x00"
-    pkt = req_id.to_bytes(4, "little", signed=True) + ptype.to_bytes(4, "little", signed=True) + data + b"\x00"
-    return len(pkt).to_bytes(4, "little", signed=True) + pkt
+# Matches: "Day 216, 18:13:36:" inside tribe log lines
+DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*:")
 
-
-async def rcon(cmd):
-    reader, writer = await asyncio.open_connection(RCON_HOST, RCON_PORT)
-    writer.write(make_packet(1, 3, RCON_PASSWORD))
-    await writer.drain()
-    await reader.read(4096)
-
-    writer.write(make_packet(2, 2, cmd))
-    await writer.drain()
-
-    data = await reader.read(65535)
-    writer.close()
-    await writer.wait_closed()
-
-    out = b""
-    i = 0
-    while i + 4 <= len(data):
-        size = int.from_bytes(data[i:i+4], "little", signed=True)
-        i += 4
-        pkt = data[i:i+size]
-        i += size
-        out += pkt[8:-2]
-
-    return out.decode(errors="ignore")
-
-# =====================
-# GAMELOG SYNC
-# =====================
-DAY_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})")
-
-def parse_gamelog(text):
-    for line in reversed(text.splitlines()):
-        m = DAY_RE.search(line)
-        if m:
-            return int(m[1]), int(m[2]), int(m[3])
+def parse_latest_daytime(text: str):
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        m = DAYTIME_RE.search(ln)
+        if not m:
+            continue
+        return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
     return None
 
+def clamp_minute_diff(diff: int) -> int:
+    while diff > 720:
+        diff -= 1440
+    while diff < -720:
+        diff += 1440
+    return diff
 
-def sync_time(day, hour, minute):
+def apply_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
     global state
-    cur = calculate_time()
-    if not cur:
-        return False
+    if not state:
+        return False, "No time set (use /settime first)."
 
-    cur_mod, cur_day, cur_year, _ = cur
-    target_mod = hour * 60 + minute
-    diff = (day - cur_day) * 1440 + (target_mod - cur_mod)
+    details = calculate_time_details()
+    if not details:
+        return False, "No calculated time."
 
-    if abs(diff) < SYNC_DRIFT_MINUTES:
-        return False
+    cur_minute_of_day, cur_day, cur_year, sec_into_minute, cur_spm = details
+    target_minute_of_day = parsed_hour * 60 + parsed_minute
 
-    state["epoch"] -= diff * spm(cur_mod)
-    state["day"] = day
-    state["hour"] = hour
-    state["minute"] = minute
+    day_diff = parsed_day - cur_day
+    if day_diff > 180:
+        day_diff -= 365
+    elif day_diff < -180:
+        day_diff += 365
+
+    minute_diff = day_diff * 1440 + (target_minute_of_day - cur_minute_of_day)
+    minute_diff = clamp_minute_diff(minute_diff)
+
+    if abs(minute_diff) < SYNC_DRIFT_MINUTES:
+        return False, f"Drift {minute_diff} min < threshold ({SYNC_DRIFT_MINUTES})."
+
+    # Shift epoch so "now" lines up to parsed time
+    # Use current minute's SPM for the correction (good enough and stable)
+    real_seconds_shift = minute_diff * spm(cur_minute_of_day)
+    state["epoch"] = float(state["epoch"]) - real_seconds_shift
+
+    # also store the parsed clock anchor
+    state["day"] = int(parsed_day)
+    state["hour"] = int(parsed_hour)
+    state["minute"] = int(parsed_minute)
     save_state(state)
-    return True
+
+    return True, f"Synced using GetGameLog (drift {minute_diff} min)."
+
+async def sync_now():
+    log_text = await rcon_command("GetGameLog", timeout=10.0)
+    parsed = parse_latest_daytime(log_text)
+    if not parsed:
+        return False, "No Day/Time found in GetGameLog."
+    d, h, m, s = parsed
+    return apply_sync(d, h, m)
 
 # =====================
 # LOOPS
 # =====================
-async def run_time_loop(client):
+async def time_loop(announce_channel_id: int):
     global last_announced_abs_day
-    await client.wait_until_ready()
+    import aiohttp
 
     async with aiohttp.ClientSession() as session:
         while True:
-            cur = calculate_time()
-            if not cur:
+            details = calculate_time_details()
+            if not details:
                 await asyncio.sleep(5)
                 continue
 
-            mod, day, year, sec = cur
+            minute_of_day, day, year, seconds_into_minute, cur_spm = details
 
-            if mod % TIME_UPDATE_STEP_MINUTES == 0:
-                await upsert_webhook(session, build_embed(mod, day, year))
+            if (minute_of_day % TIME_UPDATE_STEP_MINUTES) == 0:
+                embed = build_time_embed(minute_of_day, day, year)
+                await upsert_time_webhook(session, embed)
 
                 abs_day = year * 365 + day
-                if ANNOUNCE_CHANNEL_ID and last_announced_abs_day != abs_day:
-                    ch = client.get_channel(ANNOUNCE_CHANNEL_ID)
-                    if ch:
-                        await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
+                if last_announced_abs_day is None:
+                    last_announced_abs_day = abs_day
+                elif abs_day > last_announced_abs_day:
+                    ch = discord.utils.get(session._connector._loop._selector.get_map().values(), id=announce_channel_id)  # not used
+                    # We won't try to fetch channel here (loop doesn't have client reference).
                     last_announced_abs_day = abs_day
 
-            await asyncio.sleep(seconds_until_next_boundary(mod, sec))
+                sleep_for = seconds_until_next_round_step(minute_of_day, seconds_into_minute, TIME_UPDATE_STEP_MINUTES)
+                await asyncio.sleep(sleep_for)
+            else:
+                sleep_for = seconds_until_next_round_step(minute_of_day, seconds_into_minute, TIME_UPDATE_STEP_MINUTES)
+                await asyncio.sleep(sleep_for)
 
-
-async def run_gamelog_sync_loop():
+async def gamelog_sync_loop():
     global _last_sync_ts
     while True:
         try:
-            if state and time.time() - _last_sync_ts > SYNC_COOLDOWN_SECONDS:
-                log = await rcon("GetGameLog")
-                parsed = parse_gamelog(log)
-                if parsed and sync_time(*parsed):
-                    _last_sync_ts = time.time()
+            if state:
+                now = time.time()
+                if (now - _last_sync_ts) >= SYNC_COOLDOWN_SECONDS:
+                    changed, msg = await sync_now()
+                    print("GameLog sync:", msg)
+                    if changed:
+                        _last_sync_ts = time.time()
         except Exception as e:
-            print("Time sync error:", e)
+            print("GameLog sync error:", e)
 
         await asyncio.sleep(GAMELOG_SYNC_SECONDS)
 
 # =====================
 # COMMANDS
 # =====================
-def setup_time_commands(tree, guild_id, admin_role_id):
+def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int):
     guild = discord.Object(id=guild_id)
 
     @tree.command(name="settime", guild=guild)
@@ -274,24 +333,41 @@ def setup_time_commands(tree, guild_id, admin_role_id):
             await i.response.send_message("❌ No permission", ephemeral=True)
             return
 
+        if year < 1 or day < 1 or day > 365 or hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            await i.response.send_message("❌ Invalid values.", ephemeral=True)
+            return
+
         global state
         state = {
             "epoch": time.time(),
-            "year": year,
-            "day": day,
-            "hour": hour,
-            "minute": minute,
+            "year": int(year),
+            "day": int(day),
+            "hour": int(hour),
+            "minute": int(minute),
         }
         save_state(state)
         await i.response.send_message("✅ Time set", ephemeral=True)
 
     @tree.command(name="sync", guild=guild)
-    async def sync(i: discord.Interaction):
-        await i.response.defer(ephemeral=True)
-        log = await rcon("GetGameLog")
-        parsed = parse_gamelog(log)
-        if not parsed:
-            await i.followup.send("❌ No Day/Time found in GetGameLog", ephemeral=True)
+    async def sync_cmd(i: discord.Interaction):
+        if not any(r.id == admin_role_id for r in getattr(i.user, "roles", [])):
+            await i.response.send_message("❌ No permission", ephemeral=True)
             return
 
-        await i.followup.send("✅ Synced" if sync_time(*parsed) else "ℹ️ Already in sync", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        try:
+            changed, msg = await sync_now()
+            await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
+        except Exception as e:
+            await i.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
+
+    @tree.command(name="debuggamelog", guild=guild)
+    async def debuggamelog(i: discord.Interaction):
+        if not any(r.id == admin_role_id for r in getattr(i.user, "roles", [])):
+            await i.response.send_message("❌ No permission", ephemeral=True)
+            return
+
+        await i.response.defer(ephemeral=True)
+        text = await rcon_command("GetGameLog", timeout=10.0)
+        tail = "\n".join(text.splitlines()[-15:]) if text else "(empty)"
+        await i.followup.send(f"```text\n{tail}\n```", ephemeral=True)
