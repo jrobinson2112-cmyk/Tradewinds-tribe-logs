@@ -1,4 +1,4 @@
-limport os
+import os
 import asyncio
 import discord
 from discord import app_commands
