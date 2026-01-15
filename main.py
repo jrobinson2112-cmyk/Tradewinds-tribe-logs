@@ -4,11 +4,10 @@ import discord
 from discord import app_commands
 
 from tribelogs_module import run_tribelogs_loop, setup_tribelog_commands
-from time_module import run_time_loop, setup_time_commands  # <-- make sure these exist
+from time_module import time_loop, setup_time_commands  # <-- uses your existing function
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Your server + admin role
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
@@ -23,19 +22,16 @@ tree = app_commands.CommandTree(client)
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # 1) Register commands from both modules on the SAME tree
+    # register both modules' commands on the SAME tree
     setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
     setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
 
-    # 2) Force a guild sync (instant vs global sync which can take ages)
     synced = await tree.sync(guild=guild_obj)
+    print(f"✅ Commands synced: {[c.name for c in synced]}")
 
-    print(f"✅ Logged in as: {client.user} ({client.user.id})")
-    print(f"✅ Commands synced to guild {GUILD_ID}: {[c.name for c in synced]}")
-
-    # 3) Start background loops
+    # start loops
     asyncio.create_task(run_tribelogs_loop())
-    asyncio.create_task(run_time_loop(client))
+    asyncio.create_task(time_loop(client))  # <-- pass client if your time_loop expects it
 
     print("✅ Solunaris bot online (tribelogs + time)")
 
