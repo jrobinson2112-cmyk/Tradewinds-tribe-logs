@@ -14,7 +14,7 @@ GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
 # Webhooks (time + players)
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")                # time webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")                  # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")  # players webhook
 
 intents = discord.Intents.default()
@@ -37,7 +37,6 @@ async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: st
     # Edit existing
     if mid:
         async with session.patch(f"{url}/messages/{mid}", json={"embeds": [embed]}) as r:
-            # If it was deleted, recreate
             if r.status == 404:
                 _webhook_message_ids[key] = None
                 return await _webhook_upsert_impl(session, url, key, embed)
@@ -46,7 +45,6 @@ async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: st
     # Create new (store ID)
     async with session.post(url + "?wait=true", json={"embeds": [embed]}) as r:
         data = await r.json()
-        # Some webhook endpoints can return non-standard payloads if wrong URL
         if "id" in data:
             _webhook_message_ids[key] = data["id"]
         else:
@@ -60,13 +58,11 @@ async def webhook_upsert(*args, **kwargs):
       - webhook_upsert(key, embed)
       - webhook_upsert(session, url, key, embed)
     """
-    # Pull possible args
     session = None
     url = None
     key = None
     embed = None
 
-    # kwargs support
     if "session" in kwargs:
         session = kwargs["session"]
     if "url" in kwargs:
@@ -76,7 +72,6 @@ async def webhook_upsert(*args, **kwargs):
     if "embed" in kwargs:
         embed = kwargs["embed"]
 
-    # positional patterns
     if len(args) == 1:
         embed = args[0]
         key = key or "time"
@@ -92,7 +87,6 @@ async def webhook_upsert(*args, **kwargs):
     if not url:
         raise RuntimeError("Missing webhook URL (WEBHOOK_URL / PLAYERS_WEBHOOK_URL env var)")
 
-    # If module didn't pass a session, make a short-lived one
     if session is None:
         async with aiohttp.ClientSession() as s:
             return await _webhook_upsert_impl(s, url, key, embed)
@@ -111,18 +105,16 @@ async def on_ready():
     except TypeError:
         tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
 
-    # Time commands
-    rcon_cmd = getattr(tribelogs_module, "rcon_command", None)
-    try:
-        # Preferred: (tree, guild_id, admin_role_id, rcon_command)
-        time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd)
-    except TypeError:
-        try:
-            # (tree, guild_id, rcon_command)
-            time_module.setup_time_commands(tree, GUILD_ID, rcon_cmd)
-        except TypeError:
-            # (tree, guild_id)
-            time_module.setup_time_commands(tree, GUILD_ID)
+    # ✅ RCON command source:
+    # Prefer players_module (it definitely has it), fallback to tribelogs_module if present.
+    rcon_cmd = getattr(players_module, "rcon_command", None) or getattr(tribelogs_module, "rcon_command", None)
+
+    # ---- Time commands (FIXED) ----
+    # New signature: setup_time_commands(tree, guild_id, admin_role_id)
+    time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
+
+    # Bind RCON so /sync can call GetGameLog
+    time_module.bind_rcon_for_commands(rcon_cmd)
 
     await tree.sync(guild=guild_obj)
 
@@ -133,8 +125,8 @@ async def on_ready():
     except TypeError:
         asyncio.create_task(tribelogs_module.run_tribelogs_loop(client))
 
-    # Time (FIXED: pass webhook_upsert)
-    asyncio.create_task(time_module.run_time_loop(client, rcon_cmd, webhook_upsert))
+    # ✅ Time loop (FIXED signature: run_time_loop(client, rcon_command))
+    asyncio.create_task(time_module.run_time_loop(client, rcon_cmd))
 
     # Players
     try:
