@@ -53,24 +53,15 @@ async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: st
 
 async def webhook_upsert(*args, **kwargs):
     """
-    Flexible wrapper so modules can call this in different ways:
+    Flexible wrapper:
       - webhook_upsert(embed)
       - webhook_upsert(key, embed)
       - webhook_upsert(session, url, key, embed)
     """
-    session = None
-    url = None
-    key = None
-    embed = None
-
-    if "session" in kwargs:
-        session = kwargs["session"]
-    if "url" in kwargs:
-        url = kwargs["url"]
-    if "key" in kwargs:
-        key = kwargs["key"]
-    if "embed" in kwargs:
-        embed = kwargs["embed"]
+    session = kwargs.get("session")
+    url = kwargs.get("url")
+    key = kwargs.get("key")
+    embed = kwargs.get("embed")
 
     if len(args) == 1:
         embed = args[0]
@@ -105,16 +96,24 @@ async def on_ready():
     except TypeError:
         tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
 
-    # ✅ RCON command source:
-    # Prefer players_module (it definitely has it), fallback to tribelogs_module if present.
-    rcon_cmd = getattr(players_module, "rcon_command", None) or getattr(tribelogs_module, "rcon_command", None)
+    # RCON command function (we reuse the one in tribelogs_module)
+    rcon_cmd = getattr(tribelogs_module, "rcon_command", None)
 
-    # ---- Time commands (FIXED) ----
-    # New signature: setup_time_commands(tree, guild_id, admin_role_id)
-    time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
+    # Time commands
+    try:
+        time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd)
+    except TypeError:
+        try:
+            time_module.setup_time_commands(tree, GUILD_ID, rcon_cmd)
+        except TypeError:
+            time_module.setup_time_commands(tree, GUILD_ID)
 
-    # Bind RCON so /sync can call GetGameLog
-    time_module.bind_rcon_for_commands(rcon_cmd)
+    # Bind RCON (if time_module supports it)
+    if hasattr(time_module, "bind_rcon_for_commands"):
+        try:
+            time_module.bind_rcon_for_commands(rcon_cmd)
+        except Exception:
+            pass
 
     await tree.sync(guild=guild_obj)
 
@@ -125,8 +124,8 @@ async def on_ready():
     except TypeError:
         asyncio.create_task(tribelogs_module.run_tribelogs_loop(client))
 
-    # ✅ Time loop (FIXED signature: run_time_loop(client, rcon_command))
-    asyncio.create_task(time_module.run_time_loop(client, rcon_cmd))
+    # Time (FIX: pass webhook_upsert)
+    asyncio.create_task(time_module.run_time_loop(client, rcon_cmd, webhook_upsert))
 
     # Players
     try:
