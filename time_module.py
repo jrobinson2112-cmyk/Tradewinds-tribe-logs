@@ -141,7 +141,7 @@ def build_time_embed(minute_of_day: int, day: int, year: int):
     color = DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR
     title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
     return {"title": title, "color": color}
-    def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
+        def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
     m = minute_of_day
     mod = m % step
     minutes_to_boundary = (step - mod) if mod != 0 else step
