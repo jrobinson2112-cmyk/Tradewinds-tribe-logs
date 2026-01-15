@@ -1,121 +1,109 @@
-# time_module.py
 import os
-import re
 import json
 import time
 import asyncio
-import discord
 import aiohttp
+import discord
 from discord import app_commands
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from typing import Optional, Tuple
 
-# ============================================================
-# ENV
-# ============================================================
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
-ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0") or "0")
+# =========================
+# STORAGE (Railway volume)
+# =========================
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+STATE_FILE = os.path.join(DATA_DIR, "time_state.json")
+MESSAGE_ID_FILE = os.path.join(DATA_DIR, "time_message_id.json")
 
-# Accept either name
+# ✅ shared file written by tribelogs_module
+LAST_INGAME_TIME_FILE = os.path.join(DATA_DIR, "last_ingame_time.json")
+
+def _ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+# =========================
+# CONFIG
+# =========================
+GUILD_ID = int(os.getenv("GUILD_ID", "1430388266393276509"))
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "1439069787207766076"))
+
+# where daily "new day" text message goes
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
+
+# webhook that hosts the main time embed
 TIME_WEBHOOK_URL = os.getenv("TIME_WEBHOOK_URL") or os.getenv("WEBHOOK_URL")
+if not TIME_WEBHOOK_URL:
+    raise RuntimeError("Missing required env var: TIME_WEBHOOK_URL (or WEBHOOK_URL)")
 
-ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0") or "0")
+# ARK default: 05:30 -> 17:30
+SUNRISE = 5 * 60 + 30
+SUNSET = 17 * 60 + 30
 
-RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = int(os.getenv("RCON_PORT", "0") or "0")
-RCON_PASSWORD = os.getenv("RCON_PASSWORD")
-
-# Persist on Railway volume (you said you added one)
-TIME_STATE_PATH = os.getenv("TIME_STATE_PATH", "/data/time_state.json")
-
-# ============================================================
-# ASA day/night boundaries
-# ============================================================
-SUNRISE_MIN = 5 * 60 + 30   # 05:30
-SUNSET_MIN = 17 * 60 + 30   # 17:30
+# your SPM multipliers (as already working in your setup)
+DAY_SPM = float(os.getenv("DAY_SPM", "4.7666667"))
+NIGHT_SPM = float(os.getenv("NIGHT_SPM", "4.045"))
 
 DAY_COLOR = 0xF1C40F
 NIGHT_COLOR = 0x5865F2
 
-# ============================================================
-# NITRADO multipliers (from your screenshot)
-# Defaults: full cycle 60 mins real time => 2.5 sec per in-game minute
-# Apply multipliers:
-#   base_spm = 2.5 * DayCycleSpeedScale
-#   day_spm  = base_spm / DayTimeSpeedScale
-#   night_spm= base_spm / NightTimeSpeedScale
-# ============================================================
-DAY_CYCLE_SPEED_SCALE = float(os.getenv("DAYCYCLE_SPEEDSCALE", "5.92"))
-DAY_TIME_SPEED_SCALE = float(os.getenv("DAYTIME_SPEEDSCALE", "1.85"))
-NIGHT_TIME_SPEED_SCALE = float(os.getenv("NIGHTTIME_SPEEDSCALE", "2.18"))
+# embed update cadence
+TIME_UPDATE_STEP_MINUTES = int(os.getenv("TIME_UPDATE_STEP_MINUTES", "10"))
 
-BASE_SPM_DEFAULT = 2.5
-BASE_SPM = BASE_SPM_DEFAULT * DAY_CYCLE_SPEED_SCALE
-DAY_SPM = BASE_SPM / DAY_TIME_SPEED_SCALE
-NIGHT_SPM = BASE_SPM / NIGHT_TIME_SPEED_SCALE
+# ✅ auto-sync every 10 mins
+AUTO_SYNC_SECONDS = int(os.getenv("AUTO_SYNC_SECONDS", "600"))
+SYNC_DRIFT_MINUTES = int(os.getenv("SYNC_DRIFT_MINUTES", "2"))
 
-# ============================================================
-# Update rules
-# ============================================================
-TIME_UPDATE_STEP_MINUTES = 10      # edit embed only on 00/10/20/...
-TIME_TICK_SECONDS = 5              # check loop frequency (safe + responsive)
-AUTO_SYNC_EVERY_SECONDS = 600      # auto sync every 10 minutes
-SYNC_DRIFT_MINUTES = int(os.getenv("TIME_SYNC_DRIFT_MINUTES", "2"))
-SYNC_COOLDOWN_SECONDS = int(os.getenv("TIME_SYNC_COOLDOWN_SECONDS", "600"))
-
-# ============================================================
-# Shared state
-# ============================================================
-_state = None
-_http_session: aiohttp.ClientSession | None = None
-_last_sync_ts = 0.0
-
-# For “don’t spam edits”
-_last_posted_boundary = None  # (year, day, minute_of_day_boundary)
-
-# Force update event (so /settime can instantly push)
-_force_update_event = asyncio.Event()
-
-# ============================================================
-# Helpers
-# ============================================================
-def _require_env():
-    missing = []
-    if not TIME_WEBHOOK_URL:
-        missing.append("TIME_WEBHOOK_URL (or WEBHOOK_URL)")
-    if not GUILD_ID:
-        missing.append("GUILD_ID")
-    if not ADMIN_ROLE_ID:
-        missing.append("ADMIN_ROLE_ID")
-    if not (RCON_HOST and RCON_PORT and RCON_PASSWORD):
-        missing.append("RCON_HOST/RCON_PORT/RCON_PASSWORD")
-
-    if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
-
-
-def _load_state():
-    if not os.path.exists(TIME_STATE_PATH):
+# =========================
+# STATE
+# =========================
+def load_state():
+    _ensure_data_dir()
+    if not os.path.exists(STATE_FILE):
         return None
     try:
-        with open(TIME_STATE_PATH, "r", encoding="utf-8") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
+def save_state(s):
+    _ensure_data_dir()
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
 
-def _save_state(s: dict):
-    os.makedirs(os.path.dirname(TIME_STATE_PATH), exist_ok=True)
-    with open(TIME_STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(s, f)
+def load_message_ids():
+    _ensure_data_dir()
+    if not os.path.exists(MESSAGE_ID_FILE):
+        return {"time": None}
+    try:
+        with open(MESSAGE_ID_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"time": None}
 
+def save_message_ids(d):
+    _ensure_data_dir()
+    tmp = MESSAGE_ID_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MESSAGE_ID_FILE)
 
-def _is_day(minute_of_day: int) -> bool:
-    return SUNRISE_MIN <= minute_of_day < SUNSET_MIN
+state = load_state()
+message_ids = load_message_ids()
+_last_announced_abs_day = None
 
+# =========================
+# TIME MATH
+# =========================
+def is_day(minute_of_day: int) -> bool:
+    return SUNRISE <= minute_of_day < SUNSET
 
-def _spm(minute_of_day: int) -> float:
-    return DAY_SPM if _is_day(minute_of_day) else NIGHT_SPM
-
+def spm(minute_of_day: int) -> float:
+    return DAY_SPM if is_day(minute_of_day) else NIGHT_SPM
 
 def _advance_one_minute(minute_of_day: int, day: int, year: int):
     minute_of_day += 1
@@ -127,78 +115,60 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int):
             year += 1
     return minute_of_day, day, year
 
-
-def _calculate_time():
-    """
-    Returns:
-      (minute_of_day, day, year, seconds_into_current_minute, current_spm)
-    """
-    global _state
-    if not _state:
+def calculate_time_details():
+    global state
+    if not state:
         return None
 
-    elapsed = float(time.time() - float(_state["epoch"]))
-    minute_of_day = int(_state["hour"]) * 60 + int(_state["minute"])
-    day = int(_state["day"])
-    year = int(_state["year"])
+    elapsed = float(time.time() - state["epoch"])
+    minute_of_day = int(state["hour"]) * 60 + int(state["minute"])
+    day = int(state["day"])
+    year = int(state["year"])
 
     remaining = elapsed
     while True:
-        cur_spm = _spm(minute_of_day)
+        cur_spm = spm(minute_of_day)
         if remaining >= cur_spm:
             remaining -= cur_spm
             minute_of_day, day, year = _advance_one_minute(minute_of_day, day, year)
             continue
         return minute_of_day, day, year, remaining, cur_spm
 
-
-def _build_embed(minute_of_day: int, day: int, year: int):
+def build_time_embed(minute_of_day: int, day: int, year: int):
     hour = minute_of_day // 60
     minute = minute_of_day % 60
-    emoji = "☀️" if _is_day(minute_of_day) else "🌙"
-    color = DAY_COLOR if _is_day(minute_of_day) else NIGHT_COLOR
+    emoji = "☀️" if is_day(minute_of_day) else "🌙"
+    color = DAY_COLOR if is_day(minute_of_day) else NIGHT_COLOR
     title = f"{emoji} | Solunaris Time | {hour:02d}:{minute:02d} | Day {day} | Year {year}"
     return {"title": title, "color": color}
+    def seconds_until_next_round_step(minute_of_day: int, day: int, year: int, seconds_into_minute: float, step: int):
+    m = minute_of_day
+    mod = m % step
+    minutes_to_boundary = (step - mod) if mod != 0 else step
 
+    cur_spm = spm(m)
+    remaining_in_current_minute = max(0.0, cur_spm - seconds_into_minute)
+    total = remaining_in_current_minute
 
-def _url_with_wait(url: str) -> str:
-    p = urlparse(url)
-    q = dict(parse_qsl(p.query, keep_blank_values=True))
-    q["wait"] = "true"
-    new_query = urlencode(q, doseq=True)
-    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    m2 = m
+    d2, y2 = day, year
+    for _ in range(minutes_to_boundary - 1):
+        m2, d2, y2 = _advance_one_minute(m2, d2, y2)
+        total += spm(m2)
 
+    return max(0.5, total)
 
-async def _upsert_webhook_embed(embed: dict):
-    """
-    Posts once then PATCHes same message forever.
-    Stores message id in state.
-    """
-    global _state, _http_session
-    if not _http_session:
-        raise RuntimeError("HTTP session not ready")
-    if not _state:
-        raise RuntimeError("No time state set")
-
-    _state.setdefault("message_ids", {})
-    mid = _state["message_ids"].get("time")
-
-    base_url = TIME_WEBHOOK_URL
+async def upsert_webhook(session: aiohttp.ClientSession, url: str, key: str, embed: dict):
+    mid = message_ids.get(key)
+    base_url = url.split("?", 1)[0]
 
     if mid:
-        patch_base = base_url.split("?", 1)[0] + f"/messages/{mid}"
-        # preserve original query params (thread_id etc)
-        if "?" in base_url:
-            patch_base = patch_base + "?" + base_url.split("?", 1)[1]
-        patch_url = _url_with_wait(patch_base)
-
-        async with _http_session.patch(patch_url, json={"embeds": [embed]}) as r:
+        async with session.patch(f"{base_url}/messages/{mid}", json={"embeds": [embed]}) as r:
             if r.status == 404:
-                # message deleted; re-create
-                _state["message_ids"]["time"] = None
-                _save_state(_state)
-                return await _upsert_webhook_embed(embed)
-            if r.status >= 300:
+                message_ids[key] = None
+                save_message_ids(message_ids)
+                return await upsert_webhook(session, url, key, embed)
+            if r.status not in (200, 204):
                 try:
                     data = await r.json()
                 except Exception:
@@ -206,107 +176,26 @@ async def _upsert_webhook_embed(embed: dict):
                 raise RuntimeError(f"Webhook patch failed: {r.status} {data}")
         return
 
-    # Create message
-    post_url = _url_with_wait(base_url)
-    async with _http_session.post(post_url, json={"embeds": [embed]}) as r:
-        try:
-            data = await r.json()
-        except Exception:
-            data = await r.text()
-        if r.status >= 300:
-            raise RuntimeError(f"Webhook post failed: {r.status} {data}")
-        if not (isinstance(data, dict) and "id" in data):
-            raise RuntimeError(f"Webhook response missing id: {data}")
+    async with session.post(base_url + "?wait=true", json={"embeds": [embed]}) as r:
+        data = await r.json()
+        if "id" not in data:
+            raise RuntimeError(f"Webhook post missing id: {data}")
+        message_ids[key] = data["id"]
+        save_message_ids(message_ids)
 
-        _state["message_ids"]["time"] = data["id"]
-        _save_state(_state)
-
-
-# ============================================================
-# RCON
-# ============================================================
-def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
-    data = body.encode("utf-8") + b"\x00"
-    packet = (
-        req_id.to_bytes(4, "little", signed=True)
-        + ptype.to_bytes(4, "little", signed=True)
-        + data
-        + b"\x00"
-    )
-    size = len(packet)
-    return size.to_bytes(4, "little", signed=True) + packet
-
-
-async def rcon_command(command: str, timeout: float = 10.0) -> str:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
-    )
+# =========================
+# ✅ Sync from tribe-log timestamp file
+# =========================
+def read_last_ingame_time(max_age_seconds: int = 6 * 3600) -> Optional[Tuple[int, int, int, int]]:
     try:
-        writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
-        await writer.drain()
-        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if len(raw) < 12:
-            raise RuntimeError("RCON auth failed (short response)")
-
-        writer.write(_rcon_make_packet(2, 2, command))
-        await writer.drain()
-
-        chunks = []
-        end_time = time.time() + timeout
-        while time.time() < end_time:
-            try:
-                part = await asyncio.wait_for(reader.read(4096), timeout=0.3)
-            except asyncio.TimeoutError:
-                break
-            if not part:
-                break
-            chunks.append(part)
-
-        if not chunks:
-            return ""
-
-        data = b"".join(chunks)
-        out = []
-        i = 0
-        while i + 4 <= len(data):
-            size = int.from_bytes(data[i:i+4], "little", signed=True)
-            i += 4
-            if i + size > len(data) or size < 10:
-                break
-            pkt = data[i:i+size]
-            i += size
-            body = pkt[8:-2]
-            txt = body.decode("utf-8", errors="ignore")
-            if txt:
-                out.append(txt)
-
-        return "".join(out).strip()
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-# ============================================================
-# Sync from GetGameLog
-# Accept:
-#   "Day 237, 01:14:22: ..."
-#   "Day 237, 01:14:22 - ..."
-# ============================================================
-_DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*[:\-]", re.IGNORECASE)
-
-def _parse_latest_daytime(text: str):
-    if not text:
+        with open(LAST_INGAME_TIME_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        written_at = int(d.get("written_at_epoch", 0))
+        if written_at and (time.time() - written_at) > max_age_seconds:
+            return None
+        return int(d["day"]), int(d["hour"]), int(d["minute"]), int(d["second"])
+    except Exception:
         return None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for ln in reversed(lines):
-        m = _DAYTIME_RE.search(ln)
-        if m:
-            return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-    return None
-
 
 def _wrap_minute_diff(diff: int) -> int:
     while diff > 720:
@@ -315,15 +204,14 @@ def _wrap_minute_diff(diff: int) -> int:
         diff += 1440
     return diff
 
+def apply_sync(parsed_day: int, parsed_hour: int, parsed_minute: int):
+    global state
+    if not state:
+        return False, "No state set (use /settime once)."
 
-def _apply_sync(parsed_day: int, parsed_hour: int, parsed_minute: int, parsed_second: int):
-    global _state
-    if not _state:
-        return False, "No state set"
-
-    details = _calculate_time()
+    details = calculate_time_details()
     if not details:
-        return False, "No calculated time"
+        return False, "No calculated time."
 
     cur_minute_of_day, cur_day, cur_year, seconds_into_minute, cur_spm = details
     target_minute_of_day = parsed_hour * 60 + parsed_minute
@@ -340,54 +228,86 @@ def _apply_sync(parsed_day: int, parsed_hour: int, parsed_minute: int, parsed_se
     if abs(minute_diff) < SYNC_DRIFT_MINUTES:
         return False, f"Drift {minute_diff} min < threshold"
 
-    # seconds fraction adjustment (small)
-    second_frac_diff = (parsed_second / 60.0) - (seconds_into_minute / max(cur_spm, 0.001))
+    real_seconds_shift = minute_diff * spm(cur_minute_of_day)
+    state["epoch"] = float(state["epoch"]) - real_seconds_shift
 
-    real_shift = (minute_diff * cur_spm) + (second_frac_diff * cur_spm)
-    _state["epoch"] = float(_state["epoch"]) - real_shift
+    # keep display fields aligned
+    state["day"] = int(parsed_day)
+    state["hour"] = int(parsed_hour)
+    state["minute"] = int(parsed_minute)
+    save_state(state)
 
-    _state["day"] = int(parsed_day)
-    _state["hour"] = int(parsed_hour)
-    _state["minute"] = int(parsed_minute)
-    _save_state(_state)
+    return True, f"Synced from tribe-log timestamp (drift {minute_diff} min)"
 
-    return True, f"Synced (drift {minute_diff} min)"
+# =========================
+# LOOPS
+# =========================
+async def _time_loop(client: discord.Client):
+    global _last_announced_abs_day
+    await client.wait_until_ready()
 
+    async with aiohttp.ClientSession() as session:
+        while True:
+            details = calculate_time_details()
+            if not details:
+                await asyncio.sleep(2)
+                continue
 
-async def _sync_once():
-    global _last_sync_ts
-    if not _state:
-        return False, "No time set. Use /settime first."
+            minute_of_day, day, year, seconds_into_minute, cur_spm = details
 
-    now = time.time()
-    if (now - _last_sync_ts) < SYNC_COOLDOWN_SECONDS:
-        return False, "Sync cooldown active."
+            # update embed on step boundary
+            if (minute_of_day % TIME_UPDATE_STEP_MINUTES) == 0:
+                embed = build_time_embed(minute_of_day, day, year)
+                await upsert_webhook(session, TIME_WEBHOOK_URL, "time", embed)
 
-    text = await rcon_command("GetGameLog", timeout=10.0)
-    if not text:
-        return False, "GetGameLog returned empty output."
+                # ✅ daily message at start of a NEW in-game day
+                if ANNOUNCE_CHANNEL_ID:
+                    abs_day = year * 365 + day
+                    if _last_announced_abs_day is None:
+                        _last_announced_abs_day = abs_day
+                    elif abs_day > _last_announced_abs_day:
+                        ch = client.get_channel(ANNOUNCE_CHANNEL_ID)
+                        if ch:
+                            await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
+                        _last_announced_abs_day = abs_day
 
-    parsed = _parse_latest_daytime(text)
-    if not parsed:
-        return False, "No Day/Time found in GetGameLog."
+            sleep_for = seconds_until_next_round_step(
+                minute_of_day, day, year, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
+            )
+            await asyncio.sleep(sleep_for)
 
-    d, h, m, s = parsed
-    changed, msg = _apply_sync(d, h, m, s)
-    if changed:
-        _last_sync_ts = time.time()
-        _force_update_event.set()  # show it immediately
-    return changed, msg
+async def _autosync_loop(client: discord.Client):
+    await client.wait_until_ready()
+    while True:
+        try:
+            if state:
+                parsed = read_last_ingame_time(max_age_seconds=6 * 3600)
+                if parsed:
+                    d, h, m, s = parsed
+                    changed, msg = apply_sync(d, h, m)
+                    if changed:
+                        print("Auto-sync:", msg)
+                else:
+                    print("Auto-sync: no recent tribe-log timestamp available")
+        except Exception as e:
+            print("Auto-sync error:", e)
 
+        await asyncio.sleep(AUTO_SYNC_SECONDS)
 
-# ============================================================
-# Public API
-# ============================================================
-def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int):
+def run_time_loop(client: discord.Client):
+    async def _runner():
+        await asyncio.gather(_time_loop(client), _autosync_loop(client))
+    return _runner()
+
+# =========================
+# COMMANDS
+# =========================
+def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int = ADMIN_ROLE_ID):
     guild_obj = discord.Object(id=int(guild_id))
 
-    @tree.command(name="settime", guild=guild_obj, description="Set Solunaris in-game time anchor")
-    async def settime_cmd(i: discord.Interaction, year: int, day: int, hour: int, minute: int):
-        if not any(getattr(r, "id", None) == int(admin_role_id) for r in getattr(i.user, "roles", [])):
+    @tree.command(name="settime", guild=guild_obj)
+    async def settime(i: discord.Interaction, year: int, day: int, hour: int, minute: int):
+        if not any(r.id == int(admin_role_id) for r in getattr(i.user, "roles", [])):
             await i.response.send_message("❌ No permission", ephemeral=True)
             return
 
@@ -395,107 +315,27 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
             await i.response.send_message("❌ Invalid values.", ephemeral=True)
             return
 
-        global _state
-        _state = _load_state() or {}
-        _state.setdefault("message_ids", {})
+        global state, _last_announced_abs_day
+        state = {"epoch": time.time(), "year": int(year), "day": int(day), "hour": int(hour), "minute": int(minute)}
+        save_state(state)
 
-        _state.update({
-            "epoch": time.time(),
-            "year": int(year),
-            "day": int(day),
-            "hour": int(hour),
-            "minute": int(minute),
-        })
-        _save_state(_state)
-
-        # Force immediate webhook update
-        _force_update_event.set()
+        # reset daily-message tracking so it can fire correctly after settime
+        _last_announced_abs_day = year * 365 + day
 
         await i.response.send_message("✅ Time set.", ephemeral=True)
 
-    @tree.command(name="sync", guild=guild_obj, description="Force a one-time RCON GetGameLog sync")
-    async def sync_cmd(i: discord.Interaction):
-        if not any(getattr(r, "id", None) == int(admin_role_id) for r in getattr(i.user, "roles", [])):
-            await i.response.send_message("❌ No permission", ephemeral=True)
+    @tree.command(name="sync", guild=guild_obj)
+    async def sync(i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+
+        parsed = read_last_ingame_time(max_age_seconds=6 * 3600)
+        if not parsed:
+            await i.followup.send(
+                "❌ No recent in-game Day/Time available yet (need at least one tribe log line).",
+                ephemeral=True
+            )
             return
 
-        await i.response.defer(ephemeral=True)
-        try:
-            changed, msg = await _sync_once()
-            await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
-        except Exception as e:
-            await i.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
-
-
-async def run_time_loop(client: discord.Client):
-    """
-    Reliable loop:
-      - checks every 5s
-      - edits webhook only when hitting a NEW 10-min boundary (or /settime forces)
-      - auto-sync every 10 minutes real time
-      - daily announce when day rolls over
-    """
-    _require_env()
-    await client.wait_until_ready()
-
-    global _state, _http_session, _last_posted_boundary
-    _state = _load_state()
-    last_auto_sync = 0.0
-    last_announced_abs_day = None
-
-    async with aiohttp.ClientSession() as session:
-        _http_session = session
-
-        while True:
-            try:
-                # auto sync every 10 mins real time
-                now = time.time()
-                if now - last_auto_sync >= AUTO_SYNC_EVERY_SECONDS:
-                    last_auto_sync = now
-                    try:
-                        await _sync_once()
-                    except Exception as e:
-                        print(f"[time] auto-sync error: {e}")
-
-                details = _calculate_time()
-                if not details:
-                    await asyncio.sleep(TIME_TICK_SECONDS)
-                    continue
-
-                minute_of_day, day, year, seconds_into_minute, cur_spm = details
-
-                # daily announce
-                if ANNOUNCE_CHANNEL_ID:
-                    abs_day = year * 365 + day
-                    if last_announced_abs_day is None:
-                        last_announced_abs_day = abs_day
-                    elif abs_day > last_announced_abs_day:
-                        ch = client.get_channel(ANNOUNCE_CHANNEL_ID)
-                        if ch:
-                            try:
-                                await ch.send(f"📅 **New Solunaris Day** — Day **{day}**, Year **{year}**")
-                            except Exception:
-                                pass
-                        last_announced_abs_day = abs_day
-
-                forced = _force_update_event.is_set()
-                if forced:
-                    _force_update_event.clear()
-
-                # Only post on a boundary OR if forced
-                if forced or (minute_of_day % TIME_UPDATE_STEP_MINUTES == 0):
-                    boundary_key = (year, day, minute_of_day if (minute_of_day % TIME_UPDATE_STEP_MINUTES == 0) else -1)
-
-                    # If not forced, don't repeat same boundary
-                    if forced or (_last_posted_boundary != boundary_key):
-                        embed = _build_embed(minute_of_day, day, year)
-                        await _upsert_webhook_embed(embed)
-                        if minute_of_day % TIME_UPDATE_STEP_MINUTES == 0:
-                            _last_posted_boundary = boundary_key
-
-                await asyncio.sleep(TIME_TICK_SECONDS)
-
-            except Exception as e:
-                # Never die; log and keep going
-                print(f"[time] loop error: {e}")
-                await asyncio.sleep(5)
+        d, h, m, s = parsed
+        changed, msg = apply_sync(d, h, m)
+        await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
