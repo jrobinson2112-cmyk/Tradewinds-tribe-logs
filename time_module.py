@@ -326,3 +326,4 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, rcon_comm
             await i.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
     _log("✅ /settime and /sync registered")
+    
