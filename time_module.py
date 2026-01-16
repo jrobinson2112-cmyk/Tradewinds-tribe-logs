@@ -230,7 +230,7 @@ def _advance_time_by_real_seconds(real_elapsed: float) -> None:
     _state["year"] = year
     _state["day"] = day
     _state["minute_of_day"] = minute_of_day
-    def _extract_latest_time_from_tribelog_channels(client: discord.Client) -> Optional[Tuple[int, int, int]]:
+        def _extract_latest_time_from_tribelog_channels(client: discord.Client) -> Optional[Tuple[int, int, int]]:
     """
     Reads recent messages from all tribelog routes (threads/channels) and returns the most recent
     (year, day, minute_of_day) found. Year may fall back to current _state year if not present.
