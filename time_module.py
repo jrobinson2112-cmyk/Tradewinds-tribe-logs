@@ -46,32 +46,34 @@ _epoch_real = 0.0
 _epoch_day = 0
 _epoch_minute_of_day = 0  # 0..1439
 
-_last_posted_day = None  # for daily message feature if you add it later
-
 # rcon + webhook upsert injected by main.py
 _rcon_command: Optional[Callable[[str], Awaitable[str]]] = None
 _webhook_upsert: Optional[Callable[..., Awaitable[None]]] = None
 
+
 def _clamp_minute(m: int) -> int:
     return max(0, min(1439, m))
+
 
 def _is_daytime(minute_of_day: int) -> bool:
     # Day is [05:30, 17:30)
     return DAY_START_MINUTE <= minute_of_day < NIGHT_START_MINUTE
 
+
 def _calc_rate_seconds_per_game_minute(minute_of_day: int) -> float:
     """
     Convert SPM multipliers into "real seconds per 1 in-game minute"
     using DEFAULT_CYCLE_SECONDS *and* the three multipliers.
-    We model:
-      - The *cycle* speed scales the entire cycle duration.
-      - DayTimeSpeed affects the daytime half (12 in-game hours).
-      - NightTimeSpeed affects the night half (12 in-game hours).
+
+    Model:
+      - DayCycleSpeedScale scales the whole cycle duration.
+      - DayTimeSpeedScale affects the daytime half (720 in-game minutes).
+      - NightTimeSpeedScale affects the night half (720 in-game minutes).
     """
-    # Base cycle duration adjusted by DayCycleSpeedScale:
+    # Base cycle duration adjusted by DayCycleSpeedScale
     cycle_seconds = DEFAULT_CYCLE_SECONDS / max(0.0001, DAY_CYCLE_SPEED)
 
-    # Split cycle across 720 in-game minutes day + 720 night, then apply time speed scales.
+    # Split cycle across day/night halves then apply time speed scales.
     # Higher time speed => in-game time passes faster => fewer real seconds per in-game minute.
     day_seconds = (cycle_seconds / 2.0) / max(0.0001, DAY_TIME_SPEED)
     night_seconds = (cycle_seconds / 2.0) / max(0.0001, NIGHT_TIME_SPEED)
@@ -81,21 +83,18 @@ def _calc_rate_seconds_per_game_minute(minute_of_day: int) -> float:
     else:
         return night_seconds / 720.0
 
+
 def _advance_from_epoch(now: float) -> Tuple[int, int]:
     """
     Returns (day, minute_of_day) based on epoch and SPM-scaled progression.
+    We step minute-by-minute so the rate changes correctly at day/night boundary.
     """
-    global _epoch_real, _epoch_day, _epoch_minute_of_day
-
     day = _epoch_day
     minute = _epoch_minute_of_day
     t = _epoch_real
 
-    # Step through time in chunks, updating rate when crossing day/night boundaries.
-    # This avoids the "sun/moon wrong" problem when rates differ.
     while t < now:
         spm = _calc_rate_seconds_per_game_minute(minute)
-        # time until next minute tick
         t_next = t + spm
         if t_next > now:
             break
@@ -107,13 +106,14 @@ def _advance_from_epoch(now: float) -> Tuple[int, int]:
 
     return day, minute
 
+
 def _minute_to_hhmm(minute_of_day: int) -> str:
     hh = minute_of_day // 60
     mm = minute_of_day % 60
     return f"{hh:02d}:{mm:02d}"
 
+
 def _wrap_day_diff(a: int, b: int) -> int:
-    # minimal diff in cyclic year (optional)
     diff = a - b
     if diff > 180:
         diff -= 365
@@ -121,11 +121,12 @@ def _wrap_day_diff(a: int, b: int) -> int:
         diff += 365
     return diff
 
+
 def _apply_sync(day: int, hh: int, mm: int, ss: int) -> Tuple[bool, str]:
     """
     Shift epoch so predicted time aligns to parsed (day, hh:mm:ss).
     """
-    global _epoch_real, _epoch_day, _epoch_minute_of_day, _state_set
+    global _epoch_real, _state_set
 
     if not _state_set:
         return False, "No state set yet (use /settime first)."
@@ -146,14 +147,15 @@ def _apply_sync(day: int, hh: int, mm: int, ss: int) -> Tuple[bool, str]:
     if abs(minute_diff) < SYNC_DRIFT_MINUTES:
         return False, f"Drift {minute_diff} min (<{SYNC_DRIFT_MINUTES}m), no change."
 
-    # Shift epoch_real backwards/forwards by minute_diff minutes worth of real seconds at current rate
-    # Approximate using current spm (good enough; next loop will refine).
+    # Approximate using current spm (good enough; next loop refines)
     spm = _calc_rate_seconds_per_game_minute(cur_minute)
     shift_seconds = minute_diff * spm
 
     _epoch_real -= shift_seconds
     return True, f"Synced by {minute_diff} minutes."
-    def _build_time_embed(day: int, minute_of_day: int) -> dict:
+
+
+def _build_time_embed(day: int, minute_of_day: int) -> dict:
     icon = "☀️" if _is_daytime(minute_of_day) else "🌙"
     hhmm = _minute_to_hhmm(minute_of_day)
 
@@ -162,6 +164,7 @@ def _apply_sync(day: int, hh: int, mm: int, ss: int) -> Tuple[bool, str]:
         "description": f"**{hhmm} | Day {day}**",
         "color": 0x3498DB if icon == "🌙" else 0xF1C40F,
     }
+
 
 async def _sync_from_tribelogs() -> Tuple[bool, str]:
     """
@@ -177,13 +180,14 @@ async def _sync_from_tribelogs() -> Tuple[bool, str]:
         msg = f"{msg} (tribelog age: {age:.0f}s)"
     return ok, msg
 
+
 async def run_time_loop(
     client: discord.Client,
     rcon_command,
     webhook_upsert,
 ) -> None:
     """
-    Main loop: updates time embed and auto-syncs every TIME_AUTO_SYNC_SECONDS from tribe logs.
+    Main loop: updates time embed and auto-syncs from tribe logs every TIME_AUTO_SYNC_SECONDS.
     """
     global _rcon_command, _webhook_upsert
     _rcon_command = rcon_command
@@ -200,24 +204,19 @@ async def run_time_loop(
                 embed = _build_time_embed(day, minute)
                 await _webhook_upsert(TIME_WEBHOOK_KEY, embed)
 
-                # Auto-sync from tribe logs every 10 minutes
                 if now - last_sync >= TIME_AUTO_SYNC_SECONDS:
                     last_sync = now
                     ok, msg = await _sync_from_tribelogs()
-                    if not ok:
-                        # Don't spam Discord; just log it.
-                        print(f"[time_module] Auto-sync: {msg}")
-                    else:
+                    if ok:
                         print(f"[time_module] Auto-sync OK: {msg}")
+                    else:
+                        print(f"[time_module] Auto-sync: {msg}")
 
         except Exception as e:
             print(f"[time_module] loop error: {e}")
 
         await asyncio.sleep(TIME_UPDATE_SECONDS)
 
-# =========================
-# SLASH COMMANDS
-# =========================
 
 def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: Optional[int] = None, rcon_command=None) -> None:
     guild_obj = discord.Object(id=guild_id)
