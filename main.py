@@ -148,7 +148,8 @@ async def on_ready():
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-    await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
+    # ✅ FIX: pass client to tribelogs loop
+    await _start_task_maybe(tribelogs_module.run_tribelogs_loop, client)
 
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
 
@@ -159,7 +160,7 @@ async def on_ready():
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
 
-        # ✅ NEW: automatic gamelog embed poster
+        # ✅ automatic gamelog embed poster
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
