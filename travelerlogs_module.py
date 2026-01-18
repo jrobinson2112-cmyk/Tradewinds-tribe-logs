@@ -21,7 +21,92 @@ from discord import app_commands
 
 import time_module  # pulls current Solunaris time
 
+# --- MANUAL PANEL POSTING (admin-only) --------------------------------------
 
+def _is_admin(interaction: discord.Interaction) -> bool:
+    # "Administrator" permission is the simplest reliable check
+    return bool(getattr(interaction.user.guild_permissions, "administrator", False))
+
+
+async def post_write_panel_to_channel(channel: discord.TextChannel) -> bool:
+    """
+    Posts the "Write Log" panel into a channel if it doesn't already exist.
+    Returns True if posted, False if already present / couldn't post.
+    """
+    # Your module should already have these:
+    #   - _find_existing_panel_message(channel)
+    #   - _build_panel_embed()
+    #   - TravelerLogsPanelView()
+    try:
+        existing = await _find_existing_panel_message(channel)
+        if existing:
+            return False
+
+        await channel.send(embed=_build_panel_embed(), view=TravelerLogsPanelView())
+        return True
+    except Exception:
+        return False
+
+
+def setup_manual_panel_commands(tree: app_commands.CommandTree, guild_id: int):
+    """
+    Adds:
+      /postlogbutton        -> posts panel in the current channel
+      /postlogbutton_channel channel_id -> posts panel in a specific channel
+    """
+    guild_obj = discord.Object(id=int(guild_id))
+
+    @tree.command(name="postlogbutton", description="(Admin) Post the Write Log panel in this channel", guild=guild_obj)
+    async def postlogbutton(interaction: discord.Interaction):
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Must be used in a text channel.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await post_write_panel_to_channel(interaction.channel)
+        if ok:
+            await interaction.followup.send("✅ Panel posted.", ephemeral=True)
+        else:
+            await interaction.followup.send("ℹ️ Panel already exists here (or I couldn’t post it).", ephemeral=True)
+
+    @tree.command(name="postlogbutton_channel", description="(Admin) Post the Write Log panel to a channel ID", guild=guild_obj)
+    @app_commands.describe(channel_id="Target channel ID")
+    async def postlogbutton_channel(interaction: discord.Interaction, channel_id: str):
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            cid = int(channel_id)
+        except ValueError:
+            await interaction.followup.send("❌ Invalid channel ID.", ephemeral=True)
+            return
+
+        ch = interaction.client.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await interaction.client.fetch_channel(cid)
+            except Exception:
+                ch = None
+
+        if not isinstance(ch, discord.TextChannel):
+            await interaction.followup.send("❌ Channel not found or not a text channel.", ephemeral=True)
+            return
+
+        ok = await post_write_panel_to_channel(ch)
+        if ok:
+            await interaction.followup.send(f"✅ Panel posted in <#{cid}>.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"ℹ️ Panel already exists in <#{cid}> (or I couldn’t post it).", ephemeral=True)
+
+# ---------------------------------------------------------------------------
 # =====================
 # CONFIG
 # =====================
@@ -421,6 +506,9 @@ async def ensure_write_panels(client: discord.Client, category_id: int):
 # OPTIONAL: SLASH COMMAND FALLBACK
 # =====================
 def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int):
+    # ... your existing /writelog etc ...
+
+    setup_manual_panel_commands(tree, guild_id)  # <-- ADD THIS LINE
     """
     Optional fallback command, even if you're "button-only".
     """
