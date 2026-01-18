@@ -22,6 +22,9 @@ ADMIN_ROLE_ID = 1439069787207766076
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL") # players webhook
 
+# Traveler Logs category to lock + auto-panel
+TRAVELERLOG_CATEGORY_ID = int(os.getenv("TRAVELERLOG_CATEGORY_ID", "1434615650890023133"))
+
 # ---- Discord client / intents ----
 intents = discord.Intents.default()
 # Needed for Discord -> in-game crosschat (reading message.content)
@@ -133,14 +136,12 @@ async def _start_task_maybe(func, *args):
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # ---- Traveler Logs (IMPORTANT: persistent buttons + edit routing) ----
-    # If you don't do BOTH of these, old buttons will show "interaction failed" after redeploy.
+    # ---- Traveler Logs (IMPORTANT: persistent views so old buttons don't die) ----
     try:
-        travelerlogs_module.register_views(client)
-        travelerlogs_module.setup_interaction_router(client)
+        travelerlogs_module.register_persistent_views(client)
         print("[travelerlogs] ✅ persistent views registered")
     except Exception as e:
-        print(f"[travelerlogs] register views error: {e}")
+        print(f"[travelerlogs] register_persistent_views error: {e}")
 
     # ---- Register commands ----
     try:
@@ -155,39 +156,31 @@ async def on_ready():
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # Traveler logs command fallback (optional)
-    # Button-only still works even if you remove this.
+    # Traveler logs slash fallback (optional). Button-only works even if you remove this.
     try:
         travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
     except Exception as e:
-        print(f"[travelerlogs] command setup error: {e}")
+        print(f"[travelerlogs] setup_travelerlog_commands error: {e}")
 
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-    # Tribe logs
     await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
-
-    # Time loop
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
-
-    # Players loop
     await _start_task_maybe(players_module.run_players_loop)
-
-    # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat + GameLogs
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-    # Traveler Logs: ensure the pinned "Write Log" panel exists in every channel in the category
+    # ---- Traveler Logs: ensure pinned Write Log panel exists in category (RUN ONCE) ----
     try:
-        asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
-        print("[travelerlogs] ✅ ensure_write_panels scheduled")
+        # Run once after ready; do NOT loop this or you'll hit 429s.
+        asyncio.create_task(travelerlogs_module.ensure_controls_in_category(client, TRAVELERLOG_CATEGORY_ID))
+        print("[travelerlogs] ✅ ensure_controls_in_category scheduled")
     except Exception as e:
-        print(f"[travelerlogs] ensure_write_panels error: {e}")
+        print(f"[travelerlogs] ensure_controls_in_category error: {e}")
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
     print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
