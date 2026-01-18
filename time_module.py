@@ -315,7 +315,8 @@ def _apply_spm_tune_from_last_sync(new_sync: dict):
 
     except Exception:
         return 
-            def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None) -> tuple[bool, str]:
+            
+def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None) -> tuple[bool, str]:
     """
     Sync to the latest timed GetGameLog line using Day + HH:MM only.
     Uses real_epoch if present to anchor accurately.
