@@ -181,34 +181,27 @@ _REAL_B = re.compile(r"(\d{4})\.(\d{2})(\d{2})[_-](\d{2})\.(\d{2})\.(\d{2})")
 # YYYY.MM.DD_HH.MM.SS
 _REAL_C = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})[_-](\d{2})\.(\d{2})\.(\d{2})")
 
-def _parse_real_epoch_from_line(line: str) -> float | None:
+def parse_latest_timed_gamelog_minute(text: str) -> dict | None:
     """
-    Parse a real timestamp from the line -> epoch seconds.
-    We treat it as UTC for consistency (we mainly use deltas).
+    Extract the most recent in-game Day + HH:MM from GetGameLog output.
+    Ignores seconds on purpose.
     """
-    m = _REAL_A.search(line)
-    if m:
-        try:
-            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y.%m.%d %H.%M.%S").replace(tzinfo=timezone.utc)
-            return dt.timestamp()
-        except Exception:
-            pass
+    if not text:
+        return None
 
-    m = _REAL_B.search(line)
-    if m:
-        try:
-            y, mo, da, hh, mm, ss = map(int, m.groups())
-            return datetime(y, mo, da, hh, mm, ss, tzinfo=timezone.utc).timestamp()
-        except Exception:
-            pass
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    m = _REAL_C.search(line)
-    if m:
-        try:
-            y, mo, da, hh, mm, ss = map(int, m.groups())
-            return datetime(y, mo, da, hh, mm, ss, tzinfo=timezone.utc).timestamp()
-        except Exception:
-            pass
+    for ln in reversed(lines):
+        m = DAY_TIME_RE.search(ln)
+        if not m:
+            continue
+
+        return {
+            "day": int(m.group("day")),
+            "hour": int(m.group("hour")),
+            "minute": int(m.group("minute")),
+            "source_line": ln,
+        }
 
     return None
 
