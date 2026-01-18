@@ -1,254 +1,238 @@
+# crosschat_module.py
+# ------------------------------------------------------------
+# ASA Cross-Chat (RCON -> Discord + Discord -> RCON)
+# - Polls RCON GetChat and forwards NEW lines into 1 Discord channel
+# - Relays Discord messages from that channel back into in-game global chat (ServerChat)
+# - Includes RAW GetChat debug print (first 800 chars) so you can see exactly what ASA returns
+#
+# Expected to be started from main.py like:
+#   asyncio.create_task(crosschat_module.run_crosschat_loop(client, rcon_cmd))
+#
+# Where rcon_cmd is an async callable:
+#   await rcon_cmd("GetChat", timeout=8.0)  (or "admincheat GetChat")
+# ------------------------------------------------------------
+
 import os
-import re
 import time
 import asyncio
+import hashlib
 from collections import deque
-from typing import Optional, Callable, Awaitable
-
 import discord
 
 # =========================
-# ENV / CONFIG
+# ENV CONFIG
 # =========================
+# The 1 Discord channel used for crosschat (global)
+CROSSCHAT_CHANNEL_ID = int(os.getenv("CROSSCHAT_CHANNEL_ID", "1448575647285776444"))
 
-CROSSCHAT_ENABLED = os.getenv("CROSSCHAT_ENABLED", "1").strip() not in ("0", "false", "False", "no", "NO")
-
-# Discord channel to bridge
-CROSSCHAT_DISCORD_CHANNEL_ID = int(os.getenv("CROSSCHAT_DISCORD_CHANNEL_ID", "1448575647285776444"))
-
-# Poll interval for GetChat
+# Poll interval (seconds)
 CROSSCHAT_POLL_SECONDS = float(os.getenv("CROSSCHAT_POLL_SECONDS", "5"))
 
-# Prevent loops / spam
-CROSSCHAT_DEDUPE_MAX = int(os.getenv("CROSSCHAT_DEDUPE_MAX", "300"))
-CROSSCHAT_MAX_LINES_PER_POLL = int(os.getenv("CROSSCHAT_MAX_LINES_PER_POLL", "10"))
+# Max chat lines to remember for dedupe
+CROSSCHAT_DEDUPE_MAX = int(os.getenv("CROSSCHAT_DEDUPE_MAX", "500"))
 
-# Message formatting
-CROSSCHAT_MAP_NAME = os.getenv("CROSSCHAT_MAP_NAME", "Solunaris")
-CROSSCHAT_DISCORD_TO_INGAME_PREFIX = os.getenv("CROSSCHAT_DISCORD_TO_INGAME_PREFIX", "[Discord]")
-CROSSCHAT_INGAME_TO_DISCORD_PREFIX = os.getenv("CROSSCHAT_INGAME_TO_DISCORD_PREFIX", f"[{CROSSCHAT_MAP_NAME}]")
+# Optional: prefix when sending Discord -> game
+DISCORD_TO_GAME_PREFIX = os.getenv("DISCORD_TO_GAME_PREFIX", "[Discord]")
 
-# Ark chat has limits; keep it safe
-INGAME_MAX_LEN = int(os.getenv("CROSSCHAT_INGAME_MAX_LEN", "200"))
+# Optional: if you want to only forward lines containing something (leave blank to forward all)
+CROSSCHAT_FILTER_CONTAINS = os.getenv("CROSSCHAT_FILTER_CONTAINS", "").strip() or None
 
-# If GetChat returns a lot of history, seed dedupe on first run
-CROSSCHAT_SEED_DEDUPE = os.getenv("CROSSCHAT_SEED_DEDUPE", "1").strip() not in ("0", "false", "False", "no", "NO")
-
+# Safety: block @everyone/@here
+SAFE_ALLOWED_MENTIONS = discord.AllowedMentions.none()
 
 # =========================
-# RCON CALL WRAPPER
+# INTERNAL STATE
 # =========================
+_started = False
+_seen_hashes = deque(maxlen=CROSSCHAT_DEDUPE_MAX)
+_last_activity_ts = 0.0
 
-async def _call_rcon(rcon_command: Callable, command: str) -> str:
+# Command variants (ASA sometimes wants admincheat, sometimes not)
+_GETCHAT_CANDIDATES = ("admincheat GetChat", "GetChat")
+_SERVERCHAT_CANDIDATES = ("admincheat ServerChat", "ServerChat")
+
+
+def _h(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _normalize_line(line: str) -> str:
+    # Normalize whitespace and strip weird nulls
+    line = line.replace("\x00", "").strip()
+    # Collapse internal whitespace a bit (keeps readability)
+    line = " ".join(line.split())
+    return line
+
+
+def _extract_chat_lines(raw: str) -> list[str]:
     """
-    Your project rcon_command typically looks like:
-      - rcon_command(command)
-      - rcon_command(command, timeout=...)
-    NOT: rcon_command(host, port, password, command)
-
-    This wrapper tries the compatible call patterns.
+    Very permissive parser:
+    - Split into lines
+    - Drop empties and obvious non-chat boilerplate
+    - Return remaining lines
+    We'll refine this once we see your RAW GetChat output.
     """
-    # Try: rcon_command(command)
-    try:
-        res = rcon_command(command)
-        if asyncio.iscoroutine(res):
-            return (await res) or ""
-        return res or ""
-    except TypeError:
-        pass
-
-    # Try: rcon_command(command, timeout)
-    try:
-        res = rcon_command(command, 10)
-        if asyncio.iscoroutine(res):
-            return (await res) or ""
-        return res or ""
-    except TypeError as e:
-        raise TypeError(f"rcon_command signature not supported by crosschat_module: {e}")
-
-
-# =========================
-# PARSING
-# =========================
-
-# Common server log prefix style:
-# [2026.01.14-22.50.19:410][852]2026.01.14_22.50.19: AdminCmd: ...
-_LOG_PREFIX_RE = re.compile(r"^\[?\d{4}\.\d{2}\.\d{2}[-_]\d{2}\.\d{2}\.\d{2}[:\.\d]*\]?\s*(?:\[\d+\])?\s*\d{4}\.\d{2}\.\d{2}[_-]\d{2}\.\d{2}\.\d{2}:\s*")
-
-# Fallback: strip leading bracket groups like [....][...]
-_BRACKET_PREFIX_RE = re.compile(r"^(?:\[[^\]]+\]\s*){1,3}")
-
-def _normalize_whitespace(s: str) -> str:
-    s = s.replace("\r", " ").replace("\n", " ").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def _extract_chat_lines(getchat_raw: str) -> list[str]:
-    """
-    Attempt to extract readable chat lines from GetChat output.
-    We keep this flexible because ASA/GetChat formats vary between providers.
-    """
-    if not getchat_raw:
+    if not raw:
         return []
 
     lines = []
-    for raw_ln in getchat_raw.splitlines():
-        ln = raw_ln.strip()
+    for ln in raw.splitlines():
+        ln = _normalize_line(ln)
         if not ln:
             continue
 
-        # Remove heavy log prefixes
-        ln = _LOG_PREFIX_RE.sub("", ln)
-        ln = _BRACKET_PREFIX_RE.sub("", ln)
-        ln = _normalize_whitespace(ln)
-
-        if not ln:
-            continue
-
-        # Filter out obvious non-chat noise
         low = ln.lower()
-        if "admincmd:" in low:
+
+        # Common non-chat / noise responses
+        if "server received" in low:
             continue
-        if "[debug]" in low:
+        if "no response" in low:
             continue
-        if "joined this ark" in low or "left this ark" in low:
+        if low in ("ok", "executing", "done"):
             continue
 
-        # Typical chat may look like: "PlayerName: message"
-        # Keep only plausible chat lines containing ":"
-        if ":" in ln and len(ln) < 400:
-            lines.append(ln)
+        # Optional filter
+        if CROSSCHAT_FILTER_CONTAINS and CROSSCHAT_FILTER_CONTAINS.lower() not in low:
+            continue
+
+        lines.append(ln)
 
     return lines
 
 
-def _discord_safe(s: str) -> str:
-    # Avoid Discord mentions and formatting abuse
-    s = s.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-    return s
+async def _try_rcon(rcon_command, command: str, timeout: float = 8.0) -> str:
+    # rcon_command signatures across your project vary, so we try both common patterns
+    try:
+        return await rcon_command(command, timeout=timeout)
+    except TypeError:
+        # maybe rcon_command(command) only
+        return await rcon_command(command)
 
 
-def _ingame_safe(s: str) -> str:
-    s = _normalize_whitespace(s)
-    # Remove quotes that can break command parsing
-    s = s.replace('"', "'")
-    # Hard cap
-    if len(s) > INGAME_MAX_LEN:
-        s = s[:INGAME_MAX_LEN - 1] + "…"
-    return s
-
-
-# =========================
-# STATE (DEDUPE)
-# =========================
-
-_seen = deque(maxlen=CROSSCHAT_DEDUPE_MAX)
-_seeded = False
-_last_poll_ts = 0.0
-async def run_crosschat_loop(client: discord.Client, rcon_command: Callable):
+async def _getchat(rcon_command) -> str:
     """
-    Polls RCON 'admincheat GetChat' and forwards new messages into the Discord channel.
+    Try both command spellings.
+    Returns the first non-empty response (even if it's not chat).
     """
-    global _seeded, _last_poll_ts
-
-    if not CROSSCHAT_ENABLED:
-        print("[crosschat] disabled by CROSSCHAT_ENABLED=0")
-        return
-
-    await client.wait_until_ready()
-
-    channel = client.get_channel(CROSSCHAT_DISCORD_CHANNEL_ID)
-    if channel is None:
-        print(f"[crosschat] ERROR: Discord channel {CROSSCHAT_DISCORD_CHANNEL_ID} not found/visible to bot.")
-        return
-
-    print(f"[crosschat] ✅ running (channel_id={CROSSCHAT_DISCORD_CHANNEL_ID}, poll={CROSSCHAT_POLL_SECONDS}s)")
-
-    while not client.is_closed():
+    last = ""
+    for cmd in _GETCHAT_CANDIDATES:
         try:
-            # Avoid accidental hammering if loop gets delayed
-            now = time.time()
-            if _last_poll_ts and (now - _last_poll_ts) < (CROSSCHAT_POLL_SECONDS * 0.5):
-                await asyncio.sleep(CROSSCHAT_POLL_SECONDS)
-                continue
-            _last_poll_ts = now
+            out = await _try_rcon(rcon_command, cmd, timeout=10.0)
+            last = out or last
+            # Return immediately if we got something non-empty
+            if out and out.strip():
+                return out
+        except Exception:
+            continue
+    return last or ""
 
-            raw = await _call_rcon(rcon_command, "admincheat GetChat")
-            lines = _extract_chat_lines(raw)
 
-            if not lines:
-                await asyncio.sleep(CROSSCHAT_POLL_SECONDS)
-                continue
+async def _serverchat(rcon_command, msg: str) -> None:
+    """
+    Send to in-game global chat.
+    Tries admincheat ServerChat and ServerChat.
+    """
+    # ASA serverchat usually wants quotes kept simple
+    msg = msg.replace("\n", " ").strip()
+    if not msg:
+        return
 
-            # First run: seed dedupe so we don't spam old history
-            if not _seeded and CROSSCHAT_SEED_DEDUPE:
-                for ln in lines[-CROSSCHAT_DEDUPE_MAX:]:
-                    _seen.append(ln)
-                _seeded = True
-                await asyncio.sleep(CROSSCHAT_POLL_SECONDS)
-                continue
-            _seeded = True
+    last_err = None
+    for base in _SERVERCHAT_CANDIDATES:
+        cmd = f"{base} {msg}"
+        try:
+            await _try_rcon(rcon_command, cmd, timeout=8.0)
+            return
+        except Exception as e:
+            last_err = e
 
-            # Forward only new lines (deduped)
-            new_lines = []
-            for ln in lines:
-                if ln in _seen:
-                    continue
-                _seen.append(ln)
-                new_lines.append(ln)
+    if last_err:
+        raise last_err
 
-            if not new_lines:
-                await asyncio.sleep(CROSSCHAT_POLL_SECONDS)
-                continue
 
-            # Limit per poll to avoid discord spam bursts
-            new_lines = new_lines[-CROSSCHAT_MAX_LINES_PER_POLL:]
+def setup_crosschat_handlers(client: discord.Client, rcon_command) -> None:
+    """
+    Registers Discord -> Game relay handler (listens for messages in CROSSCHAT_CHANNEL_ID).
+    Safe to call once.
+    """
+    global _started
+    if _started:
+        return
+    _started = True
 
-            for ln in new_lines:
-                msg = f"{CROSSCHAT_INGAME_TO_DISCORD_PREFIX} {_discord_safe(ln)}"
-                await channel.send(msg)
+    async def _on_message(message: discord.Message):
+        try:
+            # Ignore bots/webhooks
+            if message.author.bot:
+                return
+            if message.webhook_id is not None:
+                return
+
+            # Only our crosschat channel
+            if message.channel.id != CROSSCHAT_CHANNEL_ID:
+                return
+
+            content = (message.content or "").strip()
+            if not content:
+                return
+
+            # Prevent pings in-game
+            content = content.replace("@everyone", "everyone").replace("@here", "here")
+
+            author = message.author.display_name
+            payload = f"{DISCORD_TO_GAME_PREFIX} {author}: {content}"
+
+            await _serverchat(rcon_command, payload)
 
         except Exception as e:
-            print(f"[crosschat] GetChat error for {CROSSCHAT_MAP_NAME}: {e}")
+            print(f"[crosschat] Discord->Game send error: {e}")
+
+    client.add_listener(_on_message, "on_message")
+
+
+async def run_crosschat_loop(client: discord.Client, rcon_command):
+    """
+    Polls GetChat and forwards NEW messages to Discord.
+    """
+    global _last_activity_ts
+
+    # Register handlers once
+    setup_crosschat_handlers(client, rcon_command)
+
+    await client.wait_until_ready()
+    ch = client.get_channel(CROSSCHAT_CHANNEL_ID)
+
+    if ch is None:
+        print(f"[crosschat] ❌ Could not find Discord channel id={CROSSCHAT_CHANNEL_ID}")
+        return
+
+    print(f"[crosschat] ✅ running (channel_id={CROSSCHAT_CHANNEL_ID}, poll={CROSSCHAT_POLL_SECONDS}s)")
+
+    while True:
+        try:
+            raw = await _getchat(rcon_command)
+
+            # ✅ RAW debug (first 800 chars)
+            print("[crosschat] RAW GetChat (first 800 chars):", (raw or "")[:800].replace("\n", "\\n"))
+
+            lines = _extract_chat_lines(raw)
+
+            # Forward only NEW lines (dedupe by hash)
+            to_send = []
+            for ln in lines:
+                h = _h(ln)
+                if h in _seen_hashes:
+                    continue
+                _seen_hashes.append(h)
+                to_send.append(ln)
+
+            if to_send:
+                # Send in order they appear (oldest -> newest)
+                for ln in to_send[-20:]:  # safety cap per poll
+                    await ch.send(ln, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+                    _last_activity_ts = time.time()
+
+        except Exception as e:
+            print(f"[crosschat] GetChat/forward error: {e}")
 
         await asyncio.sleep(CROSSCHAT_POLL_SECONDS)
-
-
-async def on_discord_message(message: discord.Message, rcon_command: Callable):
-    """
-    Relays messages from the Discord channel into the game using:
-      admincheat ServerChat <message>
-    Global chat only, per your request.
-    """
-    if not CROSSCHAT_ENABLED:
-        return
-
-    # Only bridge the configured channel
-    if message.channel.id != CROSSCHAT_DISCORD_CHANNEL_ID:
-        return
-
-    # Ignore bots/webhooks to avoid loops
-    if message.author.bot:
-        return
-
-    # Ignore commands
-    if message.content.startswith("/"):
-        return
-
-    content = message.content.strip()
-    if not content:
-        return
-
-    # Remove newlines + cap
-    safe = _ingame_safe(content)
-
-    # Add author tag
-    author = message.author.display_name
-    author = _ingame_safe(author)
-
-    payload = f"{CROSSCHAT_DISCORD_TO_INGAME_PREFIX} {author}: {safe}"
-
-    try:
-        await _call_rcon(rcon_command, f"admincheat ServerChat {payload}")
-    except Exception as e:
-        print(f"[crosschat] Discord->Game error: {e}")
