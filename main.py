@@ -1,5 +1,3 @@
-# main.py (FULL - updated for Traveler Logs button-only + lock + edit button handling)
-
 import os
 import asyncio
 import discord
@@ -12,7 +10,7 @@ import players_module
 import vcstatus_module
 import crosschat_module
 import gamelogs_autopost_module
-import travelerlogs_module  # ✅ Traveler Logs (button-only)
+import travelerlogs_module  # ✅ Traveler Logs (button + edit + lock)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -20,12 +18,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-# Traveler Logs category lock (ONLY allow bot posts; normal user text deleted)
-TRAVELERLOGS_CATEGORY_ID = 1434615650890023133
-
 # Webhooks (time + players) used by your webhook-upsert system
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL") # players webhook
+
+# Traveler logs lock category (set this in Railway env)
+# 1434615650890023133 (your provided category)
+TRAVELERLOGS_LOCK_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_LOCK_CATEGORY_ID", "1434615650890023133"))
 
 # ---- Discord client / intents ----
 intents = discord.Intents.default()
@@ -151,36 +150,32 @@ async def on_ready():
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # OPTIONAL: keep /writelog as a fallback command (button-only works without it)
+    # Traveler logs command (kept for admins/testing, but you’re using button-only UX)
     travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
 
+    # Sync slash commands
     await tree.sync(guild=guild_obj)
 
-    # ---- Traveler Logs: persistent views + ensure button in category ----
-    travelerlogs_module.register_persistent_views(client)
+    # ✅ IMPORTANT: register persistent views so buttons work after redeploys
     try:
-        await travelerlogs_module.ensure_controls_in_category(client, TRAVELERLOGS_CATEGORY_ID)
+        travelerlogs_module.register_persistent_views(client)
     except Exception as e:
-        print(f"[travelerlogs] ensure_controls_in_category error: {e}")
+        print(f"[travelerlogs] register_persistent_views error: {e}")
+
+    # ✅ Ensure the “Write Log” control message exists (and stays at the bottom) in each channel
+    if TRAVELERLOGS_LOCK_CATEGORY_ID:
+        asyncio.create_task(
+            travelerlogs_module.ensure_controls_in_category(client, TRAVELERLOGS_LOCK_CATEGORY_ID)
+        )
 
     # ---- Start loops ----
-    # Tribe logs
     await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
-
-    # Time loop
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
-
-    # Players loop
     await _start_task_maybe(players_module.run_players_loop)
-
-    # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat + GameLogs
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
-
-        # Game logs automatic poster
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
@@ -188,23 +183,12 @@ async def on_ready():
 
 
 @client.event
-async def on_interaction(interaction: discord.Interaction):
-    """
-    Handles Traveler Logs buttons (Write Log + Edit Log).
-    """
-    try:
-        await travelerlogs_module.handle_interaction(interaction)
-    except Exception as e:
-        print(f"[travelerlogs] on_interaction error: {e}")
-
-
-@client.event
 async def on_message(message: discord.Message):
     """
-    - Enforces traveler log lock (deletes normal messages in the traveler logs category).
-    - Relays Discord -> in-game chat (crosschat) if enabled.
+    - Enforces traveler log lock so only embeds/buttons are allowed in the traveler log category
+    - Relays Discord -> in-game chat (crosschat) if enabled
     """
-    # ✅ Traveler logs lock enforcement (deletes normal messages in locked category)
+    # Traveler logs lock enforcement (deletes normal messages in locked category)
     try:
         await travelerlogs_module.enforce_travelerlog_lock(message)
     except Exception as e:
@@ -216,10 +200,21 @@ async def on_message(message: discord.Message):
         try:
             await crosschat_module.on_discord_message(message, rcon_cmd)
         except TypeError:
-            # if module signature is on_discord_message(message) only
             await crosschat_module.on_discord_message(message)
         except Exception as e:
             print(f"[crosschat] on_message error: {e}")
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    """
+    Handles Traveler Logs button clicks + modals (Write Log / Edit Log).
+    Without this, buttons will show 'This interaction failed'.
+    """
+    try:
+        await travelerlogs_module.handle_interaction(interaction)
+    except Exception as e:
+        print(f"[travelerlogs] interaction error: {e}")
 
 
 client.run(DISCORD_TOKEN)
