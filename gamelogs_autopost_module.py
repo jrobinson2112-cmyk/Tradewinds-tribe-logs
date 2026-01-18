@@ -17,7 +17,7 @@ GAMELOGS_EMBED_UPDATE_SECONDS = float(os.getenv("GAMELOGS_EMBED_UPDATE_SECONDS",
 # Dedupe sizing
 GAMELOGS_DEDUPE_MAX = int(os.getenv("GAMELOGS_DEDUPE_MAX", "20000"))
 
-# How many minutes of lines to keep in memory (we only need a small window)
+# How many minutes of lines to keep in memory
 GAMELOGS_RETENTION_MINUTES = int(os.getenv("GAMELOGS_RETENTION_MINUTES", "10"))
 
 # Embed look
@@ -26,7 +26,6 @@ GAMELOGS_EMBED_COLOR = int(os.getenv("GAMELOGS_EMBED_COLOR", "0x2F3136"), 16)
 
 # Discord embed description hard limit is 4096 chars. Leave headroom.
 _EMBED_DESC_LIMIT = 3900
-
 
 # =====================
 # INTERNAL STATE
@@ -55,7 +54,7 @@ def _remember_hash(h: str):
 
 
 def _clean_line(line: str) -> str:
-    # keep special chars; remove extra whitespace
+    # Keep special chars; normalize whitespace
     return " ".join(line.strip().split())
 
 
@@ -90,14 +89,13 @@ def _lines_since(seconds: float) -> List[str]:
     return [ln for (ts, ln) in list(_buffer) if ts >= cutoff]
 
 
-def _build_embed(lines: List[str]) -> dict:
+def _build_embed(lines: List[str]) -> discord.Embed:
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
     if not lines:
         desc = "*No new logs in the last minute.*"
     else:
-        # newest at bottom feels more natural; we already store in arrival time order.
-        # Fit into embed limit.
+        # Fit into embed limit, keep chronological order
         out = []
         total = 0
         for ln in lines:
@@ -106,19 +104,18 @@ def _build_embed(lines: List[str]) -> dict:
                 continue
             add_len = len(ln) + 1
             if total + add_len > _EMBED_DESC_LIMIT:
-                # If too long, stop adding (we keep earliest lines that fit from this window)
-                # If you prefer newest-only, we can reverse-pack, but this is stable.
                 break
             out.append(ln)
             total += add_len
         desc = "\n".join(out) if out else "*Logs too long to display (window exceeds embed limit).*"
 
-    return {
-        "title": GAMELOGS_EMBED_TITLE,
-        "description": desc,
-        "color": GAMELOGS_EMBED_COLOR,
-        "footer": {"text": f"Last update: {now_str} | poll={GAMELOGS_POLL_SECONDS}s"},
-    }
+    embed = discord.Embed(
+        title=GAMELOGS_EMBED_TITLE,
+        description=desc,
+        color=GAMELOGS_EMBED_COLOR,
+    )
+    embed.set_footer(text=f"Last update: {now_str} | poll={GAMELOGS_POLL_SECONDS}s")
+    return embed
 
 
 async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
@@ -155,8 +152,8 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
             txt = await rcon_command("GetGameLog", timeout=15.0)
             if txt:
                 now = time.time()
-                # scan bottom->top to detect newest quickly, but we store in chronological order
                 raw_lines = [ln for ln in txt.splitlines() if ln.strip()]
+
                 new_lines = []
                 for ln in reversed(raw_lines):
                     ln = _clean_line(ln)
@@ -168,25 +165,22 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
                     _remember_hash(h)
                     new_lines.append(ln)
 
-                # append in correct order (oldest first)
+                # append in chronological order (oldest first)
                 for ln in reversed(new_lines):
                     _buffer.append((now, ln))
 
             # ---- embed update every N seconds ----
             if (time.time() - last_embed_update) >= GAMELOGS_EMBED_UPDATE_SECONDS:
                 lines = _lines_since(GAMELOGS_EMBED_UPDATE_SECONDS)
-                embed = _build_embed(lines)
+                embed_obj = _build_embed(lines)
 
                 if embed_message is None:
-                    # create once
-                    embed_message = await ch.send(embeds=[embed])
+                    embed_message = await ch.send(embed=embed_obj)
                 else:
-                    # edit existing to avoid spam
                     try:
-                        await embed_message.edit(embeds=[embed])
+                        await embed_message.edit(embed=embed_obj)
                     except discord.NotFound:
-                        # message deleted; recreate
-                        embed_message = await ch.send(embeds=[embed])
+                        embed_message = await ch.send(embed=embed_obj)
 
                 last_embed_update = time.time()
 
