@@ -1,49 +1,42 @@
-# time_module.py
-# Accurate-ish ASA clock with:
-#  - /settime Year Day Hour Minute (admin role)
-#  - /sync (admin role): syncs to MOST RECENT GetGameLog line that contains "Day X, HH:MM:SS"
-#  - Auto-sync in the loop: whenever a NEW timed GetGameLog line appears
-#
-# Uses the REAL timestamp at the start of each GetGameLog line (YYYY.MM.DD_HH.MM.SS) to
-# compensate for log delay and improve accuracy.
-#
-# IMPORTANT:
-# - Ignores in-game seconds for display, but uses them internally when parsing.
-# - No longer uses old tribe-log parsing. Only "Day X, HH:MM:SS" lines are used for sync.
-
 import os
 import time
 import json
 import asyncio
 import re
+from datetime import datetime, timezone
+from typing import Optional, Tuple
+
 import aiohttp
 import discord
 from discord import app_commands
-from typing import Optional, Tuple, Dict, Any
 
 # =====================
 # ENV / CONFIG
 # =====================
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # required for time webhook
 
-# Day/night boundaries (ASA defaults)
+# Your ASA day-night boundaries (default ASA)
 SUNRISE_MINUTE = int(os.getenv("SUNRISE_MINUTE", str(5 * 60 + 30)))  # 05:30
-SUNSET_MINUTE = int(os.getenv("SUNSET_MINUTE", str(17 * 60 + 30)))   # 17:30
+SUNSET_MINUTE  = int(os.getenv("SUNSET_MINUTE",  str(17 * 60 + 30))) # 17:30
 
 # REAL SECONDS PER IN-GAME MINUTE
-DAY_SPM = float(os.getenv("DAY_SPM", "4.7666667"))
+DAY_SPM   = float(os.getenv("DAY_SPM", "4.7666667"))
 NIGHT_SPM = float(os.getenv("NIGHT_SPM", "4.045"))
 
 # Behaviour
-TIME_UPDATE_STEP_MINUTES = int(os.getenv("TIME_UPDATE_STEP_MINUTES", "10"))  # update webhook on round step (10 = :00/:10/:20...)
-AUTO_SYNC_EVERY_SECONDS = int(os.getenv("AUTO_SYNC_EVERY_SECONDS", "60"))    # check GetGameLog for timed line
-SYNC_DRIFT_MINUTES = int(os.getenv("SYNC_DRIFT_MINUTES", "2"))               # only sync if >= drift minutes
-SYNC_MAX_LOOKBACK_LINES = int(os.getenv("SYNC_MAX_LOOKBACK_LINES", "2500"))  # how many tail lines to scan
+TIME_UPDATE_STEP_MINUTES = int(os.getenv("TIME_UPDATE_STEP_MINUTES", "10"))  # update webhook on round step
+SYNC_DRIFT_MINUTES       = int(os.getenv("SYNC_DRIFT_MINUTES", "2"))         # only correct if >= 2 minutes drift
+
+# Auto-sync from DISCORD gamelog embeds
+GAMELOGS_CHANNEL_ID      = int(os.getenv("GAMELOGS_CHANNEL_ID", "1462433999766028427"))
+AUTO_SYNC_FROM_DISCORD   = os.getenv("AUTO_SYNC_FROM_DISCORD", "1").lower() in ("1", "true", "yes", "on")
+AUTO_SYNC_POLL_SECONDS   = float(os.getenv("AUTO_SYNC_POLL_SECONDS", "15"))  # how often to scan channel
+AUTO_SYNC_SCAN_LIMIT     = int(os.getenv("AUTO_SYNC_SCAN_LIMIT", "50"))      # how many messages to scan back
 
 # Daily announce
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "1430388267446042666"))
 
-# State file
+# State file (Railway volume path)
 STATE_FILE = os.getenv("TIME_STATE_FILE", "/data/time_state.json")
 
 # Webhook embed colours
@@ -53,13 +46,14 @@ NIGHT_COLOR = 0x5865F2
 # =====================
 # INTERNAL STATE
 # =====================
-_state: Optional[Dict[str, Any]] = None
-_last_announced_abs_day: Optional[int] = None
+_state = None
+_last_announced_abs_day = None
 
-_rcon_command = None
+# used by /sync command + loop
+_rcon_command = None  # unused now, but kept for signature compatibility
 _webhook_upsert = None
 
-_last_synced_marker: Optional[str] = None  # prevents re-syncing the same timed line
+_last_discord_sync_marker: Optional[str] = None  # prevents resyncing same embed repeatedly
 
 # =====================
 # STATE FILE HELPERS
@@ -97,7 +91,7 @@ def _is_daytime(minute_of_day: int) -> bool:
 def _spm_for_minute(minute_of_day: int) -> float:
     return DAY_SPM if _is_daytime(minute_of_day) else NIGHT_SPM
 
-def _advance_one_minute(minute_of_day: int, day: int, year: int) -> Tuple[int, int, int]:
+def _advance_one_minute(minute_of_day: int, day: int, year: int):
     minute_of_day += 1
     if minute_of_day >= 1440:
         minute_of_day = 0
@@ -107,7 +101,7 @@ def _advance_one_minute(minute_of_day: int, day: int, year: int) -> Tuple[int, i
             year += 1
     return minute_of_day, day, year
 
-def _calc_now() -> Optional[Tuple[int, int, int, float]]:
+def _calc_now():
     """
     Returns: (minute_of_day, day, year, seconds_into_current_ingame_minute)
     based on anchor state.
@@ -129,19 +123,16 @@ def _calc_now() -> Optional[Tuple[int, int, int, float]]:
             continue
         return minute_of_day, day, year, remaining
 
-def _build_time_embed(minute_of_day: int, day: int, year: int) -> dict:
+def _build_time_embed(minute_of_day: int, day: int, year: int):
     hour = minute_of_day // 60
     minute = minute_of_day % 60
-    is_day = _is_daytime(minute_of_day)
-    icon = "☀️" if is_day else "🌙"
-    color = DAY_COLOR if is_day else NIGHT_COLOR
-    title = f"{icon} | Solunaris Time — Year {year} | Day {day} | {hour:02d}:{minute:02d}"
+    icon = "☀️" if _is_daytime(minute_of_day) else "🌙"
+    color = DAY_COLOR if _is_daytime(minute_of_day) else NIGHT_COLOR
+
+    title = f"{icon} | Solunaris Time | Year {year} | Day {day} | {hour:02d}:{minute:02d}"
     return {"title": title, "color": color}
 
 def _seconds_until_next_round_step(minute_of_day: int, seconds_into_minute: float, step: int) -> float:
-    """
-    Sleep until the next ingame minute boundary that is divisible by 'step'.
-    """
     mod = minute_of_day % step
     minutes_to_boundary = (step - mod) if mod != 0 else step
 
@@ -167,131 +158,103 @@ def _wrap_day_diff(d: int) -> int:
         d += 365
     return d
 
-def _infer_year_from_day(cur_year: int, cur_day: int, parsed_day: int) -> int:
-    """
-    Heuristic: if day jumps across year boundary, adjust year.
-    """
-    diff = parsed_day - cur_day
-    if diff > 180:
-        return max(1, cur_year - 1)
-    if diff < -180:
-        return cur_year + 1
-    return cur_year
-
-def _advance_by_real_seconds(
-    start_minute_of_day: int,
-    start_day: int,
-    start_year: int,
-    seconds: float
-) -> Tuple[int, int, int, float]:
-    """
-    Advances in-game time forward by 'seconds' real seconds using the per-minute SPM model.
-    Returns (minute_of_day, day, year, seconds_into_current_minute).
-    """
-    m = int(start_minute_of_day)
-    d = int(start_day)
-    y = int(start_year)
-
-    remaining = float(max(0.0, seconds))
-    while True:
-        spm = _spm_for_minute(m)
-        if remaining >= spm:
-            remaining -= spm
-            m, d, y = _advance_one_minute(m, d, y)
-            continue
-        # remaining = seconds into current minute
-        return m, d, y, remaining
-
-def _shift_epoch_by_ingame_minutes(cur_minute_of_day: int, minute_diff: int) -> float:
-    """
-    Convert ingame minute difference -> real seconds using the per-minute SPM model.
-    """
-    if minute_diff == 0:
-        return 0.0
-
-    seconds = 0.0
-    m = cur_minute_of_day
-
-    if minute_diff > 0:
-        for _ in range(minute_diff):
-            seconds += _spm_for_minute(m)
-            m, _, _ = _advance_one_minute(m, 1, 1)
-        return seconds
-    else:
-        for _ in range(abs(minute_diff)):
-            prev = (m - 1) % 1440
-            seconds += _spm_for_minute(prev)
-            m = prev
-        return -seconds
-
 # =====================
-# PARSING: TIMED GAMELOG LINES
-# Example:
-#   2026.01.18_17.03.38: Tribe The Silent Coven, ID ...: Day 327, 15:45:59: Dravenya froze...
+# DISCORD EMBED PARSING
 # =====================
-_REAL_TS_RE = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})_(\d{2})\.(\d{2})\.(\d{2})")
-_INGAME_TS_RE = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})")
+# Matches: "Day 327, 15:45:59:" anywhere in embed description
+_INGAME_TIMED = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})")
+
+# Matches: "2026.01.18_17.03.38" anywhere in line (real timestamp inside logs)
+_REAL_TS = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})_(\d{2})\.(\d{2})\.(\d{2})")
 
 def _parse_real_epoch_from_line(line: str) -> Optional[float]:
-    m = _REAL_TS_RE.search(line or "")
+    m = _REAL_TS.search(line or "")
     if not m:
         return None
     try:
-        yy, mo, dd, hh, mm, ss = map(int, m.groups())
-        # interpret as local time (same basis as time.time() local), matching your display usage
-        return time.mktime((yy, mo, dd, hh, mm, ss, 0, 0, -1))
+        y, mo, d, hh, mm, ss = map(int, m.groups())
+        # Treat as UTC first. We'll sanity-check before using.
+        dt = datetime(y, mo, d, hh, mm, ss, tzinfo=timezone.utc)
+        return dt.timestamp()
     except Exception:
         return None
 
-def _parse_timed_gamelog_line(line: str) -> Optional[Dict[str, Any]]:
+def _parse_timed_ingame_from_text(text: str) -> Optional[Tuple[int, int, int]]:
     """
-    Returns dict with: day, hour, minute, second, real_epoch, marker, line
+    Returns (day, hour, minute) from the first/last timed line found.
+    Ignores seconds on purpose.
     """
-    if not line:
+    if not text:
         return None
-    m = _INGAME_TS_RE.search(line)
-    if not m:
-        return None
-    try:
+    # We want the MOST RECENT line, so scan from bottom.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        m = _INGAME_TIMED.search(ln)
+        if not m:
+            continue
         day = int(m.group(1))
         hour = int(m.group(2))
         minute = int(m.group(3))
-        second = int(m.group(4))
-    except Exception:
-        return None
+        return day, hour, minute
+    return None
 
-    real_epoch = _parse_real_epoch_from_line(line)
-    marker = f"{real_epoch or 'noReal'}|{day}|{hour:02d}:{minute:02d}:{second:02d}|{hash(line)}"
-    return {
-        "day": day,
-        "hour": hour,
-        "minute": minute,
-        "second": second,
-        "real_epoch": real_epoch,
-        "marker": marker,
-        "line": line,
-    }
+async def _fetch_latest_timed_from_gamelogs_channel(client: discord.Client):
+    """
+    Scans recent messages in GAMELOGS_CHANNEL_ID and returns:
+      (marker, parsed_day, parsed_hour, parsed_minute, best_epoch)
+    marker prevents repeated re-sync on same message.
+    """
+    ch = client.get_channel(GAMELOGS_CHANNEL_ID)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(GAMELOGS_CHANNEL_ID)
+        except Exception:
+            return None
 
-def find_latest_timed_entry_from_getgamelog(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    # scan from newest backwards (tail only for speed)
-    tail = lines[-SYNC_MAX_LOOKBACK_LINES:] if len(lines) > SYNC_MAX_LOOKBACK_LINES else lines
-    for ln in reversed(tail):
-        parsed = _parse_timed_gamelog_line(ln)
-        if parsed:
-            return parsed
+    # Scan recent messages newest -> oldest
+    async for msg in ch.history(limit=AUTO_SYNC_SCAN_LIMIT):
+        # Check embeds first
+        if msg.embeds:
+            for emb in msg.embeds:
+                desc = getattr(emb, "description", None) or ""
+                parsed = _parse_timed_ingame_from_text(desc)
+                if not parsed:
+                    continue
+
+                day, hour, minute = parsed
+
+                # Try to find a real timestamp in ANY line inside desc
+                best_epoch = None
+                for ln in desc.splitlines():
+                    ep = _parse_real_epoch_from_line(ln)
+                    if ep is not None:
+                        best_epoch = ep
+                        break
+
+                # If the parsed epoch seems wildly off (timezone mismatch), ignore it
+                now_utc = datetime.now(timezone.utc).timestamp()
+                if best_epoch is not None and abs(now_utc - best_epoch) > (6 * 3600):
+                    best_epoch = None
+
+                # Fallback: use the Discord message timestamp (safe)
+                if best_epoch is None:
+                    try:
+                        best_epoch = msg.created_at.replace(tzinfo=timezone.utc).timestamp()
+                    except Exception:
+                        best_epoch = time.time()
+
+                marker = f"{msg.id}:{day}:{hour:02d}{minute:02d}"
+                return marker, day, hour, minute, float(best_epoch)
+
     return None
 
 # =====================
-# SYNC APPLY
+# SYNC APPLY (from Discord embeds)
 # =====================
-def apply_sync_from_timed_log(parsed: Dict[str, Any]) -> Tuple[bool, str]:
+def apply_sync_from_discord_timed_log(parsed_day: int, parsed_hour: int, parsed_minute: int, anchor_epoch: float) -> tuple[bool, str]:
     """
-    Syncs state using the timed log entry.
-    - Ignores in-game seconds for display (/state anchor uses HH:MM)
-    - Uses real_epoch to advance in-game time forward by the log delay for better accuracy
+    Sets the clock anchor to the parsed Day/HH:MM at a known real epoch (from log/Discord message).
+    Ignores seconds by design.
     """
     global _state
 
@@ -303,38 +266,12 @@ def apply_sync_from_timed_log(parsed: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "Could not calculate current time (state missing)."
 
     cur_minute_of_day, cur_day, cur_year, _sec_into = now_calc
+    target_minute_of_day = _minute_of_day(parsed_hour, parsed_minute)
 
-    parsed_day = int(parsed["day"])
-    parsed_hour = int(parsed["hour"])
-    parsed_minute = int(parsed["minute"])
-
-    inferred_year = _infer_year_from_day(cur_year, cur_day, parsed_day)
-
-    # Start from the in-game time *at the moment of the log line* (seconds included internally)
-    start_m = _minute_of_day(parsed_hour, parsed_minute)
-    start_d = parsed_day
-    start_y = inferred_year
-
-    # If we have real timestamp on the log line, compensate for delay
-    real_epoch = parsed.get("real_epoch")
-    if real_epoch is not None:
-        delay = time.time() - float(real_epoch)
-        # clamp silly delays (server timezone mismatch etc.)
-        if delay < 0:
-            delay = 0.0
-        if delay > 3600 * 6:
-            # if delay is huge, don't "advance" for hours; just anchor to the line itself
-            delay = 0.0
-        adv_m, adv_d, adv_y, adv_sec_into = _advance_by_real_seconds(start_m, start_d, start_y, delay)
-    else:
-        adv_m, adv_d, adv_y, adv_sec_into = start_m, start_d, start_y, 0.0
-
-    # Compute drift vs current model (minutes)
-    target_minute_of_day = adv_m
-    day_diff = _wrap_day_diff(adv_d - cur_day)
+    day_diff = _wrap_day_diff(parsed_day - cur_day)
     minute_diff = (day_diff * 1440) + (target_minute_of_day - cur_minute_of_day)
 
-    # clamp huge drift within +/- 12h
+    # clamp huge drift
     if minute_diff > 720:
         minute_diff -= 1440
     elif minute_diff < -720:
@@ -343,16 +280,21 @@ def apply_sync_from_timed_log(parsed: Dict[str, Any]) -> Tuple[bool, str]:
     if abs(minute_diff) < SYNC_DRIFT_MINUTES:
         return False, f"Drift {minute_diff} min < threshold ({SYNC_DRIFT_MINUTES})."
 
-    # Re-anchor state precisely: set epoch so that _calc_now() == adv_m/adv_d/adv_y at current time
-    now = time.time()
-    _state["epoch"] = float(now) - float(adv_sec_into)
-    _state["year"] = int(adv_y)
-    _state["day"] = int(adv_d)
-    _state["hour"] = int(target_minute_of_day // 60)
-    _state["minute"] = int(target_minute_of_day % 60)
+    # Infer year rollover if needed (rare, but safe)
+    year = int(cur_year)
+    if day_diff < -180:
+        year += 1
+    elif day_diff > 180:
+        year = max(1, year - 1)
+
+    _state["epoch"] = float(anchor_epoch)
+    _state["year"] = int(year)
+    _state["day"] = int(parsed_day)
+    _state["hour"] = int(parsed_hour)
+    _state["minute"] = int(parsed_minute)
 
     save_state()
-    return True, f"Synced to timed GetGameLog line (drift {minute_diff} min)."
+    return True, f"Synced from Discord gamelog embed (drift {minute_diff} min)."
 
 # =====================
 # COMMANDS
@@ -361,10 +303,10 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
     """
     Registers:
       /settime Year Day Hour Minute
-      /sync  (sync to most recent timed GetGameLog line)
+      /sync  (sync from latest timed gamelog embed in GAMELOGS_CHANNEL_ID)
     """
     global _rcon_command, _webhook_upsert
-    _rcon_command = rcon_command
+    _rcon_command = rcon_command  # unused now
     _webhook_upsert = webhook_upsert
 
     guild_obj = discord.Object(id=int(guild_id))
@@ -398,51 +340,43 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
             await i.followup.send("❌ No permission", ephemeral=True)
             return
 
-        if _rcon_command is None:
-            await i.followup.send("❌ RCON not available to time module.", ephemeral=True)
-            return
-
         if not _state:
             await i.followup.send("❌ Time not set yet. Use /settime first.", ephemeral=True)
             return
 
-        try:
-            text = await _rcon_command("GetGameLog", timeout=12.0)
-            parsed = find_latest_timed_entry_from_getgamelog(text)
-            if not parsed:
-                await i.followup.send("❌ No timed line found in GetGameLog (no 'Day X, HH:MM:SS' in recent output).", ephemeral=True)
-                return
+        found = await _fetch_latest_timed_from_gamelogs_channel(i.client)
+        if not found:
+            await i.followup.send("❌ No timed line found in recent gamelog embeds.", ephemeral=True)
+            return
 
-            changed, msg = apply_sync_from_timed_log(parsed)
+        marker, d, h, m, ep = found
+        changed, msg = apply_sync_from_discord_timed_log(d, h, m, ep)
 
-            # push webhook right away after manual sync
-            if _webhook_upsert is not None:
-                now_calc = _calc_now()
-                if now_calc:
-                    mo, dd, yy, _ = now_calc
-                    await _webhook_upsert("time", _build_time_embed(mo, dd, yy))
+        # push webhook right away after manual sync
+        if _webhook_upsert is not None:
+            now_calc = _calc_now()
+            if now_calc:
+                mo, dd, yy, _ = now_calc
+                await _webhook_upsert("time", _build_time_embed(mo, dd, yy))
 
-            await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
+        await i.followup.send(("✅ " if changed else "ℹ️ ") + msg, ephemeral=True)
 
-        except Exception as e:
-            await i.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
-
-    print("[time_module] ✅ /settime and /sync registered (minute-precise GetGameLog sync)")
+    print("[time_module] ✅ /settime and /sync registered (Discord gamelog embed sync)")
 
 # =====================
 # LOOP
 # =====================
 async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
     """
-    - Updates the time webhook only on round step minutes
+    - Updates the time webhook on round step minutes
     - Announces new day in ANNOUNCE_CHANNEL_ID
-    - Auto-syncs using the MOST RECENT timed GetGameLog line whenever it changes
+    - Auto-syncs by scanning the GAMELOGS_CHANNEL_ID for a timed line:
+        "Day X, HH:MM:SS"
+      and anchoring clock to that time (ignores seconds).
     """
-    global _state, _last_announced_abs_day, _last_synced_marker
+    global _state, _last_announced_abs_day, _last_discord_sync_marker
 
     _state = load_state()
-
-    last_sync_check_ts = 0.0
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -454,37 +388,26 @@ async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
 
                 minute_of_day, day, year, seconds_into_minute = now_calc
 
-                # --- Auto sync: check for newest timed gamelog line ---
-                if rcon_command is not None and (time.time() - last_sync_check_ts) >= AUTO_SYNC_EVERY_SECONDS:
-                    last_sync_check_ts = time.time()
+                # --- Auto sync from Discord gamelog embeds ---
+                if AUTO_SYNC_FROM_DISCORD:
                     try:
-                        text = await rcon_command("GetGameLog", timeout=12.0)
-                        parsed = find_latest_timed_entry_from_getgamelog(text)
-                        if parsed:
-                            marker = parsed.get("marker")
-                            if marker and marker != _last_synced_marker:
-                                changed, msg = apply_sync_from_timed_log(parsed)
-                                _last_synced_marker = marker
+                        found = await _fetch_latest_timed_from_gamelogs_channel(client)
+                        if found:
+                            marker, d, h, m, ep = found
+                            if marker != _last_discord_sync_marker:
+                                changed, msg = apply_sync_from_discord_timed_log(d, h, m, ep)
+                                _last_discord_sync_marker = marker
                                 if changed:
                                     print(f"[time_module] Auto-sync: {msg}")
-                                    # recalc and push webhook immediately after a real sync
-                                    now_calc2 = _calc_now()
-                                    if now_calc2:
-                                        mo, dd, yy, _ = now_calc2
-                                        embed2 = _build_time_embed(mo, dd, yy)
-                                        await webhook_upsert(session, WEBHOOK_URL, "time", embed2)
-                        else:
-                            # keep this quiet-ish; only print occasionally if you want
-                            print("[time_module] Auto-sync: No timed line found in GetGameLog.")
+                                    # recalc after sync
+                                    now_calc = _calc_now()
+                                    if now_calc:
+                                        minute_of_day, day, year, seconds_into_minute = now_calc
+                        # If not found: stay silent (no spam)
                     except Exception as e:
                         print(f"[time_module] Auto-sync error: {e}")
 
-                    # refresh local calc after potential sync
-                    now_calc = _calc_now()
-                    if now_calc:
-                        minute_of_day, day, year, seconds_into_minute = now_calc
-
-                # --- Update webhook on round step ---
+                # --- Update time webhook on round step ---
                 if (minute_of_day % TIME_UPDATE_STEP_MINUTES) == 0:
                     embed = _build_time_embed(minute_of_day, day, year)
                     await webhook_upsert(session, WEBHOOK_URL, "time", embed)
@@ -502,9 +425,13 @@ async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
                                 pass
                         _last_announced_abs_day = abs_day
 
+                # Sleep until next update boundary (or poll interval, whichever is sooner)
                 sleep_for = _seconds_until_next_round_step(
                     minute_of_day, seconds_into_minute, TIME_UPDATE_STEP_MINUTES
                 )
+                if AUTO_SYNC_FROM_DISCORD:
+                    sleep_for = min(sleep_for, max(2.0, AUTO_SYNC_POLL_SECONDS))
+
                 await asyncio.sleep(sleep_for)
 
             except Exception as e:
