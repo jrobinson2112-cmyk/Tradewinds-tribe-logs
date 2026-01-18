@@ -1,117 +1,236 @@
+# tribelogs_module.py
+# RCON -> GetGameLog -> forward tribe log lines to per-tribe Discord webhooks (forum threads supported)
+# - /linktribelog, /unlinktribelog, /listroutes (admin only)
+# - routes persisted to Railway volume so they survive redeploys
+# - dedupe + first-run "seed" (no backlog spam)
+# - optional heartbeat (only if no activity)
+# - CLEAN log formatting: "Day X, HH:MM:SS - Who ... - What ..."
+# - exposes get_latest_tribelog_time() for time_module syncing (uses tribe log timestamps)
+
 import os
-import re
 import json
 import time
-import hashlib
 import asyncio
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
-
 import aiohttp
 import discord
 from discord import app_commands
+import re
+from typing import Optional, Dict, Any, List, Tuple
 
-# ============================================================
-# ENV / CONFIG
-# ============================================================
+# =====================
+# ENV
+# =====================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # only needed by main.py, not used here directly
 
 RCON_HOST = os.getenv("RCON_HOST")
-RCON_PORT = os.getenv("RCON_PORT")
+RCON_PORT = int(os.getenv("RCON_PORT", "0") or 0)
 RCON_PASSWORD = os.getenv("RCON_PASSWORD")
 
-# Poll interval for GetGameLog
-TRIBELOGS_POLL_SECONDS = float(os.getenv("TRIBELOGS_POLL_SECONDS", "10"))
+# Persist routes + dedupe info on Railway volume
+TRIBELOGS_DATA_DIR = os.getenv("TRIBELOGS_DATA_DIR", "/data")
+ROUTES_FILE = os.getenv("TRIBE_ROUTES_FILE", os.path.join(TRIBELOGS_DATA_DIR, "tribe_routes.json"))
+DEDUPE_FILE = os.getenv("TRIBE_DEDUPE_FILE", os.path.join(TRIBELOGS_DATA_DIR, "tribe_dedupe.json"))
 
-# Heartbeat: only sent if no activity since last heartbeat window
-HEARTBEAT_SECONDS = int(os.getenv("TRIBELOGS_HEARTBEAT_SECONDS", "3600"))  # 60 mins default
-HEARTBEAT_ENABLED = os.getenv("TRIBELOGS_HEARTBEAT_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+# Polling / heartbeat
+POLL_SECONDS = float(os.getenv("TRIBELOG_POLL_SECONDS", "8"))
+MAX_LINES_PER_POLL = int(os.getenv("TRIBELOG_MAX_LINES_PER_POLL", "25"))
+HEARTBEAT_ENABLED = os.getenv("TRIBELOG_HEARTBEAT_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+HEARTBEAT_SECONDS = int(os.getenv("TRIBELOG_HEARTBEAT_SECONDS", "3600"))  # 60 mins default
 
-# Persist routes on Railway Volume (recommended)
-DATA_DIR = os.getenv("TRIBELOGS_DATA_DIR", "/data")
-ROUTES_FILE = os.getenv("TRIBELOGS_ROUTES_FILE", os.path.join(DATA_DIR, "tribelog_routes.json"))
+# Formatting / colours
+USE_COLORS = os.getenv("TRIBELOG_USE_COLORS", "1").lower() in ("1", "true", "yes", "on")
 
-# File that time_module can read to sync from tribe log timestamps
-TIMEHINT_FILE = os.getenv("TRIBELOGS_TIMEHINT_FILE", os.path.join(DATA_DIR, "tribelog_latest_time.json"))
+COLOR_RED = 0xE74C3C        # killed/died/destroyed
+COLOR_YELLOW = 0xF1C40F     # demolished/unclaimed
+COLOR_PURPLE = 0x9B59B6     # claimed
+COLOR_GREEN = 0x2ECC71      # tamed
+COLOR_LIGHTBLUE = 0x5DADE2  # alliance
+COLOR_WHITE = 0xFFFFFF      # everything else
 
-# Dedupe tuning (keep last N hashes in memory per route)
-DEDUPE_MAX = int(os.getenv("TRIBELOGS_DEDUPE_MAX", "3000"))
+# =====================
+# INTERNALS
+# =====================
+_routes: List[Dict[str, str]] = []
+_routes_sig: str = ""
+_routes_loaded_once = False
+_routes_dirty = False
 
-# Admin role (passed in setup_tribelog_commands, but we keep a fallback)
-DEFAULT_ADMIN_ROLE_ID = int(os.getenv("TRIBELOGS_ADMIN_ROLE_ID", "0") or "0")
+_dedupe: Dict[str, Dict[str, Any]] = {}  # per tribe: {"seen": {hash: ts}, "last_heartbeat": ts, "last_activity": ts}
+_dedupe_dirty = False
 
-# ============================================================
-# VALIDATION
-# ============================================================
+_first_run_seeded = False
 
-def _require_env():
-    missing = []
-    if not RCON_HOST:
-        missing.append("RCON_HOST")
-    if not RCON_PORT:
-        missing.append("RCON_PORT")
-    if not RCON_PASSWORD:
-        missing.append("RCON_PASSWORD")
-    if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+# Latest tribe-log Day/Time observed (for time_module)
+_latest_daytime: Optional[Tuple[int, int, int, int]] = None  # (day, hour, minute, second)
+_latest_daytime_ts: float = 0.0
 
-RCON_PORT = int(RCON_PORT or 0)
+# =====================
+# FILE HELPERS
+# =====================
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-# ============================================================
-# ROUTES MODEL
-# ============================================================
-
-@dataclass
-class TribeRoute:
-    tribe: str
-    webhook: str
-    thread_id: Optional[str] = None
-
-def _ensure_data_dir():
+def _load_json(path: str, default):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        pass
+        return default
 
-def _load_routes() -> List[TribeRoute]:
-    _ensure_data_dir()
-    if not os.path.exists(ROUTES_FILE):
-        return []
+def _save_json(path: str, obj):
+    _ensure_dir(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+# =====================
+# ROUTES
+# Each route:
+#   {"tribe": "Valkyrie", "webhook": "https://discord.com/api/webhooks/..../....", "thread_id": "1459..."}
+# =====================
+def _normalize_webhook(url: str) -> str:
+    # Remove any existing ?Thread=... or ?thread_id=... so we manage thread_id consistently
+    # Keep base webhook URL only.
+    if not url:
+        return url
+    # Discord webhooks accept query params; we want the base.
+    return url.split("?", 1)[0].strip()
+
+def _route_signature(routes: List[Dict[str, str]]) -> str:
+    # stable signature so we can avoid spam printing
     try:
-        with open(ROUTES_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        routes: List[TribeRoute] = []
-        if isinstance(raw, list):
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                tribe = str(item.get("tribe", "")).strip()
-                webhook = str(item.get("webhook", "")).strip()
-                thread_id = item.get("thread_id")
-                thread_id = str(thread_id).strip() if thread_id else None
-                if tribe and webhook:
-                    routes.append(TribeRoute(tribe=tribe, webhook=webhook, thread_id=thread_id))
-        return routes
+        return json.dumps(sorted(routes, key=lambda r: (r.get("tribe",""), r.get("webhook",""), r.get("thread_id",""))),
+                          ensure_ascii=False, sort_keys=True)
     except Exception:
-        return []
+        return str(routes)
 
-def _save_routes(routes: List[TribeRoute]) -> None:
-    _ensure_data_dir()
-    data = [{"tribe": r.tribe, "webhook": r.webhook, "thread_id": r.thread_id} for r in routes]
-    with open(ROUTES_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def _load_routes() -> List[Dict[str, str]]:
+    global _routes, _routes_sig, _routes_loaded_once
+    _ensure_dir(ROUTES_FILE)
+    data = _load_json(ROUTES_FILE, default=[])
+    if not isinstance(data, list):
+        data = []
 
-# In-memory routes (reloadable)
-_ROUTES: List[TribeRoute] = []
+    norm: List[Dict[str, str]] = []
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        tribe = str(r.get("tribe", "")).strip()
+        webhook = _normalize_webhook(str(r.get("webhook", "")).strip())
+        thread_id = str(r.get("thread_id", "")).strip()
+        if tribe and webhook:
+            norm.append({"tribe": tribe, "webhook": webhook, "thread_id": thread_id})
 
-def _reload_routes():
-    global _ROUTES
-    _ROUTES = _load_routes()
-    print("Tribe routes loaded:", [r.tribe for r in _ROUTES])
+    _routes = norm
+    _routes_sig = _route_signature(_routes)
+    _routes_loaded_once = True
 
-# ============================================================
-# RCON (Minimal Source RCON)  — works for ASA/Nitrado
-# ============================================================
+    # IMPORTANT: print only once on startup (fixes your spam)
+    print("Tribe routes loaded:", [r["tribe"] for r in _routes])
+    return _routes
 
+def _save_routes():
+    global _routes_dirty
+    _ensure_dir(ROUTES_FILE)
+    _save_json(ROUTES_FILE, _routes)
+    _routes_dirty = False
+
+def _maybe_reload_routes_quiet():
+    """
+    Reload routes only when the commands changed them (routes_dirty flag).
+    Avoid spam prints in the poll loop.
+    """
+    global _routes, _routes_sig, _routes_dirty
+    if not _routes_dirty:
+        return
+
+    data = _load_json(ROUTES_FILE, default=[])
+    if not isinstance(data, list):
+        data = []
+    norm: List[Dict[str, str]] = []
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        tribe = str(r.get("tribe", "")).strip()
+        webhook = _normalize_webhook(str(r.get("webhook", "")).strip())
+        thread_id = str(r.get("thread_id", "")).strip()
+        if tribe and webhook:
+            norm.append({"tribe": tribe, "webhook": webhook, "thread_id": thread_id})
+
+    new_sig = _route_signature(norm)
+    _routes = norm
+    if new_sig != _routes_sig:
+        _routes_sig = new_sig
+        print("Tribe routes updated:", [r["tribe"] for r in _routes])
+
+    _routes_dirty = False
+
+# =====================
+# DEDUPE
+# =====================
+def _load_dedupe():
+    global _dedupe
+    _ensure_dir(DEDUPE_FILE)
+    d = _load_json(DEDUPE_FILE, default={})
+    if not isinstance(d, dict):
+        d = {}
+    # keep shape
+    for tribe, obj in list(d.items()):
+        if not isinstance(obj, dict):
+            d.pop(tribe, None)
+            continue
+        if "seen" not in obj or not isinstance(obj["seen"], dict):
+            obj["seen"] = {}
+        if "last_heartbeat" not in obj:
+            obj["last_heartbeat"] = 0.0
+        if "last_activity" not in obj:
+            obj["last_activity"] = 0.0
+    _dedupe = d
+
+def _save_dedupe():
+    global _dedupe_dirty
+    if not _dedupe_dirty:
+        return
+    _ensure_dir(DEDUPE_FILE)
+    # Trim seen to keep file from growing forever
+    now = time.time()
+    for tribe, obj in _dedupe.items():
+        seen = obj.get("seen", {})
+        if not isinstance(seen, dict):
+            obj["seen"] = {}
+            continue
+        # keep last 48h entries
+        cutoff = now - 48 * 3600
+        for k, ts in list(seen.items()):
+            try:
+                if float(ts) < cutoff:
+                    seen.pop(k, None)
+            except Exception:
+                seen.pop(k, None)
+        # hard cap size
+        if len(seen) > 5000:
+            # drop oldest
+            items = sorted(seen.items(), key=lambda kv: float(kv[1]) if str(kv[1]).replace(".","",1).isdigit() else 0.0)
+            for k, _ in items[: len(items) - 5000]:
+                seen.pop(k, None)
+
+    _save_json(DEDUPE_FILE, _dedupe)
+    _dedupe_dirty = False
+
+def _hash_line(s: str) -> str:
+    # stable lightweight hash (no external libs)
+    # includes full string; special chars preserved
+    import hashlib
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+# =====================
+# RCON (minimal Source-like)
+# =====================
 def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     data = body.encode("utf-8") + b"\x00"
     packet = (
@@ -124,22 +243,25 @@ def _rcon_make_packet(req_id: int, ptype: int, body: str) -> bytes:
     return size.to_bytes(4, "little", signed=True) + packet
 
 async def rcon_command(command: str, timeout: float = 8.0) -> str:
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout)
+    if not (RCON_HOST and RCON_PORT and RCON_PASSWORD):
+        raise RuntimeError("RCON env vars missing (RCON_HOST/RCON_PORT/RCON_PASSWORD).")
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(RCON_HOST, RCON_PORT), timeout=timeout
+    )
     try:
         # auth
         writer.write(_rcon_make_packet(1, 3, RCON_PASSWORD))
         await writer.drain()
-        raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if len(raw) < 12:
-            raise RuntimeError("RCON auth failed (short response)")
+        _ = await asyncio.wait_for(reader.read(4096), timeout=timeout)
 
-        # exec
+        # command
         writer.write(_rcon_make_packet(2, 2, command))
         await writer.drain()
 
         chunks = []
-        end_time = time.time() + timeout
-        while time.time() < end_time:
+        end = time.time() + timeout
+        while time.time() < end:
             try:
                 part = await asyncio.wait_for(reader.read(4096), timeout=0.35)
             except asyncio.TimeoutError:
@@ -152,8 +274,6 @@ async def rcon_command(command: str, timeout: float = 8.0) -> str:
             return ""
 
         data = b"".join(chunks)
-
-        # parse packets
         out = []
         i = 0
         while i + 4 <= len(data):
@@ -163,8 +283,8 @@ async def rcon_command(command: str, timeout: float = 8.0) -> str:
                 break
             pkt = data[i:i+size]
             i += size
-            body = pkt[8:-2]  # skip id+type, strip \x00\x00
-            txt = body.decode("utf-8", errors="replace")
+            body = pkt[8:-2]
+            txt = body.decode("utf-8", errors="ignore")
             if txt:
                 out.append(txt)
 
@@ -176,440 +296,383 @@ async def rcon_command(command: str, timeout: float = 8.0) -> str:
         except Exception:
             pass
 
-# ============================================================
+# =====================
 # PARSING / CLEANING
-# ============================================================
+# Goal output:
+#   "Day 294, 07:12:15 - Atropo claimed baby Megaraptor - Lvl 216 (Megaraptor)"
+# We take messy RichColor markup and trim junk.
+# =====================
+_RICHCOLOR = re.compile(r"<\s*RichColor[^>]*>", re.IGNORECASE)
+_TAGS = re.compile(r"</?\s*[^>]+>")  # generic tags
+_MULTI_SPACE = re.compile(r"\s{2,}")
+# Capture tribe log lines that include tribe name OR are clearly tribe events
+# We still route per tribe by checking "Tribe <name>" substring in the original line.
+_DAYTIME = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})")
 
-# Example lines contain:
-# "... Tribe Valkyrie, ID 123...: Day 216, 18:13:36: Einar froze ..."
-_DAYTIME_RE = re.compile(r"Day\s+(\d+),\s+(\d{1,2}):(\d{2}):(\d{2})\s*:", re.IGNORECASE)
+def _strip_markup(s: str) -> str:
+    s = _RICHCOLOR.sub("", s)
+    s = _TAGS.sub("", s)
+    s = s.replace("\u200b", "")
+    s = _MULTI_SPACE.sub(" ", s)
+    return s.strip()
 
-# Strip RichColor wrappers and other tag-like stuff
-_RICH_TAG_RE = re.compile(r"<[^>]+>")
-
-def _strip_rich_tags(s: str) -> str:
-    # remove <RichColor ...> etc
-    s = _RICH_TAG_RE.sub("", s)
-    return s
-
-def _clean_trailing_garbage(s: str) -> str:
-    # remove weird end fragments like "</>)" or "!>)" or "))"
-    s = s.strip()
-    while s.endswith(("</>)", "</)", "!>)", ">)", "))", ")")) and len(s) > 3:
-        s = s[:-1].strip()
-    return s
-
-def _normalize_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
-
-def _extract_day_time_and_message(line: str) -> Optional[Tuple[int, int, int, int, str]]:
-    """
-    Returns: (day, hh, mm, ss, message_after_time_colon)
-    where message_after_time_colon is the part AFTER 'Day X, HH:MM:SS:'.
-    """
-    m = _DAYTIME_RE.search(line)
+def _extract_daytime(s: str) -> Optional[Tuple[int, int, int, int]]:
+    m = _DAYTIME.search(s)
     if not m:
         return None
-    day = int(m.group(1))
-    hh = int(m.group(2))
-    mm = int(m.group(3))
-    ss = int(m.group(4))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
-    # text after the matched "Day..., HH:MM:SS:"
-    after = line[m.end():].strip()
-
-    # Remove leading punctuation/extra
-    after = after.lstrip(":").strip()
-    after = _strip_rich_tags(after)
-    after = _clean_trailing_garbage(after)
-    after = _normalize_spaces(after)
-
-    return day, hh, mm, ss, after
-
-def _extract_player_and_action(after: str) -> str:
+def _clean_to_desired_format(raw_line: str) -> Optional[str]:
     """
-    We want: "Who + action" only (keep what ARK gives, but remove extra bracketed metadata if present).
-    We'll lightly clean quotes.
+    Takes a raw GetGameLog line and returns the cleaned single-line message, or None if no Day/Time.
     """
-    s = after
+    s = raw_line.strip()
+    if not s:
+        return None
+    s = _strip_markup(s)
 
-    # Remove "Frozen by ID: ..." style continuation lines are handled elsewhere;
-    # here we just format the main action line.
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
-
-    # Light cleanup: remove "UniqueNetId..." chunks if ever present: "Name [UniqueNetId:...]" -> "Name"
-    s = re.sub(r"\s*\[UniqueNetId:[^\]]+\]", "", s)
-
-    return _normalize_spaces(s)
-
-def format_compact_log(line: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Produces:
-      display_text: "Day 294, 07:12:15 - Atropo claimed baby Megaraptor - Lvl 216 (Megaraptor)"
-      embed: Discord embed dict with colour per action keyword
-    """
-    parsed = _extract_day_time_and_message(line)
-    if not parsed:
+    dt = _extract_daytime(s)
+    if not dt:
         return None
 
-    day, hh, mm, ss, after = parsed
-    after2 = _extract_player_and_action(after)
+    day, hh, mm, ss = dt
 
-    display = f"Day {day}, {hh:02d}:{mm:02d}:{ss:02d} - {after2}"
+    # Remove anything before the first "Day X, HH:MM:SS" to get the actual event message
+    idx = s.lower().find(f"day {day},".lower())
+    if idx > 0:
+        s = s[idx:]
 
-    # Colour mapping (your exact rules)
-    low = after2.lower()
+    # Many lines look like:
+    # "Day 294, 07:12:15: Atropo ... "
+    # or "... Day 294, 07:12:15: Tribe Valkyrie, ID ...: Atropo ..."
+    # Normalize the first delimiter after time from ":" to " - "
+    # Find the first ":" after the HH:MM:SS
+    time_token = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    p = s.find(time_token)
+    if p != -1:
+        after = s[p + len(time_token):].lstrip()
+        # If it starts with ":" remove it
+        if after.startswith(":"):
+            after = after[1:].lstrip()
+        elif after.startswith("-"):
+            after = after[1:].lstrip()
 
+        # Some lines include an extra prefix like "Tribe X, ID 123:"
+        # Remove leading "Tribe ...:" chunks but keep player/action
+        # If it begins with "Tribe " then remove up to the next ":" once
+        if after.lower().startswith("tribe "):
+            colon = after.find(":")
+            if colon != -1:
+                after = after[colon+1:].lstrip()
+
+        s = f"Day {day}, {time_token} - {after}".strip()
+
+    # final tidy
+    s = _MULTI_SPACE.sub(" ", s).strip(" -")
+    return s if s else None
+
+def _pick_color(clean_line: str) -> int:
+    """
+    Colour classification based on action keywords in the cleaned line.
+    """
+    if not USE_COLORS:
+        return COLOR_WHITE
+
+    t = clean_line.lower()
     # Red - Killed / Died / Death / Destroyed
-    if any(k in low for k in [" killed", "killed ", " died", "died ", " death", "destroyed"]):
-        color = 0xE74C3C
-    # Yellow - Demolished OR Unclaimed
-    elif "demolished" in low or " unclaimed" in low or low.startswith("unclaimed"):
-        color = 0xF1C40F
+    if any(k in t for k in (" killed ", " killed", "killed ", " died", " death", " destroyed", "was killed", "was destroyed")):
+        return COLOR_RED
+    # Yellow - Demolished / Unclaimed
+    if " demolished" in t or "unclaimed" in t:
+        return COLOR_YELLOW
     # Purple - Claimed
-    elif " claimed" in low or low.startswith("claimed"):
-        color = 0x9B59B6
+    if " claimed" in t:
+        return COLOR_PURPLE
     # Green - Tamed
-    elif " tamed" in low or "taming" in low:
-        color = 0x2ECC71
+    if " tamed" in t:
+        return COLOR_GREEN
     # Light blue - Alliance
-    elif "alliance" in low:
-        color = 0x5DADE2
-    # White - Anything else (e.g. froze)
-    else:
-        color = 0xFFFFFF
+    if " alliance" in t:
+        return COLOR_LIGHTBLUE
 
-    embed = {
-        "embeds": [
-            {
-                "description": display,
-                "color": color,
-            }
-        ]
-    }
-    return display, embed
+    return COLOR_WHITE
 
-def _is_continuation_noise(line: str) -> bool:
-    # skip lines like "Frozen by ID: ...." or obvious server noise
-    l = line.strip().lower()
-    if not l:
-        return True
-    if l.startswith("frozen by id:"):
-        return True
-    if "garbage collection triggered" in l:
-        return True
-    return False
-
-def _sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()
-
-def _write_timehint(day: int, hh: int, mm: int, ss: int):
-    """
-    Writes last seen in-game day/time for time_module to use.
-    """
-    _ensure_data_dir()
-    payload = {
-        "day": day,
-        "hour": hh,
-        "minute": mm,
-        "second": ss,
-        "updated_at": int(time.time())
-    }
-    try:
-        with open(TIMEHINT_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-        # ============================================================
-# DISCORD WEBHOOK SEND (supports forum thread_id)
-# ============================================================
-
-async def _post_webhook(session: aiohttp.ClientSession, webhook_url: str, payload: Dict[str, Any], thread_id: Optional[str]):
-    # Always use params for thread routing (Forum / thread webhooks)
-    params = {"wait": "true"}
+# =====================
+# WEBHOOK POST (forum thread supported)
+# =====================
+def _build_webhook_url(base: str, thread_id: str) -> str:
+    base = base.strip()
+    if not base:
+        return base
+    sep = "&" if "?" in base else "?"
+    url = f"{base}{sep}wait=true"
     if thread_id:
-        params["thread_id"] = str(thread_id)
+        url += f"&thread_id={thread_id}"
+    return url
 
-    async with session.post(webhook_url, params=params, json=payload) as r:
-        # Discord returns message JSON on success when wait=true
-        if r.status >= 300:
-            txt = await r.text()
-            raise RuntimeError(f"Webhook post failed: {r.status} {txt}")
+async def _post_embed(session: aiohttp.ClientSession, webhook_base: str, thread_id: str, embed: Dict[str, Any]):
+    url = _build_webhook_url(webhook_base, thread_id)
+    async with session.post(url, json={"embeds": [embed]}) as r:
+        # Discord commonly returns 200 or 204 depending; 2xx is fine
+        if 200 <= r.status < 300:
+            return True, None
+        try:
+            data = await r.json()
+        except Exception:
+            data = await r.text()
+        return False, f"Webhook post failed: {r.status} {data}"
 
-# ============================================================
-# DEDUPE STATE
-# ============================================================
-
-class _RouteDedupe:
+# =====================
+# PUBLIC: time module hook
+# =====================
+def get_latest_tribelog_time() -> Optional[Tuple[int, int, int, int]]:
     """
-    Keeps an ordered ring of recent hashes per route.
+    Returns the most recent (day, hour, minute, second) seen in tribe log lines.
     """
-    def __init__(self, max_items: int):
-        self.max_items = max_items
-        self.order: List[str] = []
-        self.set = set()
+    return _latest_daytime
 
-    def seen(self, h: str) -> bool:
-        return h in self.set
-
-    def add(self, h: str):
-        if h in self.set:
-            return
-        self.set.add(h)
-        self.order.append(h)
-        if len(self.order) > self.max_items:
-            old = self.order.pop(0)
-            self.set.discard(old)
-
-# per-tribe dedupe
-_DEDUPE_BY_TRIBE: Dict[str, _RouteDedupe] = {}
-
-def _dedupe_for(tribe: str) -> _RouteDedupe:
-    key = tribe.lower().strip()
-    d = _DEDUPE_BY_TRIBE.get(key)
-    if not d:
-        d = _RouteDedupe(DEDUPE_MAX)
-        _DEDUPE_BY_TRIBE[key] = d
-    return d
-
-# ============================================================
-# HEARTBEAT
-# ============================================================
-
-_last_activity_ts_by_tribe: Dict[str, float] = {}
-_last_heartbeat_ts_by_tribe: Dict[str, float] = {}
-
-def _mark_activity(tribe: str):
-    _last_activity_ts_by_tribe[tribe.lower().strip()] = time.time()
-
-def _should_heartbeat(tribe: str) -> bool:
-    if not HEARTBEAT_ENABLED:
-        return False
-    now = time.time()
-    k = tribe.lower().strip()
-    last_hb = _last_heartbeat_ts_by_tribe.get(k, 0.0)
-    if now - last_hb < HEARTBEAT_SECONDS:
-        return False
-    last_act = _last_activity_ts_by_tribe.get(k, 0.0)
-    # only heartbeat if NO activity since last heartbeat window
-    if last_act > last_hb:
-        return False
-    _last_heartbeat_ts_by_tribe[k] = now
-    return True
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-_first_run_seeded = False
-
-async def run_tribelogs_loop():
+# =====================
+# COMMANDS
+# =====================
+def setup_tribelog_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int):
     """
-    Polls RCON GetGameLog and routes tribe logs to their configured webhooks.
-    Designed to be started once from main.py via asyncio.create_task().
-    """
-    _require_env()
-    _reload_routes()
-
-    global _first_run_seeded
-    print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                # reload routes each poll so /linktribelog changes apply quickly
-                _reload_routes()
-                if not _ROUTES:
-                    await asyncio.sleep(TRIBELOGS_POLL_SECONDS)
-                    continue
-
-                gamelog = await rcon_command("GetGameLog", timeout=10.0)
-                if not gamelog:
-                    # no output; still heartbeat if needed
-                    for rt in _ROUTES:
-                        if _should_heartbeat(rt.tribe):
-                            try:
-                                hb_payload = {"embeds": [{"description": "Heartbeat: no new logs since last (still polling).", "color": 0x95A5A6}]}
-                                await _post_webhook(session, rt.webhook, hb_payload, rt.thread_id)
-                            except Exception as e:
-                                print(f"Heartbeat error for {rt.tribe}: {e}")
-                    await asyncio.sleep(TRIBELOGS_POLL_SECONDS)
-                    continue
-
-                # Split to lines and filter/format
-                lines = gamelog.splitlines()
-
-                # Seed dedupe (prevents backlog spam on boot)
-                if not _first_run_seeded:
-                    for ln in lines:
-                        if _is_continuation_noise(ln):
-                            continue
-                        # add to all matching tribes, but don't send
-                        for rt in _ROUTES:
-                            if rt.tribe.lower() in ln.lower():
-                                fc = format_compact_log(ln)
-                                if not fc:
-                                    continue
-                                display, _payload = fc
-                                h = _sha1(display)
-                                _dedupe_for(rt.tribe).add(h)
-                                # also write timehint if present
-                                parsed = _extract_day_time_and_message(ln)
-                                if parsed:
-                                    d, hh, mm, ss, _after = parsed
-                                    _write_timehint(d, hh, mm, ss)
-                    _first_run_seeded = True
-                    await asyncio.sleep(TRIBELOGS_POLL_SECONDS)
-                    continue
-
-                # Normal run: forward only NEW entries per tribe
-                sent_any_for: Dict[str, int] = {}
-
-                for ln in lines:
-                    if _is_continuation_noise(ln):
-                        continue
-
-                    # Update time hint if line has Day/Time (any tribe)
-                    parsed = _extract_day_time_and_message(ln)
-                    if parsed:
-                        d, hh, mm, ss, _after = parsed
-                        _write_timehint(d, hh, mm, ss)
-
-                    for rt in _ROUTES:
-                        if rt.tribe.lower() not in ln.lower():
-                            continue
-
-                        fc = format_compact_log(ln)
-                        if not fc:
-                            continue
-
-                        display, payload = fc
-                        h = _sha1(display)
-
-                        ded = _dedupe_for(rt.tribe)
-                        if ded.seen(h):
-                            continue
-
-                        # mark as seen BEFORE sending (prevents burst duplicates on rate limits)
-                        ded.add(h)
-
-                        try:
-                            await _post_webhook(session, rt.webhook, payload, rt.thread_id)
-                            _mark_activity(rt.tribe)
-                            sent_any_for[rt.tribe] = sent_any_for.get(rt.tribe, 0) + 1
-                        except Exception as e:
-                            print(f"GetGameLog/forward error for {rt.tribe}: {e}")
-
-                # Heartbeats (per tribe) only if no activity
-                for rt in _ROUTES:
-                    if _should_heartbeat(rt.tribe):
-                        try:
-                            hb_payload = {"embeds": [{"description": "Heartbeat: no new logs since last (still polling).", "color": 0x95A5A6}]}
-                            await _post_webhook(session, rt.webhook, hb_payload, rt.thread_id)
-                        except Exception as e:
-                            print(f"Heartbeat error for {rt.tribe}: {e}")
-
-            except Exception as e:
-                print(f"TribeLogs loop error: {e}")
-
-            await asyncio.sleep(TRIBELOGS_POLL_SECONDS)
-
-# ============================================================
-# SLASH COMMANDS
-# ============================================================
-
-def setup_tribelog_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int = 0):
-    """
-    Registers:
-      /linktribelog tribe webhook_url thread_id(optional)
+    Admin-only commands:
+      /linktribelog tribe webhook thread_id
       /unlinktribelog tribe
       /listroutes
     """
-    if not admin_role_id:
-        admin_role_id = DEFAULT_ADMIN_ROLE_ID
-
     guild_obj = discord.Object(id=int(guild_id))
 
     def _is_admin(i: discord.Interaction) -> bool:
-        if not admin_role_id:
-            return False
         try:
-            return any(getattr(r, "id", None) == int(admin_role_id) for r in i.user.roles)
+            return any(getattr(r, "id", None) == int(admin_role_id) for r in getattr(i.user, "roles", []))
         except Exception:
             return False
 
     @tree.command(name="linktribelog", guild=guild_obj)
-    async def linktribelog(i: discord.Interaction, tribe: str, webhook_url: str, thread_id: str = ""):
+    async def linktribelog(i: discord.Interaction, tribe: str, webhook: str, thread_id: str = ""):
+        global _routes, _routes_dirty
         if not _is_admin(i):
-            await i.response.send_message("❌ No permission.", ephemeral=True)
+            await i.response.send_message("❌ No permission", ephemeral=True)
             return
 
-        tribe = tribe.strip()
-        webhook_url = webhook_url.strip()
-        thread_id = thread_id.strip() or None
+        tribe = (tribe or "").strip()
+        webhook = _normalize_webhook((webhook or "").strip())
+        thread_id = (thread_id or "").strip()
 
-        if not tribe or not webhook_url:
-            await i.response.send_message("❌ Tribe and webhook_url are required.", ephemeral=True)
+        if not tribe or not webhook:
+            await i.response.send_message("❌ Provide tribe + webhook.", ephemeral=True)
             return
 
-        routes = _load_routes()
-        # Replace if exists
-        replaced = False
-        for r in routes:
-            if r.tribe.lower() == tribe.lower():
-                r.webhook = webhook_url
-                r.thread_id = thread_id
-                replaced = True
+        # load once if needed
+        if not _routes_loaded_once:
+            _load_routes()
+
+        # upsert
+        found = False
+        for r in _routes:
+            if r["tribe"].lower() == tribe.lower():
+                r["tribe"] = tribe
+                r["webhook"] = webhook
+                r["thread_id"] = thread_id
+                found = True
                 break
-        if not replaced:
-            routes.append(TribeRoute(tribe=tribe, webhook=webhook_url, thread_id=thread_id))
+        if not found:
+            _routes.append({"tribe": tribe, "webhook": webhook, "thread_id": thread_id})
 
-        _save_routes(routes)
-        _reload_routes()
+        _save_routes()
+        _routes_dirty = True  # triggers quiet reload / updated print once
 
         await i.response.send_message(
-            f"✅ Linked **{tribe}** to webhook (thread_id={thread_id or 'none'}).",
+            f"✅ Linked **{tribe}** → webhook (thread_id={thread_id or 'none'})",
             ephemeral=True
         )
 
     @tree.command(name="unlinktribelog", guild=guild_obj)
     async def unlinktribelog(i: discord.Interaction, tribe: str):
+        global _routes, _routes_dirty
         if not _is_admin(i):
-            await i.response.send_message("❌ No permission.", ephemeral=True)
+            await i.response.send_message("❌ No permission", ephemeral=True)
             return
 
-        tribe = tribe.strip()
-        routes = _load_routes()
-        new_routes = [r for r in routes if r.tribe.lower() != tribe.lower()]
-        _save_routes(new_routes)
-        _reload_routes()
+        tribe = (tribe or "").strip()
+        if not tribe:
+            await i.response.send_message("❌ Provide a tribe name.", ephemeral=True)
+            return
 
-        await i.response.send_message(f"✅ Unlinked **{tribe}**.", ephemeral=True)
+        if not _routes_loaded_once:
+            _load_routes()
+
+        before = len(_routes)
+        _routes = [r for r in _routes if r["tribe"].lower() != tribe.lower()]
+        after = len(_routes)
+
+        _save_routes()
+        _routes_dirty = True
+
+        if after < before:
+            await i.response.send_message(f"✅ Unlinked **{tribe}**.", ephemeral=True)
+        else:
+            await i.response.send_message(f"ℹ️ No route found for **{tribe}**.", ephemeral=True)
 
     @tree.command(name="listroutes", guild=guild_obj)
     async def listroutes(i: discord.Interaction):
-        routes = _load_routes()
-        if not routes:
-            await i.response.send_message("No routes set.", ephemeral=True)
+        if not _routes_loaded_once:
+            _load_routes()
+
+        if not _routes:
+            await i.response.send_message("No tribe routes linked yet.", ephemeral=True)
             return
 
         lines = []
-        for r in routes:
-            lines.append(f"- **{r.tribe}** -> thread_id={r.thread_id or 'none'}")
-        await i.response.send_message("\n".join(lines), ephemeral=True)
+        for r in _routes:
+            lines.append(f"- **{r['tribe']}** (thread_id={r.get('thread_id') or 'none'})")
+        msg = "Current tribe routes:\n" + "\n".join(lines)
+        await i.response.send_message(msg, ephemeral=True)
 
     print("[tribelogs_module] ✅ /linktribelog, /unlinktribelog, /listroutes registered")
 
-# ============================================================
-# OPTIONAL: helper for time_module to read
-# ============================================================
+# =====================
+# LOOP
+# =====================
+async def run_tribelogs_loop(client: Optional[discord.Client] = None):
+    """
+    Polls GetGameLog and forwards new tribe log lines to each tribe's route.
 
-def read_latest_timehint() -> Optional[Dict[str, Any]]:
+    IMPORTANT behaviour:
+    - First run: seeds dedupe with the *current* GetGameLog output (no backlog spam)
+    - After that: only forwards new lines
+    - Heartbeat: every HEARTBEAT_SECONDS but ONLY if no activity in that tribe since last heartbeat
     """
-    Returns the last seen timehint dict from tribe logs, or None.
-    """
-    try:
-        with open(TIMEHINT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    global _first_run_seeded, _dedupe_dirty, _latest_daytime, _latest_daytime_ts
+
+    if not _routes_loaded_once:
+        _load_routes()
+
+    _load_dedupe()
+
+    async with aiohttp.ClientSession() as session:
+        # First-run seed
+        if not _first_run_seeded:
+            try:
+                text = await rcon_command("GetGameLog", timeout=12.0)
+                now = time.time()
+                # seed all tribes: mark all parsable lines as seen
+                lines = [ln for ln in text.splitlines() if ln.strip()]
+                for route in _routes:
+                    tribe = route["tribe"]
+                    obj = _dedupe.setdefault(tribe, {"seen": {}, "last_heartbeat": 0.0, "last_activity": 0.0})
+                    seen = obj.setdefault("seen", {})
+                    for ln in lines[-1000:]:
+                        # only seed lines relevant to this tribe, to keep seen smaller
+                        if f"tribe {tribe}".lower() in ln.lower():
+                            h = _hash_line(ln)
+                            seen[h] = now
+                    obj.setdefault("last_activity", 0.0)
+                    obj.setdefault("last_heartbeat", 0.0)
+                _dedupe_dirty = True
+                _save_dedupe()
+                _first_run_seeded = True
+                print("First run: seeded dedupe from current GetGameLog output (no backlog spam).")
+            except Exception as e:
+                print(f"First run seed error: {e}")
+                _first_run_seeded = True  # don't loop forever seeding
+
+        # Main loop
+        while True:
+            try:
+                _maybe_reload_routes_quiet()
+
+                if not _routes:
+                    await asyncio.sleep(max(2.0, POLL_SECONDS))
+                    continue
+
+                text = await rcon_command("GetGameLog", timeout=12.0)
+                raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+                # Focus on tail to reduce reprocessing
+                tail = raw_lines[-1200:] if len(raw_lines) > 1200 else raw_lines
+
+                any_forwarded_this_cycle = False
+
+                # For each route, scan for tribe lines, clean, dedupe, send
+                for route in _routes:
+                    tribe = route["tribe"]
+                    webhook = route["webhook"]
+                    thread_id = route.get("thread_id", "")
+
+                    obj = _dedupe.setdefault(tribe, {"seen": {}, "last_heartbeat": 0.0, "last_activity": 0.0})
+                    seen = obj.setdefault("seen", {})
+
+                    new_msgs: List[Tuple[str, str]] = []  # (clean_line, raw_line)
+                    for ln in tail:
+                        # route match
+                        if f"tribe {tribe}".lower() not in ln.lower():
+                            continue
+
+                        h = _hash_line(ln)
+                        if h in seen:
+                            continue
+
+                        clean = _clean_to_desired_format(ln)
+                        if not clean:
+                            # still mark as seen to prevent repeat processing of junk
+                            seen[h] = time.time()
+                            _dedupe_dirty = True
+                            continue
+
+                        new_msgs.append((clean, ln))
+                        seen[h] = time.time()
+                        _dedupe_dirty = True
+
+                    if new_msgs:
+                        # only send up to MAX_LINES_PER_POLL to avoid bursts
+                        new_msgs = new_msgs[-MAX_LINES_PER_POLL:]
+                        for clean, _raw in new_msgs:
+                            # update latest time for time_module (best-effort)
+                            dt = _extract_daytime(clean)
+                            if dt:
+                                day, hh, mm, ss = dt
+                                # accept if newer in wallclock or simply replace (we only need "recent")
+                                _latest_daytime = (day, hh, mm, ss)
+                                _latest_daytime_ts = time.time()
+
+                            embed = {
+                                "description": clean,
+                                "color": _pick_color(clean),
+                            }
+                            ok, err = await _post_embed(session, webhook, thread_id, embed)
+                            if not ok:
+                                print(f"GetGameLog/forward error for {tribe}: {err}")
+                                # don't break; keep going
+
+                        obj["last_activity"] = time.time()
+                        any_forwarded_this_cycle = True
+                        any_forwarded_this_cycle = True
+
+                    # Heartbeat (only if enabled AND no activity for HEARTBEAT_SECONDS)
+                    if HEARTBEAT_ENABLED:
+                        now = time.time()
+                        last_act = float(obj.get("last_activity", 0.0) or 0.0)
+                        last_hb = float(obj.get("last_heartbeat", 0.0) or 0.0)
+                        # send heartbeat if it's been HEARTBEAT_SECONDS since last heartbeat AND no activity since last heartbeat
+                        if (now - last_hb) >= HEARTBEAT_SECONDS and last_act <= last_hb:
+                            hb_embed = {
+                                "description": "Heartbeat: no new logs since last (still polling).",
+                                "color": 0x95A5A6,
+                            }
+                            ok, err = await _post_embed(session, webhook, thread_id, hb_embed)
+                            if ok:
+                                obj["last_heartbeat"] = now
+                                _dedupe_dirty = True
+                            else:
+                                print(f"Heartbeat error for {tribe}: {err}")
+
+                if _dedupe_dirty:
+                    _save_dedupe()
+
+                await asyncio.sleep(max(1.0, POLL_SECONDS))
+
+            except Exception as e:
+                # Keep loop alive
+                print(f"TribeLogs loop error: {e}")
+                await asyncio.sleep(3)
