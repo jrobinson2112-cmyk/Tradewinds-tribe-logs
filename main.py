@@ -209,12 +209,34 @@ async def on_message(message: discord.Message):
 async def on_interaction(interaction: discord.Interaction):
     """
     Handles Traveler Logs button clicks + modals (Write Log / Edit Log).
-    Without this, buttons will show 'This interaction failed'.
+    If we don't ACK in time, Discord shows "This interaction failed".
     """
     try:
-        await travelerlogs_module.handle_interaction(interaction)
+        # Only try to handle component & modal interactions here
+        is_component = interaction.type == discord.InteractionType.component
+        is_modal = interaction.type == discord.InteractionType.modal_submit
+
+        if is_component or is_modal:
+            handled = False
+            try:
+                handled = await travelerlogs_module.handle_interaction(interaction)
+            except AttributeError:
+                # If your module doesn't have handle_interaction, ignore
+                handled = False
+
+            # If module didn't respond, at least ACK so Discord doesn't error
+            # (module can still edit/send followups after defer)
+            if handled and not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+
     except Exception as e:
         print(f"[travelerlogs] interaction error: {e}")
+        # Last-resort ACK to stop the red banner
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
 
 
 client.run(DISCORD_TOKEN)
