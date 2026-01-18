@@ -26,6 +26,10 @@ TIME_UPDATE_STEP_MINUTES = int(os.getenv("TIME_UPDATE_STEP_MINUTES", "10"))  # u
 AUTO_SYNC_EVERY_SECONDS  = int(os.getenv("AUTO_SYNC_EVERY_SECONDS", "60"))   # check for timed log lines
 SYNC_DRIFT_MINUTES       = int(os.getenv("SYNC_DRIFT_MINUTES", "2"))         # only correct if >= 2 min drift
 
+# /sync retries (so manual sync doesn’t fail between timed events)
+SYNC_PULL_ATTEMPTS = int(os.getenv("SYNC_PULL_ATTEMPTS", "6"))               # e.g. 6 attempts
+SYNC_PULL_SLEEP    = float(os.getenv("SYNC_PULL_SLEEP", "2.0"))              # e.g. every 2s
+
 # Daily announce
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "1430388267446042666"))
 
@@ -44,6 +48,25 @@ _last_announced_abs_day = None
 
 _rcon_command = None
 _webhook_upsert = None
+
+# Cache fed by other modules (e.g. gamelogs_autopost)
+_latest_gamelog_text = None
+_latest_gamelog_cache_ts = 0.0
+
+def ingest_gamelog_text(text: str):
+    """
+    Optional: other modules can call this with the raw GetGameLog output they already fetched.
+    This makes time sync much more reliable (no “wrong batch” issue).
+    """
+    global _latest_gamelog_text, _latest_gamelog_cache_ts
+    if isinstance(text, str) and text.strip():
+        _latest_gamelog_text = text
+        _latest_gamelog_cache_ts = time.time()
+
+def _get_cached_gamelog_text(max_age_seconds: float = 120.0) -> str | None:
+    if _latest_gamelog_text and (time.time() - _latest_gamelog_cache_ts) <= max_age_seconds:
+        return _latest_gamelog_text
+    return None
 
 # =====================
 # STATE FILE HELPERS
@@ -128,8 +151,6 @@ def _build_time_embed(minute_of_day: int, day: int, year: int):
     minute = minute_of_day % 60
     icon = "☀️" if _is_daytime(minute_of_day) else "🌙"
     color = DAY_COLOR if _is_daytime(minute_of_day) else NIGHT_COLOR
-
-    # big single-line title
     title = f"{icon} | Solunaris Time — Year {year} | Day {day} | {hour:02d}:{minute:02d}"
     return {"title": title, "color": color}
 
@@ -170,17 +191,17 @@ def _shift_epoch_by_ingame_minutes(cur_minute_of_day: int, minute_diff: int) -> 
 
 # =====================
 # PARSING TIMED LINES FROM GetGameLog
-# Example line:
-# 2026.01.18_15.24.48: Tribe The Crossroads, ... Day 326, 17:32:40: ...
+# Handles variants:
+# "Day 326, 17:32:40:"  or "Day 326,17:32:40" or "Day 326 17:32:40"
 # =====================
-_DAY_HMS = re.compile(r"Day\s+(\d+),\s*(\d{1,2}):(\d{2}):(\d{2})")
+# Day + time anywhere in line
+_DAY_HMS = re.compile(r"Day\s+(\d+)\s*,?\s*(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})", re.IGNORECASE)
+
+# Real timestamp at start anywhere:
+# 2026.01.18_15.24.48
 _REAL_TS = re.compile(r"(\d{4}\.\d{2}\.\d{2})_(\d{2}\.\d{2}\.\d{2})")
 
 def _parse_real_epoch_from_line(line: str) -> float | None:
-    """
-    Parses 'YYYY.MM.DD_HH.MM.SS' and returns epoch seconds.
-    Uses local time conversion (good enough; we only need relative accuracy).
-    """
     m = _REAL_TS.search(line or "")
     if not m:
         return None
@@ -205,8 +226,9 @@ def parse_latest_timed_line(text: str) -> dict | None:
       }
     Picks the newest (last) line that contains Day + HH:MM:SS.
     """
-    if not text:
+    if not isinstance(text, str) or not text.strip():
         return None
+
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in reversed(lines):
         m = _DAY_HMS.search(ln)
@@ -231,16 +253,11 @@ def parse_latest_timed_line(text: str) -> dict | None:
 # SYNC APPLY (minute precision; ignores in-game seconds)
 # =====================
 def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None) -> tuple[bool, str]:
-    """
-    Syncs to Day + HH:MM from a timed GetGameLog line.
-    If the line includes a real timestamp, we anchor epoch to that for extra accuracy.
-    """
     global _state
 
     if not _state:
         return False, "No state set yet (use /settime first)."
 
-    # target
     parsed_day = int(parsed["day"])
     parsed_hour = int(parsed["hour"])
     parsed_minute = int(parsed["minute"])
@@ -251,16 +268,13 @@ def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None)
 
     cur_minute_of_day, cur_day, cur_year, _sec_into = now_calc
 
-    # year handling: keep current year unless user provided a hint
     target_year = int(year_hint) if year_hint is not None else int(cur_year)
-
     target_minute_of_day = _minute_of_day(parsed_hour, parsed_minute)
 
-    # compute drift in minutes (wrap days)
     day_diff = _wrap_day_diff(parsed_day - cur_day)
     minute_diff = (day_diff * 1440) + (target_minute_of_day - cur_minute_of_day)
 
-    # clamp huge drift (stale line protection)
+    # stale protection
     if minute_diff > 720:
         minute_diff -= 1440
     elif minute_diff < -720:
@@ -269,7 +283,7 @@ def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None)
     if abs(minute_diff) < SYNC_DRIFT_MINUTES:
         return False, f"Drift {minute_diff} min < threshold ({SYNC_DRIFT_MINUTES})."
 
-    # If we have a real timestamp on the log line, anchor epoch to it (best accuracy)
+    # Best accuracy: anchor to the real timestamp on the log line
     real_epoch = parsed.get("real_epoch", None)
     if isinstance(real_epoch, (int, float)) and real_epoch > 0:
         _state["epoch"] = float(real_epoch)
@@ -280,7 +294,7 @@ def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None)
         save_state()
         return True, f"Synced to timed GetGameLog line using real timestamp (drift {minute_diff} min)."
 
-    # Fallback: shift epoch by modeled SPM minutes
+    # Fallback: shift epoch by SPM model
     shift_seconds = _shift_epoch_by_ingame_minutes(cur_minute_of_day, minute_diff)
     _state["epoch"] = float(_state["epoch"]) - float(shift_seconds)
     _state["year"] = int(target_year)
@@ -290,14 +304,38 @@ def apply_sync_from_timed_log_minute(parsed: dict, year_hint: int | None = None)
     save_state()
     return True, f"Synced to timed GetGameLog line (no real timestamp; drift {minute_diff} min)."
 
+async def _pull_latest_timed_line_from_rcon(rcon_command) -> dict | None:
+    """
+    Pulls GetGameLog and returns the latest timed line, or None.
+    """
+    text = await rcon_command("GetGameLog", timeout=10.0)
+    return parse_latest_timed_line(text)
+
+async def _find_timed_line_with_retries(rcon_command) -> dict | None:
+    """
+    For manual /sync: retry a few times so it doesn't fail just because no timed event happened in that exact batch.
+    Also checks cache first (fed by gamelogs_autopost).
+    """
+    cached = _get_cached_gamelog_text()
+    if cached:
+        parsed = parse_latest_timed_line(cached)
+        if parsed:
+            return parsed
+
+    for _ in range(max(1, SYNC_PULL_ATTEMPTS)):
+        parsed = await _pull_latest_timed_line_from_rcon(rcon_command)
+        if parsed:
+            return parsed
+        await asyncio.sleep(max(0.2, SYNC_PULL_SLEEP))
+    return None
+
 # =====================
 # COMMANDS
 # =====================
 def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int, rcon_command, webhook_upsert):
     """
-    Registers:
-      /settime Year Day Hour Minute  (admin locked)
-      /sync                         (admin locked; syncs ONLY from timed GetGameLog lines)
+    /settime Year Day Hour Minute
+    /sync (syncs ONLY from timed GetGameLog lines)
     """
     global _rcon_command, _webhook_upsert
     _rcon_command = rcon_command
@@ -346,15 +384,13 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
             return
 
         try:
-            text = await _rcon_command("GetGameLog", timeout=10.0)
-            parsed = parse_latest_timed_line(text)
+            parsed = await _find_timed_line_with_retries(_rcon_command)
             if not parsed:
-                await i.followup.send("❌ No timed line found in GetGameLog (no 'Day X, HH:MM:SS').", ephemeral=True)
+                await i.followup.send("❌ No timed line found in GetGameLog (no 'Day X, HH:MM:SS' in recent output).", ephemeral=True)
                 return
 
             changed, msg = apply_sync_from_timed_log_minute(parsed)
 
-            # push webhook right away after manual sync
             if _webhook_upsert is not None:
                 now_calc = _calc_now()
                 if now_calc:
@@ -373,10 +409,10 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
 # =====================
 async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
     """
-    - Updates the time webhook only on round step minutes
-    - Announces new day in ANNOUNCE_CHANNEL_ID
+    - Updates time webhook on round step minutes
+    - Announces new day
     - Auto-syncs using timed GetGameLog lines (Day X, HH:MM:SS)
-      and uses the real timestamp in the line for better accuracy.
+      Prefer cached text from gamelogs_autopost if available.
     """
     global _state, _last_announced_abs_day
 
@@ -393,20 +429,26 @@ async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
 
                 minute_of_day, day, year, seconds_into_minute = now_calc
 
-                # --- Auto sync (best effort) ---
+                # --- Auto sync ---
                 if rcon_command is not None and (time.time() - last_sync_ts) >= AUTO_SYNC_EVERY_SECONDS:
                     try:
-                        text = await rcon_command("GetGameLog", timeout=10.0)
-                        parsed = parse_latest_timed_line(text)
+                        # Prefer cache (fed by gamelogs_autopost)
+                        cached = _get_cached_gamelog_text()
+                        parsed = parse_latest_timed_line(cached) if cached else None
+
+                        # If no cache or cache has no timed line, fall back to RCON pull
+                        if not parsed:
+                            parsed = await _pull_latest_timed_line_from_rcon(rcon_command)
+
                         if parsed:
                             changed, msg = apply_sync_from_timed_log_minute(parsed)
                             if changed:
-                                print(f"[time_module] Auto-sync: {msg} | line='{parsed.get('raw','')[:120]}'")
+                                print(f"[time_module] Auto-sync: {msg}")
                         else:
-                            # keep this quiet-ish; but still mark that we checked
                             print("[time_module] Auto-sync: No timed line found in GetGameLog.")
                     except Exception as e:
                         print(f"[time_module] Auto-sync error: {e}")
+
                     last_sync_ts = time.time()
 
                     # recalc after sync
