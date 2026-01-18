@@ -1,190 +1,213 @@
+# gamelogs_autopost_module.py
+# Polls ASA RCON "GetGameLog" every N seconds, and POSTS (not edits) a new embed every 60s
+# containing ONLY the new log lines seen during that minute.
+#
+# ✅ No redeploy spam: on startup it "seeds" the dedupe from the current GetGameLog output
+# ✅ Posts a NEW embed every minute (even if no logs -> "No new logs in the last minute.")
+# ✅ Does NOT delete or edit previous embeds
+# ✅ No filtering: includes ANY new GetGameLog lines (claims, tames, demolish, etc.)
+#
+# How to use in main.py:
+#   import gamelogs_autopost_module
+#   asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
+#
+# Env vars:
+#   GAMELOGS_CHANNEL_ID=1462433999766028427
+#   GAMELOGS_POLL_SECONDS=10
+#   GAMELOGS_POST_EVERY_SECONDS=60
+#   GAMELOGS_MAX_LINES_PER_EMBED=40
+#   GAMELOGS_SEED_ON_START=1
+#   GAMELOGS_SHOW_DEBUG=0
+
 import os
 import time
+import json
 import asyncio
 import hashlib
-from collections import deque
-from typing import Deque, Tuple, Optional, List
+from typing import List, Optional, Dict, Set
 
 import discord
 
 # =====================
-# ENV / CONFIG
+# CONFIG (ENV)
 # =====================
 GAMELOGS_CHANNEL_ID = int(os.getenv("GAMELOGS_CHANNEL_ID", "1462433999766028427"))
-GAMELOGS_POLL_SECONDS = float(os.getenv("GAMELOGS_POLL_SECONDS", "10"))
-GAMELOGS_EMBED_UPDATE_SECONDS = float(os.getenv("GAMELOGS_EMBED_UPDATE_SECONDS", "60"))
+POLL_SECONDS = float(os.getenv("GAMELOGS_POLL_SECONDS", "10"))
+POST_EVERY_SECONDS = int(os.getenv("GAMELOGS_POST_EVERY_SECONDS", "60"))
+MAX_LINES_PER_EMBED = int(os.getenv("GAMELOGS_MAX_LINES_PER_EMBED", "40"))
+SEED_ON_START = os.getenv("GAMELOGS_SEED_ON_START", "1").lower() in ("1", "true", "yes", "on")
+SHOW_DEBUG = os.getenv("GAMELOGS_SHOW_DEBUG", "0").lower() in ("1", "true", "yes", "on")
 
-# Dedupe sizing
-GAMELOGS_DEDUPE_MAX = int(os.getenv("GAMELOGS_DEDUPE_MAX", "20000"))
+# Persist dedupe so restarts don't replay the whole world
+DATA_DIR = os.getenv("GAMELOGS_DATA_DIR", "/data")
+STATE_FILE = os.getenv("GAMELOGS_STATE_FILE", os.path.join(DATA_DIR, "gamelogs_state.json"))
 
-# How many minutes of lines to keep in memory
-GAMELOGS_RETENTION_MINUTES = int(os.getenv("GAMELOGS_RETENTION_MINUTES", "10"))
-
-# Embed look
-GAMELOGS_EMBED_TITLE = os.getenv("GAMELOGS_EMBED_TITLE", "📜 Game Logs (live)")
-GAMELOGS_EMBED_COLOR = int(os.getenv("GAMELOGS_EMBED_COLOR", "0x2F3136"), 16)
-
-# Discord embed description hard limit is 4096 chars. Leave headroom.
-_EMBED_DESC_LIMIT = 3900
+EMBED_COLOR = 0x2F3136  # dark-ish
 
 # =====================
-# INTERNAL STATE
+# STATE
 # =====================
-# store (seen_ts, line)
-_buffer: Deque[Tuple[float, str]] = deque()
+_seen_hashes: Set[str] = set()
+_buffer: List[str] = []
+_last_post_ts: float = 0.0
 
-_seen_hashes: Deque[str] = deque()
-_seen_set = set()
+# =====================
+# HELPERS
+# =====================
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-_running = False
-
-
-def _hash_line(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()
-
-
-def _remember_hash(h: str):
-    if h in _seen_set:
-        return
-    _seen_hashes.append(h)
-    _seen_set.add(h)
-    while len(_seen_hashes) > GAMELOGS_DEDUPE_MAX:
-        old = _seen_hashes.popleft()
-        _seen_set.discard(old)
-
-
-def _clean_line(line: str) -> str:
-    # Keep special chars; normalize whitespace
-    return " ".join(line.strip().split())
-
-
-def _trim_buffer():
-    cutoff = time.time() - (GAMELOGS_RETENTION_MINUTES * 60)
-    while _buffer and _buffer[0][0] < cutoff:
-        _buffer.popleft()
-
-
-async def _seed_no_backlog(rcon_command):
-    """
-    Seed dedupe from current GetGameLog so redeploy doesn't spam old lines.
-    We DO NOT add seeded lines to buffer.
-    """
+def _load_state():
+    global _seen_hashes
     try:
-        txt = await rcon_command("GetGameLog", timeout=15.0)
-        if not txt:
-            print("[gamelogs_autopost] seed: empty GetGameLog")
+        if not os.path.exists(STATE_FILE):
+            _seen_hashes = set()
             return
-        for ln in txt.splitlines():
-            ln = _clean_line(ln)
-            if not ln:
-                continue
-            _remember_hash(_hash_line(ln))
-        print("[gamelogs_autopost] ✅ seeded from current GetGameLog (no redeploy backlog spam).")
-    except Exception as e:
-        print(f"[gamelogs_autopost] seed error: {e}")
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("seen"), list):
+            _seen_hashes = set(str(x) for x in data["seen"][-20000:])  # cap memory
+        else:
+            _seen_hashes = set()
+    except Exception:
+        _seen_hashes = set()
 
+def _save_state():
+    # keep file from growing forever
+    try:
+        _ensure_dir(STATE_FILE)
+        seen_list = list(_seen_hashes)
+        if len(seen_list) > 20000:
+            seen_list = seen_list[-20000:]
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"seen": seen_list}, f)
+    except Exception:
+        pass
 
-def _lines_since(seconds: float) -> List[str]:
-    cutoff = time.time() - seconds
-    return [ln for (ts, ln) in list(_buffer) if ts >= cutoff]
+def _h(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
+def _split_lines(text: str) -> List[str]:
+    if not text:
+        return []
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-def _build_embed(lines: List[str]) -> discord.Embed:
-    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+def _truncate_for_embed(lines: List[str]) -> str:
+    """
+    Discord embed description limit = 4096 chars.
+    We'll join lines and truncate safely.
+    """
+    joined = "\n".join(lines)
+    if len(joined) <= 3900:
+        return joined
+    # truncate hard but keep readable
+    return joined[:3890] + "\n… (truncated)"
+
+async def _post_minute_embed(client: discord.Client, lines: List[str]):
+    ch = client.get_channel(GAMELOGS_CHANNEL_ID)
+    if ch is None:
+        # Try fetch if cache missed
+        try:
+            ch = await client.fetch_channel(GAMELOGS_CHANNEL_ID)
+        except Exception:
+            ch = None
+
+    if ch is None:
+        if SHOW_DEBUG:
+            print("[gamelogs_autopost] ❌ channel not found:", GAMELOGS_CHANNEL_ID)
+        return
+
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
     if not lines:
         desc = "*No new logs in the last minute.*"
     else:
-        # Fit into embed limit, keep chronological order
-        out = []
-        total = 0
-        for ln in lines:
-            ln = _clean_line(ln)
-            if not ln:
-                continue
-            add_len = len(ln) + 1
-            if total + add_len > _EMBED_DESC_LIMIT:
-                break
-            out.append(ln)
-            total += add_len
-        desc = "\n".join(out) if out else "*Logs too long to display (window exceeds embed limit).*"
+        # limit number of lines per embed, keep most recent
+        trimmed = lines[-MAX_LINES_PER_EMBED:]
+        desc = _truncate_for_embed(trimmed)
 
     embed = discord.Embed(
-        title=GAMELOGS_EMBED_TITLE,
+        title="📜 Game Logs (minute)",
         description=desc,
-        color=GAMELOGS_EMBED_COLOR,
+        color=EMBED_COLOR,
     )
-    embed.set_footer(text=f"Last update: {now_str} | poll={GAMELOGS_POLL_SECONDS}s")
-    return embed
+    embed.set_footer(text=f"Posted: {now_str} | poll={POLL_SECONDS:.1f}s")
 
+    try:
+        await ch.send(embed=embed)
+    except Exception as e:
+        if SHOW_DEBUG:
+            print("[gamelogs_autopost] send error:", e)
 
+# =====================
+# PUBLIC LOOP
+# =====================
 async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
     """
-    Poll GetGameLog every GAMELOGS_POLL_SECONDS.
-    Edit/update a single embed message every GAMELOGS_EMBED_UPDATE_SECONDS in channel GAMELOGS_CHANNEL_ID.
+    rcon_command must be awaitable like: await rcon_command("GetGameLog", timeout=10.0)
     """
-    global _running
-    if _running:
-        return
-    _running = True
+    global _buffer, _last_post_ts
 
-    await client.wait_until_ready()
-
-    ch = client.get_channel(GAMELOGS_CHANNEL_ID)
-    if ch is None:
-        print(f"[gamelogs_autopost] ❌ Channel not found: {GAMELOGS_CHANNEL_ID}")
+    if rcon_command is None:
+        print("[gamelogs_autopost] ❌ rcon_command is None (not wired).")
         return
 
-    await _seed_no_backlog(rcon_command)
+    _ensure_dir(STATE_FILE)
+    _load_state()
 
-    last_embed_update = 0.0
-    embed_message: Optional[discord.Message] = None
+    # Seed (no redeploy spam): mark existing lines as seen, but DO NOT post them
+    if SEED_ON_START:
+        try:
+            text = await rcon_command("GetGameLog", timeout=12.0)
+            lines = _split_lines(text)
+            for ln in lines[-2000:]:  # only tail
+                _seen_hashes.add(_h(ln))
+            _save_state()
+            print("[gamelogs_autopost] ✅ seeded backlog from GetGameLog (no redeploy spam).")
+        except Exception as e:
+            print("[gamelogs_autopost] seed error:", e)
 
-    print(
-        f"[gamelogs_autopost] ✅ running (channel={GAMELOGS_CHANNEL_ID}, poll={GAMELOGS_POLL_SECONDS}s, embed_update={GAMELOGS_EMBED_UPDATE_SECONDS}s)"
-    )
+    _last_post_ts = time.time()
+    print(f"[gamelogs_autopost] ✅ running (channel_id={GAMELOGS_CHANNEL_ID}, poll={POLL_SECONDS:.1f}s, post_every={POST_EVERY_SECONDS}s)")
+
+    last_state_save = time.time()
 
     while True:
         try:
-            _trim_buffer()
+            # Poll GetGameLog
+            text = await rcon_command("GetGameLog", timeout=12.0)
+            lines = _split_lines(text)
 
-            # ---- poll ----
-            txt = await rcon_command("GetGameLog", timeout=15.0)
-            if txt:
-                now = time.time()
-                raw_lines = [ln for ln in txt.splitlines() if ln.strip()]
+            # only process the tail to keep things fast
+            tail = lines[-2000:] if len(lines) > 2000 else lines
 
-                new_lines = []
-                for ln in reversed(raw_lines):
-                    ln = _clean_line(ln)
-                    if not ln:
-                        continue
-                    h = _hash_line(ln)
-                    if h in _seen_set:
-                        continue
-                    _remember_hash(h)
-                    new_lines.append(ln)
+            new_count = 0
+            for ln in tail:
+                hh = _h(ln)
+                if hh in _seen_hashes:
+                    continue
+                _seen_hashes.add(hh)
+                _buffer.append(ln)
+                new_count += 1
 
-                # append in chronological order (oldest first)
-                for ln in reversed(new_lines):
-                    _buffer.append((now, ln))
+            # Periodic save of dedupe set (every ~30s)
+            if time.time() - last_state_save >= 30:
+                _save_state()
+                last_state_save = time.time()
 
-            # ---- embed update every N seconds ----
-            if (time.time() - last_embed_update) >= GAMELOGS_EMBED_UPDATE_SECONDS:
-                lines = _lines_since(GAMELOGS_EMBED_UPDATE_SECONDS)
-                embed_obj = _build_embed(lines)
+            # Post every minute as a NEW embed
+            if time.time() - _last_post_ts >= POST_EVERY_SECONDS:
+                await _post_minute_embed(client, _buffer)
+                _buffer = []
+                _last_post_ts = time.time()
 
-                if embed_message is None:
-                    embed_message = await ch.send(embed=embed_obj)
-                else:
-                    try:
-                        await embed_message.edit(embed=embed_obj)
-                    except discord.NotFound:
-                        embed_message = await ch.send(embed=embed_obj)
+            if SHOW_DEBUG and new_count:
+                print(f"[gamelogs_autopost] +{new_count} new lines buffered")
 
-                last_embed_update = time.time()
+            await asyncio.sleep(max(1.0, POLL_SECONDS))
 
         except Exception as e:
             print(f"[gamelogs_autopost] loop error: {e}")
-
-        await asyncio.sleep(GAMELOGS_POLL_SECONDS)
+            await asyncio.sleep(3)
