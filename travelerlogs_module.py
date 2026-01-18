@@ -1,572 +1,386 @@
 # travelerlogs_module.py
-# Button-only Traveler Logs:
-# - Posts a persistent "🖋️ Write Log" button message that is ALWAYS the newest message in the channel
-#   (by re-posting itself after each log) so it sits at the bottom under the latest log.
-# - Button opens a Modal (Title + Log)
-# - Log posts as an embed with auto Year/Day pulled from time_module
-# - Each posted log embed includes an "✏️ Edit Log" button (author-only) which opens a modal to edit.
-# - Optional lock: delete normal text messages in a specific CATEGORY so only bot logs appear.
-#
-# ENV (optional):
-#   TRAVELERLOGS_LOCK_CATEGORY_ID=1434615650890023133   # if set, delete normal user messages in that category
-#   TRAVELERLOGS_CONTROL_MESSAGE_TEXT="Tap to write a Traveler Log"
-#   TRAVELERLOGS_MAX_LOG_CHARS=3500
-#   TRAVELERLOGS_MAX_TITLE_CHARS=120
-#   TRAVELERLOGS_ALLOW_EDIT_MINUTES=0   # 0 = unlimited, otherwise limit edits
-#
-# In main.py:
-#   import travelerlogs_module
-#   travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)   # registers /writelog fallback (optional)
-#   (and in on_ready, call travelerlogs_module.ensure_controls_in_category(client) OR per-channel)
-#   In on_message: await travelerlogs_module.enforce_travelerlog_lock(message)
-#
-# If you want FULL button-only (no slash command), you can ignore the setup_travelerlog_commands entirely.
+# Traveler logs with automatic Year/Day pulled LIVE from time_module
+# + Button-only "Write Log" pinned at bottom
+# + Edit button on each log (only author can edit)
+# + Category lock enforcement (delete normal text)
 
 import os
 import time
-import json
 import asyncio
-from typing import Optional, Tuple, Dict, Any, Set
+from typing import Optional, Tuple, Dict
 
 import discord
 from discord import app_commands
 
-import time_module  # must expose get_time_state() or compatible helper
+import time_module  # uses time_module._calc_now() for LIVE year/day
+
 
 # =====================
 # CONFIG
 # =====================
 TRAVELERLOG_EMBED_COLOR = 0x8B5CF6  # purple
-CONTROL_EMBED_COLOR = 0x2F3136
-
 TRAVELERLOG_TITLE = "📖 Traveler Log"
 
-LOCK_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_LOCK_CATEGORY_ID", "0")) or None
+# Lock enforcement: delete normal user text in this category
+LOCK_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_LOCK_CATEGORY_ID", "0"))  # set this env var
 
-CONTROL_MESSAGE_TEXT = os.getenv(
-    "TRAVELERLOGS_CONTROL_MESSAGE_TEXT",
-    "Tap the button below to write a Traveler Log."
-)
-
-MAX_LOG_CHARS = int(os.getenv("TRAVELERLOGS_MAX_LOG_CHARS", "3500"))
-MAX_TITLE_CHARS = int(os.getenv("TRAVELERLOGS_MAX_TITLE_CHARS", "120"))
-ALLOW_EDIT_MINUTES = int(os.getenv("TRAVELERLOGS_ALLOW_EDIT_MINUTES", "0"))  # 0 = unlimited
-
-DATA_DIR = os.getenv("TRAVELERLOGS_DATA_DIR", "/data")
-STATE_FILE = os.getenv("TRAVELERLOGS_STATE_FILE", os.path.join(DATA_DIR, "travelerlogs_state.json"))
+# Controls message (Write Log button) text
+CONTROLS_TITLE = "🖋️ Write a Traveler Log"
+CONTROLS_DESC = "Tap the button below to write a Traveler Log.\n\n**Tap the button • A form will open**"
 
 # Custom IDs
-CID_OPEN_MODAL = "travlog:open_modal"
-CID_EDIT_BTN_PREFIX = "travlog:edit:"  # + message_id
+CID_WRITE = "travlog:write"
+CID_EDIT_PREFIX = "travlog:edit:"  # + message_id
 
-# =====================
-# STATE
-# =====================
-_state: Dict[str, Any] = {
-    # channel_id -> control_message_id
-    "control_by_channel": {},
-    # posted_message_id -> {author_id, channel_id, created_ts}
-    "posts": {},
-}
-
-_loaded = False
-_state_lock = asyncio.Lock()
+# Store who owns which log message (so only author can edit)
+# message_id -> author_id
+_LOG_OWNERS: Dict[int, int] = {}
 
 
 # =====================
-# STATE FILE HELPERS
+# TIME PULL (FIXED)
 # =====================
-def _ensure_dir(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-
-def _load_state():
-    global _loaded, _state
-    if _loaded:
-        return
-    _ensure_dir(STATE_FILE)
+def _get_current_year_day() -> Tuple[int, int]:
+    """
+    Best-effort: pull Year/Day from the *live* time system.
+    Priority:
+      1) time_module._calc_now() (live computed time)
+      2) time_module._state / time_module.load_state() (anchor)
+      3) fallback (1,1)
+    """
+    # 1) Live computed time
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                # merge safely
-                _state["control_by_channel"] = data.get("control_by_channel", {}) or {}
-                _state["posts"] = data.get("posts", {}) or {}
-    except Exception:
-        pass
-    _loaded = True
-
-
-def _save_state():
-    try:
-        _ensure_dir(STATE_FILE)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_state, f)
+        calc = getattr(time_module, "_calc_now", None)
+        if callable(calc):
+            res = calc()
+            # expected: (minute_of_day, day, year, seconds_into_minute)
+            if res and len(res) >= 3:
+                day = int(res[1])
+                year = int(res[2])
+                if year > 0 and day > 0:
+                    return year, day
     except Exception:
         pass
 
-
-# =====================
-# TIME HELPERS
-# =====================
-def _get_current_day_year() -> Tuple[int, int]:
-    """
-    Pull current Year + Day from the time system.
-    Falls back safely if time isn't initialised yet.
-    """
+    # 2) Anchor state if available
     try:
-        # You already had this in your earlier module; keep same expectation.
-        st = time_module.get_time_state()
-        year = int(st.get("year", 1))
-        day = int(st.get("day", 1))
-        return year, day
+        # Ensure state loaded if module supports it
+        if getattr(time_module, "_state", None) is None:
+            loader = getattr(time_module, "load_state", None)
+            if callable(loader):
+                loader()
+
+        st = getattr(time_module, "_state", None)
+        if isinstance(st, dict):
+            year = int(st.get("year", 1))
+            day = int(st.get("day", 1))
+            if year > 0 and day > 0:
+                return year, day
     except Exception:
-        return 1, 1
+        pass
+
+    return 1, 1
 
 
 # =====================
 # EMBED BUILDERS
 # =====================
-def _build_control_embed() -> discord.Embed:
-    e = discord.Embed(
-        title="🖋️ Write a Traveler Log",
-        description=CONTROL_MESSAGE_TEXT,
-        color=CONTROL_EMBED_COLOR,
-    )
-    e.set_footer(text="Tap the button • A form will open")
-    return e
+def _build_log_embed(author_name: str, title: str, entry: str) -> discord.Embed:
+    year, day = _get_current_year_day()
 
-
-def _build_log_embed(author_name: str, year: int, day: int, title: str, entry: str) -> discord.Embed:
     embed = discord.Embed(
         title=TRAVELERLOG_TITLE,
         color=TRAVELERLOG_EMBED_COLOR,
     )
+
     embed.add_field(
         name="🗓️ Solunaris Time",
         value=f"**Year {year} • Day {day}**",
         inline=False,
     )
-    # Keep title separate so it stands out
-    embed.add_field(
-        name=title.strip()[:MAX_TITLE_CHARS] if title.strip() else "Untitled",
-        value=entry.strip()[:MAX_LOG_CHARS] if entry.strip() else "*No content*",
-        inline=False,
-    )
+
+    # Title + body
+    if title.strip():
+        embed.add_field(name=title.strip(), value=entry or " ", inline=False)
+    else:
+        embed.add_field(name="Entry", value=entry or " ", inline=False)
+
     embed.set_footer(text=f"Logged by {author_name}")
     return embed
 
 
-def _build_control_view() -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(
-        label="🖋️ Write Log",
-        style=discord.ButtonStyle.primary,
-        custom_id=CID_OPEN_MODAL
-    ))
-    return view
-
-
-def _build_edit_view(message_id: int) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(
-        label="✏️ Edit Log",
-        style=discord.ButtonStyle.secondary,
-        custom_id=f"{CID_EDIT_BTN_PREFIX}{message_id}"
-    ))
-    return view
+def _build_controls_embed() -> discord.Embed:
+    return discord.Embed(
+        title=CONTROLS_TITLE,
+        description=CONTROLS_DESC,
+        color=0x2F3136,
+    )
 
 
 # =====================
-# CONTROL MESSAGE MANAGEMENT
+# DISCORD UI (Views/Modals)
 # =====================
-async def _delete_message_safe(msg: discord.Message):
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
+    log_title = discord.ui.TextInput(
+        label="Title",
+        placeholder="Short title for your log entry",
+        required=True,
+        max_length=100,
+    )
+    entry = discord.ui.TextInput(
+        label="Log",
+        placeholder="Write your log here...",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
 
-
-async def _ensure_control_message(channel: discord.TextChannel) -> Optional[int]:
-    """
-    Ensure a single control message exists for this channel.
-    Returns its message_id.
-    """
-    _load_state()
-    async with _state_lock:
-        stored_id = _state["control_by_channel"].get(str(channel.id))
-
-    # If we have an ID, verify it exists
-    if stored_id:
-        try:
-            msg = await channel.fetch_message(int(stored_id))
-            # Ensure it has the view (Discord may drop components on old messages in rare cases)
-            try:
-                await msg.edit(embed=_build_control_embed(), view=_build_control_view())
-            except Exception:
-                pass
-            return int(stored_id)
-        except Exception:
-            # message missing => recreate
-            pass
-
-    # Create new control message
-    try:
-        msg = await channel.send(embed=_build_control_embed(), view=_build_control_view())
-    except Exception:
-        return None
-
-    async with _state_lock:
-        _state["control_by_channel"][str(channel.id)] = str(msg.id)
-        _save_state()
-
-    return msg.id
-
-
-async def bump_control_to_bottom(channel: discord.TextChannel):
-    """
-    Make the control message the newest message in channel by deleting and re-posting it.
-    This keeps the button ALWAYS at the bottom under the most recent log.
-    """
-    _load_state()
-    async with _state_lock:
-        stored_id = _state["control_by_channel"].get(str(channel.id))
-
-    # Delete old if exists
-    if stored_id:
-        try:
-            old = await channel.fetch_message(int(stored_id))
-            await _delete_message_safe(old)
-        except Exception:
-            pass
-
-    # Recreate
-    new_id = await _ensure_control_message(channel)
-    if new_id is None:
-        return
-
-    # Pin it (optional). You asked "pinned to the bottom" — pin is independent of bottom,
-    # but we can pin for visibility AND keep it bottom by bumping.
-    try:
-        msg = await channel.fetch_message(int(new_id))
-        await msg.pin(reason="Traveler Logs control button")
-    except Exception:
-        pass
-
-
-async def ensure_controls_in_category(client: discord.Client, category_id: int):
-    """
-    OPTIONAL helper: ensure every text channel in a category has a control message.
-    Call this once in on_ready after the bot is logged in.
-    """
-    guilds = client.guilds
-    if not guilds:
-        return
-
-    for g in guilds:
-        cat = g.get_channel(category_id)
-        if cat and isinstance(cat, discord.CategoryChannel):
-            for ch in cat.text_channels:
-                await _ensure_control_message(ch)
-
-
-# =====================
-# INTERACTION HANDLERS (Buttons + Modals)
-# =====================
-class TravelerLogCreateModal(discord.ui.Modal):
     def __init__(self):
-        super().__init__(title="Write Traveler Log")
-
-        self.log_title = discord.ui.TextInput(
-            label="Title",
-            placeholder="A short title for your log",
-            required=True,
-            max_length=MAX_TITLE_CHARS,
-        )
-        self.log_entry = discord.ui.TextInput(
-            label="Log",
-            placeholder="Write your log here…",
-            style=discord.TextStyle.paragraph,
-            required=True,
-            max_length=MAX_LOG_CHARS,
-        )
-        self.add_item(self.log_title)
-        self.add_item(self.log_entry)
+        super().__init__(timeout=600)
 
     async def on_submit(self, interaction: discord.Interaction):
-        year, day = _get_current_day_year()
-
         embed = _build_log_embed(
             author_name=interaction.user.display_name,
-            year=year,
-            day=day,
-            title=str(self.log_title.value),
-            entry=str(self.log_entry.value),
+            title=str(self.log_title),
+            entry=str(self.entry),
         )
 
-        # Post the log embed
-        msg = await interaction.channel.send(embed=embed)
-        # Add edit button
-        try:
-            await msg.edit(view=_build_edit_view(msg.id))
-        except Exception:
-            pass
+        # Per-log Edit button
+        view = discord.ui.View(timeout=None)
+        btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Edit Log",
+            emoji="✏️",
+            custom_id=f"{CID_EDIT_PREFIX}PENDING",  # replaced after send
+        )
+        view.add_item(btn)
 
-        # Store authorship
-        _load_state()
-        async with _state_lock:
-            _state["posts"][str(msg.id)] = {
-                "author_id": str(interaction.user.id),
-                "channel_id": str(interaction.channel.id),
-                "created_ts": time.time(),
-            }
-            # Keep posts map from growing forever (basic cap)
-            if len(_state["posts"]) > 5000:
-                # drop oldest ~1000
-                items = list(_state["posts"].items())
-                items.sort(key=lambda kv: float(kv[1].get("created_ts", 0)))
-                for k, _v in items[:1000]:
-                    _state["posts"].pop(k, None)
-            _save_state()
+        msg = await interaction.channel.send(embed=embed, view=view)
 
-        # Bump control message so it's always the newest message
+        # Track ownership + update edit button custom_id to include message_id
+        _LOG_OWNERS[msg.id] = interaction.user.id
+        view2 = discord.ui.View(timeout=None)
+        btn2 = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Edit Log",
+            emoji="✏️",
+            custom_id=f"{CID_EDIT_PREFIX}{msg.id}",
+        )
+        view2.add_item(btn2)
         try:
-            await bump_control_to_bottom(interaction.channel)
+            await msg.edit(view=view2)
         except Exception:
             pass
 
         await interaction.response.send_message("✅ Traveler log recorded.", ephemeral=True)
 
 
-class TravelerLogEditModal(discord.ui.Modal):
-    def __init__(self, target_message_id: int, existing_title: str, existing_body: str):
-        super().__init__(title="Edit Traveler Log")
-        self.target_message_id = target_message_id
+class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
+    new_title = discord.ui.TextInput(
+        label="Title",
+        placeholder="Update title",
+        required=True,
+        max_length=100,
+    )
+    new_entry = discord.ui.TextInput(
+        label="Log",
+        placeholder="Update log text",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
 
-        self.log_title = discord.ui.TextInput(
-            label="Title",
-            required=True,
-            max_length=MAX_TITLE_CHARS,
-            default=existing_title[:MAX_TITLE_CHARS] if existing_title else "",
-        )
-        self.log_entry = discord.ui.TextInput(
-            label="Log",
-            style=discord.TextStyle.paragraph,
-            required=True,
-            max_length=MAX_LOG_CHARS,
-            default=existing_body[:MAX_LOG_CHARS] if existing_body else "",
-        )
-        self.add_item(self.log_title)
-        self.add_item(self.log_entry)
+    def __init__(self, message: discord.Message):
+        super().__init__(timeout=600)
+        self._message = message
 
-    async def on_submit(self, interaction: discord.Interaction):
-        # Rebuild embed with current time stamp (year/day always current OR keep original?)
-        # You asked it to be auto-stamped from time system; for edits we will KEEP the original stamp
-        # if we can read it, otherwise use current.
-        channel = interaction.channel
+        # Pre-fill from existing embed if possible
         try:
-            msg = await channel.fetch_message(int(self.target_message_id))
-        except Exception:
-            await interaction.response.send_message("❌ Could not find that log message.", ephemeral=True)
-            return
-
-        # Try to read existing Year/Day from embed field 0, else use current
-        year, day = _get_current_day_year()
-        try:
-            if msg.embeds:
-                emb0 = msg.embeds[0]
-                for f in getattr(emb0, "fields", []):
-                    if "Solunaris Time" in (f.name or ""):
-                        # f.value like "**Year 2 • Day 329**"
-                        import re
-                        m = re.search(r"Year\s+(\d+).*Day\s+(\d+)", f.value or "")
-                        if m:
-                            year = int(m.group(1))
-                            day = int(m.group(2))
-                        break
+            emb = message.embeds[0] if message.embeds else None
+            if emb and emb.fields:
+                # fields[0] = Solunaris Time
+                # fields[1] = Title/Entry
+                if len(emb.fields) >= 2:
+                    self.new_title.default = emb.fields[1].name or "Entry"
+                    self.new_entry.default = emb.fields[1].value or ""
         except Exception:
             pass
 
-        new_embed = _build_log_embed(
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = _build_log_embed(
             author_name=interaction.user.display_name,
-            year=year,
-            day=day,
-            title=str(self.log_title.value),
-            entry=str(self.log_entry.value),
+            title=str(self.new_title),
+            entry=str(self.new_entry),
         )
 
-        try:
-            await msg.edit(embed=new_embed, view=_build_edit_view(msg.id))
-        except Exception:
-            await interaction.response.send_message("❌ I couldn't edit that message (missing permissions?).", ephemeral=True)
-            return
+        # Keep the edit button
+        view = discord.ui.View(timeout=None)
+        view.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.secondary,
+                label="Edit Log",
+                emoji="✏️",
+                custom_id=f"{CID_EDIT_PREFIX}{self._message.id}",
+            )
+        )
 
+        await self._message.edit(embed=embed, view=view)
         await interaction.response.send_message("✅ Log updated.", ephemeral=True)
 
 
-async def _handle_open_modal(interaction: discord.Interaction):
-    await interaction.response.send_modal(TravelerLogCreateModal())
+class ControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.primary,
+                label="Write Log",
+                emoji="🖋️",
+                custom_id=CID_WRITE,
+            )
+        )
 
 
-async def _handle_edit_button(interaction: discord.Interaction, target_message_id: int):
-    _load_state()
-    post = _state["posts"].get(str(target_message_id))
-
-    # If we don't have state, we can still try to allow edit only if user is author by reading footer name is unreliable.
-    if not post:
-        await interaction.response.send_message("❌ I can't verify ownership for this log (state missing).", ephemeral=True)
-        return
-
-    author_id = int(post.get("author_id", "0") or 0)
-    created_ts = float(post.get("created_ts", 0) or 0)
-
-    if interaction.user.id != author_id:
-        await interaction.response.send_message("❌ Only the original author can edit this log.", ephemeral=True)
-        return
-
-    if ALLOW_EDIT_MINUTES > 0:
-        if time.time() - created_ts > (ALLOW_EDIT_MINUTES * 60):
-            await interaction.response.send_message("❌ Editing window has expired for this log.", ephemeral=True)
-            return
-
-    # Fetch message to prefill
+# =====================
+# PUBLIC API used by main.py
+# =====================
+def register_persistent_views(client: discord.Client):
+    # So the button keeps working after restarts
     try:
-        msg = await interaction.channel.fetch_message(int(target_message_id))
-    except Exception:
-        await interaction.response.send_message("❌ Could not find that log message.", ephemeral=True)
-        return
-
-    existing_title = ""
-    existing_body = ""
-    try:
-        if msg.embeds:
-            emb = msg.embeds[0]
-            # fields[1] is title/body (as created)
-            if len(emb.fields) >= 2:
-                existing_title = emb.fields[1].name or ""
-                existing_body = emb.fields[1].value or ""
+        client.add_view(ControlsView())
     except Exception:
         pass
 
-    await interaction.response.send_modal(
-        TravelerLogEditModal(target_message_id, existing_title, existing_body)
-    )
 
-
-# =====================
-# PUBLIC: register persistent views + optional slash
-# =====================
-def register_persistent_views(client: discord.Client):
+async def ensure_controls_in_category(client: discord.Client, category_id: int):
     """
-    Call this ONCE (in on_ready) so buttons keep working after restarts.
+    Ensures each text channel in the category has a pinned "Write Log" controls message
+    as the newest message (re-posted on restart if needed).
     """
-    # Control view
-    client.add_view(_build_control_view())
+    if not category_id:
+        return
 
-    # Edit view is message-id specific; but Discord requires exact custom_id matching
-    # We can register a dummy view with a dynamic handler by using on_interaction below instead.
-    # So no add_view() for edit buttons here.
+    category = client.get_channel(int(category_id))
+    if category is None:
+        try:
+            category = await client.fetch_channel(int(category_id))
+        except Exception:
+            return
+
+    if not isinstance(category, discord.CategoryChannel):
+        return
+
+    for ch in category.text_channels:
+        try:
+            # Look for recent bot controls message
+            found = False
+            async for m in ch.history(limit=30):
+                if m.author.bot and m.embeds:
+                    if m.embeds[0].title == CONTROLS_TITLE:
+                        found = True
+                        # ensure pinned
+                        try:
+                            if not m.pinned:
+                                await m.pin(reason="Traveler Log controls")
+                        except Exception:
+                            pass
+                        break
+
+            if not found:
+                msg = await ch.send(embed=_build_controls_embed(), view=ControlsView())
+                try:
+                    await msg.pin(reason="Traveler Log controls")
+                except Exception:
+                    pass
+        except Exception:
+            continue
 
 
 def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int):
     """
-    OPTIONAL fallback /writelog (in case you ever want it).
-    Button-only usage does not require this at all.
+    Optional fallback command (still useful on desktop).
+    Button-only flow works without this.
     """
-    guild_obj = discord.Object(id=int(guild_id))
+    @tree.command(
+        name="writelog",
+        description="Write a traveler log (auto-stamped with current Year & Day)",
+        guild=discord.Object(id=guild_id),
+    )
+    @app_commands.describe(title="Short title for your log entry", entry="The log text")
+    async def writelog(interaction: discord.Interaction, title: str, entry: str):
+        await interaction.response.send_modal(WriteLogModal())
 
-    @tree.command(name="writelog", guild=guild_obj, description="Write a traveler log (opens form)")
-    async def writelog_cmd(i: discord.Interaction):
-        await i.response.send_modal(TravelerLogCreateModal())
 
-
-# =====================
-# PUBLIC: interaction router (call from main.on_interaction)
-# =====================
 async def handle_interaction(interaction: discord.Interaction):
     """
-    Route our button interactions.
-    Must be called from main.py via client.event on_interaction.
+    Called by main.py on_interaction to handle Write/Edit button presses.
     """
-    try:
-        if not interaction.type == discord.InteractionType.component:
-            return
-        data = interaction.data or {}
-        cid = data.get("custom_id")
-        if not cid:
+    if interaction.type != discord.InteractionType.component:
+        return
+
+    cid = interaction.data.get("custom_id") if interaction.data else None
+    if not cid:
+        return
+
+    if cid == CID_WRITE:
+        await interaction.response.send_modal(WriteLogModal())
+        return
+
+    if cid.startswith(CID_EDIT_PREFIX):
+        # Parse message_id
+        try:
+            mid_str = cid[len(CID_EDIT_PREFIX):]
+            msg_id = int(mid_str)
+        except Exception:
+            await interaction.response.send_message("❌ Invalid edit reference.", ephemeral=True)
             return
 
-        if cid == CID_OPEN_MODAL:
-            await _handle_open_modal(interaction)
+        # Ownership check
+        owner_id = _LOG_OWNERS.get(msg_id)
+        if owner_id is not None and owner_id != interaction.user.id:
+            await interaction.response.send_message("❌ Only the original author can edit this log.", ephemeral=True)
             return
 
-        if cid.startswith(CID_EDIT_BTN_PREFIX):
-            mid_str = cid.split(CID_EDIT_BTN_PREFIX, 1)[1]
+        # Fetch message
+        try:
+            msg = await interaction.channel.fetch_message(msg_id)
+        except Exception:
+            await interaction.response.send_message("❌ Could not find that log message.", ephemeral=True)
+            return
+
+        # If not tracked (restart), allow only if footer matches the user display name (best-effort)
+        if owner_id is None:
             try:
-                mid = int(mid_str)
+                emb = msg.embeds[0] if msg.embeds else None
+                if emb and emb.footer and emb.footer.text:
+                    if interaction.user.display_name not in emb.footer.text:
+                        await interaction.response.send_message("❌ Only the original author can edit this log.", ephemeral=True)
+                        return
             except Exception:
-                await interaction.response.send_message("❌ Invalid edit target.", ephemeral=True)
-                return
-            await _handle_edit_button(interaction, mid)
-            return
-    except Exception:
-        # never crash the bot on interactions
+                pass
+            _LOG_OWNERS[msg_id] = interaction.user.id
+
+        await interaction.response.send_modal(EditLogModal(msg))
         return
 
 
-# =====================
-# PUBLIC: lock enforcement (call from main.on_message)
-# =====================
 async def enforce_travelerlog_lock(message: discord.Message):
     """
-    Deletes normal user text messages inside the configured CATEGORY.
-    This allows channels to remain clean while still allowing button interactions.
+    Deletes normal text messages in the locked category.
+    Users can still use the button (and slash commands).
     """
     if message.author.bot:
         return
 
-    if LOCK_CATEGORY_ID is None:
-        return
-
-    try:
-        if not isinstance(message.channel, discord.TextChannel):
+    if LOCK_CATEGORY_ID and getattr(message.channel, "category_id", None) == LOCK_CATEGORY_ID:
+        # Allow slash commands (they may appear as "/" messages in some clients)
+        if message.content and message.content.startswith("/"):
             return
-        if not message.channel.category or message.channel.category.id != LOCK_CATEGORY_ID:
-            return
-    except Exception:
-        return
 
-    # Allow messages that are just system interaction notices? (ignore)
-    # We only delete normal user messages.
-    try:
-        await message.delete()
-    except discord.Forbidden:
-        pass
-    except Exception:
-        pass
-
-
-# =====================
-# PUBLIC: ensure control exists in a channel (call from main.on_ready)
-# =====================
-async def ensure_control_in_channel(client: discord.Client, channel_id: int):
-    ch = client.get_channel(int(channel_id))
-    if ch is None:
+        # Otherwise delete
         try:
-            ch = await client.fetch_channel(int(channel_id))
+            await message.delete()
+        except discord.Forbidden:
+            pass
         except Exception:
-            ch = None
-    if ch is None or not isinstance(ch, discord.TextChannel):
-        return
-    await _ensure_control_message(ch)
-    # Optional: pin it (and keep bottom via bumping)
-    try:
-        msg_id = _state["control_by_channel"].get(str(ch.id))
-        if msg_id:
-            msg = await ch.fetch_message(int(msg_id))
-            await msg.pin(reason="Traveler Logs control button")
-    except Exception:
-        pass
+            pass
