@@ -148,7 +148,7 @@ async def on_ready():
 
     # ✅ Traveler logs: /writelog (auto stamps Year/Day from time system)
     # NOTE: your module uses the singular function name:
-    travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, client)
+    travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
 
     await tree.sync(guild=guild_obj)
 
