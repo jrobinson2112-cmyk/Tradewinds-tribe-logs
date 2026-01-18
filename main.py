@@ -16,9 +16,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-# Webhooks (time + players) used by your webhook-upsert system
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")                  # time webhook
-PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")  # players webhook
+# Webhooks (time + players) used by the webhook-upsert system
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")                   # time webhook
+PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")   # players webhook
 
 # ---- Discord client / intents ----
 intents = discord.Intents.default()
@@ -98,6 +98,7 @@ async def webhook_upsert(*args, **kwargs):
 
 def _get_rcon_command():
     """
+    Your project already exposes an RCON function somewhere.
     Historically you've had tribelogs_module.rcon_command.
     """
     return getattr(tribelogs_module, "rcon_command", None)
@@ -115,8 +116,13 @@ async def _start_task_maybe(func, *args):
         if asyncio.iscoroutine(res):
             asyncio.create_task(res)
         elif isinstance(res, asyncio.Task):
+            # already scheduled
+            pass
+        else:
+            # sync loop starter or None
             pass
     except TypeError:
+        # If signature mismatch, try calling with no args
         res = func()
         if asyncio.iscoroutine(res):
             asyncio.create_task(res)
@@ -135,7 +141,7 @@ async def on_ready():
     except TypeError:
         tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
 
-    # Time commands (time_module requires webhook_upsert)
+    # Time commands (IMPORTANT: always pass webhook_upsert, because time_module requires it)
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is None:
         print("⚠️ WARNING: rcon_command not found. Time/Crosschat may not function correctly.")
@@ -172,14 +178,23 @@ async def on_ready():
     # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat loop
-    # IMPORTANT: do NOT add any on_message handler in main.py.
-    # crosschat_module installs its own discord->game relay internally.
+    # Crosschat loop (GetChat polling on all maps)
     if rcon_cmd is not None:
         asyncio.create_task(crosschat_module.run_crosschat_loop(client, rcon_cmd))
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
     print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    """
+    Needed for Discord -> in-game chat relay.
+    """
+    try:
+        await crosschat_module.on_discord_message(message)
+    except Exception as e:
+        print(f"[crosschat] on_message error: {e}")
 
 
 client.run(DISCORD_TOKEN)
