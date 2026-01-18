@@ -146,31 +146,20 @@ async def on_ready():
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # ✅ Traveler logs: /writelog (auto stamps Year/Day by reading the time embed in TIME_CHANNEL_ID)
-    # IMPORTANT: travelerlogs_module needs the discord client passed in so it can read the channel history
-    travelerlogs_module.setup_travelerlogs_commands(tree, GUILD_ID, client)
+    # ✅ Traveler logs: /writelog (auto stamps Year/Day from time system)
+    # NOTE: your module uses the singular function name:
+    travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, client)
 
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-
-    # Tribe logs
     await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
-
-    # Time loop
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
-
-    # Players loop
     await _start_task_maybe(players_module.run_players_loop)
-
-    # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat + GameLogs
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
-
-        # Game logs automatic poster
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
@@ -180,23 +169,20 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     """
-    - Optional traveler log lock enforcement (if your travelerlogs_module exposes it)
+    - Traveler log lock enforcement (if your module has it)
     - Relays Discord -> in-game chat (crosschat)
     """
-    # Traveler logs lock enforcement (only if your module has it)
     if hasattr(travelerlogs_module, "enforce_travelerlog_lock"):
         try:
             await travelerlogs_module.enforce_travelerlog_lock(message)
         except Exception as e:
             print(f"[travelerlogs] enforce error: {e}")
 
-    # Crosschat relay
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is not None:
         try:
             await crosschat_module.on_discord_message(message, rcon_cmd)
         except TypeError:
-            # if module signature is on_discord_message(message) only
             await crosschat_module.on_discord_message(message)
         except Exception as e:
             print(f"[crosschat] on_message error: {e}")
