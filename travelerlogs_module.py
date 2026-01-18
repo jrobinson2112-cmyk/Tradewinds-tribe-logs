@@ -21,12 +21,21 @@ from discord import app_commands
 
 import time_module  # pulls current Solunaris time
 
+ADMIN_ROLE_ID = 1439069787207766076
+
 # --- MANUAL PANEL POSTING (admin-only) --------------------------------------
 
 def _is_admin(interaction: discord.Interaction) -> bool:
-    # "Administrator" permission is the simplest reliable check
-    return bool(getattr(interaction.user.guild_permissions, "administrator", False))
-
+    """
+    Allow users with the configured admin role ID
+    """
+    try:
+        for role in interaction.user.roles:
+            if role.id == ADMIN_ROLE_ID:
+                return True
+        return False
+    except Exception:
+        return False
 
 async def post_write_panel_to_channel(channel: discord.TextChannel) -> bool:
     """
