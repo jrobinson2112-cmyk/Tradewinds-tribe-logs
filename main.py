@@ -3,13 +3,15 @@ import asyncio
 import discord
 from discord import app_commands
 import aiohttp
+import inspect
+import contextlib
+import io
 
 import tribelogs_module
 import time_module
 import players_module
 import vcstatus_module
 import crosschat_module
-import travelerlogs_module  # <-- ADD THIS
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -105,93 +107,118 @@ def _get_rcon_command():
     return getattr(tribelogs_module, "rcon_command", None)
 
 
-async def _start_task_maybe(func, *args):
+def _call_signature_aware(func, *args):
     """
-    Accepts:
-      - async function returning coroutine
-      - sync function returning coroutine/task/None
-    Ensures it gets scheduled safely.
+    Calls func with only the number of args it accepts.
+    Works for both sync and async callables.
     """
+    if func is None:
+        return None
+
     try:
-        res = func(*args)
-        if asyncio.iscoroutine(res):
-            asyncio.create_task(res)
-        elif isinstance(res, asyncio.Task):
-            # already scheduled
-            pass
-        else:
-            # sync loop starter or None
-            pass
-    except TypeError:
-        # If signature mismatch, try calling with no args
-        res = func()
-        if asyncio.iscoroutine(res):
-            asyncio.create_task(res)
-        elif isinstance(res, asyncio.Task):
-            pass
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+
+        accepted = 0
+        for p in params:
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                accepted += 1
+            elif p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                accepted = len(args)  # accepts anything
+                break
+
+        use_args = args[:accepted]
+        return func(*use_args)
+    except Exception:
+        # fall back: try raw call
+        return func(*args)
+
+
+async def _start_task(func, *args):
+    """
+    Runs func(*args), schedules if coroutine.
+    """
+    res = _call_signature_aware(func, *args)
+    if asyncio.iscoroutine(res):
+        asyncio.create_task(res)
+    elif isinstance(res, asyncio.Task):
+        pass
+
+
+# ---- prevent tribelog spam by filtering repeated "Tribe routes loaded" prints ----
+_last_routes_line = None
+
+
+def _filtered_print(line: str):
+    global _last_routes_line
+    if line.strip().startswith("Tribe routes loaded:"):
+        if line == _last_routes_line:
+            return
+        _last_routes_line = line
+    print(line)
+
+
+async def _start_task_filtered_stdout(func, *args):
+    """
+    Starts a task while capturing stdout from the initial call so we can filter spam.
+    (Does not modify the module; just prevents Railway log flooding.)
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = _call_signature_aware(func, *args)
+
+    captured = buf.getvalue().splitlines()
+    for line in captured:
+        if line.strip():
+            _filtered_print(line)
+
+    if asyncio.iscoroutine(res):
+        asyncio.create_task(res)
+    elif isinstance(res, asyncio.Task):
+        pass
 
 
 @client.event
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # ---- Register commands (MUST be before sync) ----
+    # ---- Register commands ----
+    _call_signature_aware(tribelogs_module.setup_tribelog_commands, tree, GUILD_ID, ADMIN_ROLE_ID)
 
-    # Tribe logs commands
-    try:
-        tribelogs_module.setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
-    except TypeError:
-        tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
-
-    # Time commands (your time_module expects webhook_upsert)
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is None:
         print("⚠️ WARNING: rcon_command not found. Time/Crosschat may not function correctly.")
 
-    time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
+    # Time commands expects webhook_upsert in your current setup
+    _call_signature_aware(time_module.setup_time_commands, tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # Traveler Logs (/writelog) - NOT admin locked
-    # (travelerlogs_module should handle its own channel restriction internally)
-    try:
-        travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
-    except AttributeError:
-        # If you named it differently in the module, try common alternatives
-        travelerlogs_module.setup_commands(tree, GUILD_ID)
-
-    # ---- Sync to guild ----
-    synced = await tree.sync(guild=guild_obj)
+    await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-
-    # Tribe logs loop
-    await _start_task_maybe(tribelogs_module.run_tribelogs_loop, client)
+    # Tribe logs loop (filtered stdout so you don’t get spam)
+    await _start_task_filtered_stdout(tribelogs_module.run_tribelogs_loop, client)
 
     # Time loop
-    asyncio.create_task(time_module.run_time_loop(client, rcon_cmd, webhook_upsert))
+    await _start_task(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
 
     # Players loop
-    await _start_task_maybe(players_module.run_players_loop, client)
+    await _start_task(players_module.run_players_loop, client)
 
     # VC status loop
-    await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
+    await _start_task(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat loop
-    if rcon_cmd is not None:
-        # Some versions expect only (client); others (client, rcon_cmd)
-        try:
-            asyncio.create_task(crosschat_module.run_crosschat_loop(client, rcon_cmd))
-        except TypeError:
-            asyncio.create_task(crosschat_module.run_crosschat_loop(client))
+    # Crosschat loop (signature-aware: works if module wants (client) OR (client, rcon_cmd))
+    await _start_task(crosschat_module.run_crosschat_loop, client, rcon_cmd)
 
-    print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID} ({len(synced)} commands)")
-    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, travelerlogs")
+    print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
+    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat")
 
 
 @client.event
 async def on_message(message: discord.Message):
     """
-    Needed for Discord -> in-game chat relay.
-    We only call the handler if it exists in the crosschat module.
+    Discord -> in-game relay.
+    Fixes signature mismatch by calling on_discord_message with the args it supports.
     """
     if message.author.bot:
         return
@@ -201,11 +228,10 @@ async def on_message(message: discord.Message):
         return
 
     rcon_cmd = _get_rcon_command()
-    if rcon_cmd is None:
-        return
-
     try:
-        await handler(message, rcon_cmd)
+        res = _call_signature_aware(handler, message, rcon_cmd)
+        if asyncio.iscoroutine(res):
+            await res
     except Exception as e:
         print(f"[crosschat] on_message error: {e}")
 
