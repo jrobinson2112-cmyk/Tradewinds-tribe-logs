@@ -16,7 +16,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-# Webhooks (time + players) used by the webhook-upsert system
+# Webhooks (time + players) used by your webhook-upsert system
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                   # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")   # players webhook
 
@@ -122,12 +122,15 @@ async def _start_task_maybe(func, *args):
             # sync loop starter or None
             pass
     except TypeError:
-        # If signature mismatch, try calling with no args
-        res = func()
-        if asyncio.iscoroutine(res):
-            asyncio.create_task(res)
-        elif isinstance(res, asyncio.Task):
-            pass
+        # If signature mismatch, try calling with fewer args then none
+        try:
+            res = func()
+            if asyncio.iscoroutine(res):
+                asyncio.create_task(res)
+            elif isinstance(res, asyncio.Task):
+                pass
+        except Exception:
+            raise
 
 
 @client.event
@@ -178,9 +181,21 @@ async def on_ready():
     # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    # Crosschat loop (GetChat polling on all maps)
-    if rcon_cmd is not None:
-        asyncio.create_task(crosschat_module.run_crosschat_loop(client, rcon_cmd))
+    # Crosschat loop (support BOTH signatures: (client, rcon_cmd) OR (client))
+    try:
+        if rcon_cmd is not None:
+            res = crosschat_module.run_crosschat_loop(client, rcon_cmd)
+        else:
+            res = crosschat_module.run_crosschat_loop(client)
+    except TypeError:
+        # module only accepts 1 arg
+        res = crosschat_module.run_crosschat_loop(client)
+
+    # schedule if coroutine / task
+    if asyncio.iscoroutine(res):
+        asyncio.create_task(res)
+    elif isinstance(res, asyncio.Task):
+        pass
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
     print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat")
@@ -190,9 +205,24 @@ async def on_ready():
 async def on_message(message: discord.Message):
     """
     Needed for Discord -> in-game chat relay.
+    We support BOTH crosschat handlers:
+      - on_discord_message(message)
+      - on_discord_message(message, rcon_cmd)
     """
     try:
-        await crosschat_module.on_discord_message(message)
+        handler = getattr(crosschat_module, "on_discord_message", None)
+        if handler is None:
+            return
+
+        rcon_cmd = _get_rcon_command()
+        try:
+            res = handler(message, rcon_cmd)
+        except TypeError:
+            res = handler(message)
+
+        if asyncio.iscoroutine(res):
+            await res
+
     except Exception as e:
         print(f"[crosschat] on_message error: {e}")
 
