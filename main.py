@@ -10,7 +10,7 @@ import players_module
 import vcstatus_module
 import crosschat_module
 import gamelogs_autopost_module
-import travelerlogs_module  # ✅ NEW
+import travelerlogs_module  # ✅ traveler logs
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -146,12 +146,14 @@ async def on_ready():
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # ✅ Traveler logs: /writelog (auto stamps Year/Day from time system)
-    travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
+    # ✅ Traveler logs: /writelog (auto stamps Year/Day by reading the time embed in TIME_CHANNEL_ID)
+    # IMPORTANT: travelerlogs_module needs the discord client passed in so it can read the channel history
+    travelerlogs_module.setup_travelerlogs_commands(tree, GUILD_ID, client)
 
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
+
     # Tribe logs
     await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
 
@@ -174,18 +176,19 @@ async def on_ready():
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
     print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
 
+
 @client.event
 async def on_message(message: discord.Message):
     """
-    - Enforces traveler log lock (optional) so only /writelog can be posted in locked channels/category.
-    - Relays Discord -> in-game chat (crosschat) if enabled.
+    - Optional traveler log lock enforcement (if your travelerlogs_module exposes it)
+    - Relays Discord -> in-game chat (crosschat)
     """
-    # ✅ Traveler logs lock enforcement (deletes normal messages in locked channels/category)
-    try:
-        await travelerlogs_module.enforce_travelerlog_lock(message)
-    except Exception as e:
-        # Don't crash on permissions/config issues
-        print(f"[travelerlogs] enforce error: {e}")
+    # Traveler logs lock enforcement (only if your module has it)
+    if hasattr(travelerlogs_module, "enforce_travelerlog_lock"):
+        try:
+            await travelerlogs_module.enforce_travelerlog_lock(message)
+        except Exception as e:
+            print(f"[travelerlogs] enforce error: {e}")
 
     # Crosschat relay
     rcon_cmd = _get_rcon_command()
