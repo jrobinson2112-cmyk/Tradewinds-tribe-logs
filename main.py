@@ -9,7 +9,8 @@ import time_module
 import players_module
 import vcstatus_module
 import crosschat_module
-import gamelogs_autopost_module  # ✅ NEW
+import gamelogs_autopost_module
+import travelerlogs_module  # ✅ NEW
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -140,38 +141,53 @@ async def on_ready():
 
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is None:
-        print("⚠️ WARNING: rcon_command not found. Time/Crosschat may not function correctly.")
+        print("⚠️ WARNING: rcon_command not found. Time/Crosschat/GameLogs may not function correctly.")
 
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
+    # ✅ Traveler logs: /writelog (auto stamps Year/Day from time system)
+    travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
+
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-    # ✅ FIX: pass client to tribelogs loop
-    await _start_task_maybe(tribelogs_module.run_tribelogs_loop, client)
+    # Tribe logs
+    await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
 
+    # Time loop
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
 
+    # Players loop
     await _start_task_maybe(players_module.run_players_loop)
 
+    # VC status loop
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
+    # Crosschat + GameLogs
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
 
-        # ✅ automatic gamelog embed poster
+        # Game logs automatic poster
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
-    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost")
-
+    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
 
 @client.event
 async def on_message(message: discord.Message):
     """
-    Needed for Discord -> in-game chat relay.
+    - Enforces traveler log lock (optional) so only /writelog can be posted in locked channels/category.
+    - Relays Discord -> in-game chat (crosschat) if enabled.
     """
+    # ✅ Traveler logs lock enforcement (deletes normal messages in locked channels/category)
+    try:
+        await travelerlogs_module.enforce_travelerlog_lock(message)
+    except Exception as e:
+        # Don't crash on permissions/config issues
+        print(f"[travelerlogs] enforce error: {e}")
+
+    # Crosschat relay
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is not None:
         try:
