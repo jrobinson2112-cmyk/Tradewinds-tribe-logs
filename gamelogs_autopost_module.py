@@ -2,14 +2,10 @@
 # Polls ASA RCON "GetGameLog" every N seconds, and POSTS (not edits) a new embed every 60s
 # containing ONLY the new log lines seen during that minute.
 #
-# ✅ No redeploy spam: on startup it "seeds" the dedupe from the current GetGameLog output
-# ✅ Posts a NEW embed every minute (even if no logs -> "No new logs in the last minute.")
+# ✅ No redeploy spam: on startup it "seeds" dedupe from current GetGameLog output
+# ✅ Posts a NEW embed only when there ARE new logs in that minute
 # ✅ Does NOT delete or edit previous embeds
-# ✅ No filtering: includes ANY new GetGameLog lines (claims, tames, demolish, etc.)
-#
-# How to use in main.py:
-#   import gamelogs_autopost_module
-#   asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
+# ✅ Also feeds GetGameLog text to time_module.ingest_gamelog_text(text) (for accurate time sync)
 #
 # Env vars:
 #   GAMELOGS_CHANNEL_ID=1462433999766028427
@@ -18,15 +14,22 @@
 #   GAMELOGS_MAX_LINES_PER_EMBED=40
 #   GAMELOGS_SEED_ON_START=1
 #   GAMELOGS_SHOW_DEBUG=0
+#
+# Optional:
+#   GAMELOGS_DATA_DIR=/data
+#   GAMELOGS_STATE_FILE=/data/gamelogs_state.json
 
 import os
 import time
 import json
 import asyncio
 import hashlib
-from typing import List, Optional, Dict, Set
+from typing import List, Set
 
 import discord
+
+# IMPORTANT: feed log text to time module cache for auto-sync
+import time_module
 
 # =====================
 # CONFIG (ENV)
@@ -75,7 +78,6 @@ def _load_state():
         _seen_hashes = set()
 
 def _save_state():
-    # keep file from growing forever
     try:
         _ensure_dir(STATE_FILE)
         seen_list = list(_seen_hashes)
@@ -102,13 +104,18 @@ def _truncate_for_embed(lines: List[str]) -> str:
     joined = "\n".join(lines)
     if len(joined) <= 3900:
         return joined
-    # truncate hard but keep readable
     return joined[:3890] + "\n… (truncated)"
 
 async def _post_minute_embed(client: discord.Client, lines: List[str]):
+    """
+    Posts a NEW embed containing the new log lines for the minute window.
+    Caller should ensure lines is non-empty.
+    """
+    if not lines:
+        return  # safety
+
     ch = client.get_channel(GAMELOGS_CHANNEL_ID)
     if ch is None:
-        # Try fetch if cache missed
         try:
             ch = await client.fetch_channel(GAMELOGS_CHANNEL_ID)
         except Exception:
@@ -121,12 +128,8 @@ async def _post_minute_embed(client: discord.Client, lines: List[str]):
 
     now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-    if not lines:
-        desc = "*No new logs in the last minute.*"
-    else:
-        # limit number of lines per embed, keep most recent
-        trimmed = lines[-MAX_LINES_PER_EMBED:]
-        desc = _truncate_for_embed(trimmed)
+    trimmed = lines[-MAX_LINES_PER_EMBED:]
+    desc = _truncate_for_embed(trimmed)
 
     embed = discord.Embed(
         title="📜 Game Logs (minute)",
@@ -140,7 +143,7 @@ async def _post_minute_embed(client: discord.Client, lines: List[str]):
     except Exception as e:
         if SHOW_DEBUG:
             print("[gamelogs_autopost] send error:", e)
-
+            
 # =====================
 # PUBLIC LOOP
 # =====================
@@ -161,6 +164,13 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
     if SEED_ON_START:
         try:
             text = await rcon_command("GetGameLog", timeout=12.0)
+
+            # Feed cache for time sync
+            try:
+                time_module.ingest_gamelog_text(text)
+            except Exception:
+                pass
+
             lines = _split_lines(text)
             for ln in lines[-2000:]:  # only tail
                 _seen_hashes.add(_h(ln))
@@ -170,7 +180,10 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
             print("[gamelogs_autopost] seed error:", e)
 
     _last_post_ts = time.time()
-    print(f"[gamelogs_autopost] ✅ running (channel_id={GAMELOGS_CHANNEL_ID}, poll={POLL_SECONDS:.1f}s, post_every={POST_EVERY_SECONDS}s)")
+    print(
+        f"[gamelogs_autopost] ✅ running "
+        f"(channel_id={GAMELOGS_CHANNEL_ID}, poll={POLL_SECONDS:.1f}s, post_every={POST_EVERY_SECONDS}s)"
+    )
 
     last_state_save = time.time()
 
@@ -178,9 +191,16 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
         try:
             # Poll GetGameLog
             text = await rcon_command("GetGameLog", timeout=12.0)
+
+            # Feed cache for time_module auto-sync (critical)
+            try:
+                time_module.ingest_gamelog_text(text)
+            except Exception:
+                pass
+
             lines = _split_lines(text)
 
-            # only process the tail to keep things fast
+            # Only process the tail to keep things fast
             tail = lines[-2000:] if len(lines) > 2000 else lines
 
             new_count = 0
@@ -197,9 +217,14 @@ async def run_gamelogs_autopost_loop(client: discord.Client, rcon_command):
                 _save_state()
                 last_state_save = time.time()
 
-            # Post every minute as a NEW embed
+            # Post every minute as a NEW embed ONLY if there were new logs in that minute
             if time.time() - _last_post_ts >= POST_EVERY_SECONDS:
-                await _post_minute_embed(client, _buffer)
+                if _buffer:
+                    await _post_minute_embed(client, _buffer)
+                else:
+                    if SHOW_DEBUG:
+                        print("[gamelogs_autopost] (minute) no new logs -> not posting")
+
                 _buffer = []
                 _last_post_ts = time.time()
 
