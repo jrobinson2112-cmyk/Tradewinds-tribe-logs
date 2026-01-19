@@ -142,6 +142,11 @@ async def on_ready():
         print("[travelerlogs] ✅ persistent views registered")
     except Exception as e:
         print(f"[travelerlogs] register_persistent_views error: {e}")
+        
+    # ---- Traveler Logs: ensure Write Log button exists (testing channel only) ----
+    asyncio.create_task(
+        travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID)
+    )
 
     # ---- Register commands ----
     try:
