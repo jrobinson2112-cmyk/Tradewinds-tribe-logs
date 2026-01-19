@@ -1,15 +1,16 @@
 # travelerlogs_module.py
 # Button-only Traveler Logs with:
-# - Write Log panel (pinned + re-posted to keep near bottom)
-# - Edit Log (author-only)
-# - Add Image (author-only, reliable attachment://)
-# - /postlogbutton (admin role)
-# - Startup cleanup (removes old panels & reposts)
+# - Write Log button panel (pinned)
+# - Edit Log button (only author)
+# - Add Image button (only author) ✅ reliable: re-uploads image to the log message and uses attachment://
+# - /postlogbutton admin command to manually post the panel
+# - Startup cleanup: remove duplicate panels, ensure exactly 1 pinned panel
 #
-# Marker NOTE:
-# - User asked to remove visible PANEL_MARKER text.
-# - We now identify the panel via a *hidden* message content marker (zero-width chars).
-#   It is not visible in Discord UI.
+# Notes:
+# - “Gallery style” multiple images in ONE embed isn’t possible (one embed image).
+#   So MAX_IMAGES_PER_LOG = 1 to keep it reliable.
+# - No “normal text” enforcement (you’ll do via Discord perms).
+# - Year/Day defaults from time_module.get_time_state() but user can change in modal.
 
 import os
 import asyncio
@@ -22,12 +23,11 @@ import time_module
 # =====================
 # CONFIG
 # =====================
-PANEL_EMBED_COLOR = 0xFFFFFF  # "white" accent strip
-LOG_EMBED_COLOR = 0x2563EB    # blue
+LOG_EMBED_COLOR = 0x2563EB     # blue
+PANEL_EMBED_COLOR = 0xFFFFFF   # white
+LOG_TITLE = "📜 Traveler Log"
 
-TRAVELERLOG_TITLE = "📜 Traveler Log"
-
-# Only this channel gets the panel while testing
+# TEST ONLY channel (you asked to keep it only in test during tweaks)
 TEST_ONLY_CHANNEL_ID = int(os.getenv("TRAVELERLOGS_TEST_CHANNEL_ID", "1462402354535075890"))
 
 # Admin role allowed to use /postlogbutton
@@ -36,9 +36,14 @@ ADMIN_ROLE_ID = int(os.getenv("TRAVELERLOGS_ADMIN_ROLE_ID", "1439069787207766076
 # Max images per log (reliable: 1)
 MAX_IMAGES_PER_LOG = 1
 
-# Hidden (non-visible) content marker to identify the panel message
-# This renders as nothing, but is detectable in code.
-PANEL_HIDDEN_MARKER = "\u200b\u200b\u200bTRAVELERLOG_PANEL\u200b\u200b\u200b"
+# Persistent view IDs
+WRITE_BUTTON_CUSTOM_ID = "travelerlogs:write"
+EDIT_BUTTON_CUSTOM_ID = "travelerlogs:edit"
+ADDIMG_BUTTON_CUSTOM_ID = "travelerlogs:addimg"
+
+# Internal marker used to identify panel messages WITHOUT showing anything in embed footer
+# (We store this marker in the *content* of the message, which users don’t really see because it’s blank-ish)
+PANEL_MARKER_TEXT = "\u200b\u200bTRAVELERLOG_PANEL_V2\u200b\u200b"
 
 # =====================
 # IN-MEMORY STATE
@@ -46,16 +51,22 @@ PANEL_HIDDEN_MARKER = "\u200b\u200b\u200bTRAVELERLOG_PANEL\u200b\u200b\u200b"
 # log message id -> {"author_id": int, "image_filename": str|None}
 _LOG_META: Dict[int, Dict[str, Any]] = {}
 
-# user_id + channel_id -> last log message id
+# user_id/channel_id -> last log message id (for add image flow)
 _LAST_LOG_BY_USER_CHANNEL: Dict[Tuple[int, int], int] = {}
 
 # =====================
 # TIME HELPERS
 # =====================
 def _get_current_day_year() -> Tuple[int, int]:
+    """
+    Pull current Year + Day from time_module.
+    Falls back to 1,1 if time isn't initialised yet.
+    """
     try:
         state = time_module.get_time_state()
-        return int(state.get("year", 1)), int(state.get("day", 1))
+        year = int(state.get("year", 1))
+        day = int(state.get("day", 1))
+        return year, day
     except Exception:
         return 1, 1
 
@@ -63,11 +74,15 @@ def _get_current_day_year() -> Tuple[int, int]:
 # TEXT HELPERS
 # =====================
 def _chunk_text(text: str, limit: int = 3900) -> list[str]:
+    """
+    Embed description hard limit is 4096; keep margin for safety.
+    If log is longer, we split into multiple continuation embeds.
+    """
     text = text or ""
     if len(text) <= limit:
         return [text]
 
-    chunks: list[str] = []
+    chunks = []
     cur = ""
     for line in text.splitlines(keepends=True):
         if len(cur) + len(line) > limit:
@@ -98,54 +113,35 @@ def _build_log_embed(
     page: int = 1,
     total_pages: int = 1,
 ) -> discord.Embed:
-    emb = discord.Embed(title=TRAVELERLOG_TITLE, color=LOG_EMBED_COLOR)
-
+    # Show Year/Day directly under the title (top)
+    desc_top = f"**Year {year} • Day {day}**"
     if total_pages > 1:
-        emb.add_field(name=title, value=f"{body}\n\n*(Page {page}/{total_pages})*", inline=False)
-    else:
-        emb.add_field(name=title, value=body or "\u200b", inline=False)
+        desc_top += f"\n*(Page {page}/{total_pages})*"
+
+    embed = discord.Embed(
+        title=LOG_TITLE,
+        description=desc_top,
+        color=LOG_EMBED_COLOR,
+    )
+
+    # Main log content as field(s)
+    embed.add_field(name=title or "\u200b", value=body or "\u200b", inline=False)
 
     if image_filename:
-        emb.add_field(name="📸 Image", value="Attached below.", inline=False)
-        emb.set_image(url=f"attachment://{image_filename}")
+        embed.add_field(name="📸 Image", value="Attached below.", inline=False)
+        embed.set_image(url=f"attachment://{image_filename}")
 
-    # ✅ “Solunaris Time” field removed — shown in footer instead
-    emb.set_footer(text=f"Year {year} • Day {day} • Logged by {author_name}")
-    return emb
+    embed.set_footer(text=f"Logged by {author_name}")
+    return embed
 
 def _build_panel_embed() -> discord.Embed:
-    return discord.Embed(
+    e = discord.Embed(
         title="🖋️ Write a Traveler Log",
         description="Tap the button below to write a Traveler Log.\n\n**Tap the button • A form will open**",
         color=PANEL_EMBED_COLOR,
     )
-
-# =====================
-# PARSERS (from embed)
-# =====================
-def _parse_year_day_from_footer(emb: discord.Embed) -> Tuple[int, int]:
-    year, day = 1, 1
-    try:
-        ft = emb.footer.text or ""
-        parts = ft.replace("•", "").split()
-        if "Year" in parts and "Day" in parts:
-            year = int(parts[parts.index("Year") + 1])
-            day = int(parts[parts.index("Day") + 1])
-    except Exception:
-        pass
-    return year, day
-
-def _parse_title_body(emb: discord.Embed) -> Tuple[str, str]:
-    title = "Log"
-    body = ""
-    try:
-        if emb.fields:
-            title = emb.fields[0].name or "Log"
-            body = emb.fields[0].value or ""
-            body = body.replace("\n\n*(Page 1/1)*", "")
-    except Exception:
-        pass
-    return title, body
+    # IMPORTANT: no footer marker (so TRAVELERLOG_PANEL doesn’t show)
+    return e
 
 # =====================
 # UI: MODALS
@@ -154,15 +150,31 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
     def __init__(self, default_year: int, default_day: int):
         super().__init__(timeout=300)
 
-        self.year = discord.ui.TextInput(label="Year (number)", required=True, default=str(default_year), max_length=6)
-        self.day = discord.ui.TextInput(label="Day (number)", required=True, default=str(default_day), max_length=6)
-        self.log_title = discord.ui.TextInput(label="Title", required=True, placeholder="Short title for your log entry", max_length=256)
+        self.year = discord.ui.TextInput(
+            label="Year (number)",
+            required=True,
+            default=str(default_year),
+            max_length=6,
+        )
+        self.day = discord.ui.TextInput(
+            label="Day (number)",
+            required=True,
+            default=str(default_day),
+            max_length=6,
+        )
+        self.log_title = discord.ui.TextInput(
+            label="Title",
+            required=True,
+            placeholder="Short title for your log entry",
+            max_length=256,
+        )
+        # Discord modal limit: 4000
         self.log_body = discord.ui.TextInput(
             label="Log",
             required=True,
             style=discord.TextStyle.paragraph,
             placeholder="Write your traveler log...",
-            max_length=4000,  # Discord hard limit for modal paragraph input
+            max_length=4000,
         )
 
         self.add_item(self.year)
@@ -194,9 +206,24 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
     def __init__(self, *, default_year: int, default_day: int, default_title: str, default_body: str):
         super().__init__(timeout=300)
 
-        self.year = discord.ui.TextInput(label="Year (number)", required=True, default=str(default_year), max_length=6)
-        self.day = discord.ui.TextInput(label="Day (number)", required=True, default=str(default_day), max_length=6)
-        self.log_title = discord.ui.TextInput(label="Title", required=True, default=(default_title or "")[:256], max_length=256)
+        self.year = discord.ui.TextInput(
+            label="Year (number)",
+            required=True,
+            default=str(default_year),
+            max_length=6,
+        )
+        self.day = discord.ui.TextInput(
+            label="Day (number)",
+            required=True,
+            default=str(default_day),
+            max_length=6,
+        )
+        self.log_title = discord.ui.TextInput(
+            label="Title",
+            required=True,
+            default=(default_title or "")[:256],
+            max_length=256,
+        )
         self.log_body = discord.ui.TextInput(
             label="Log",
             required=True,
@@ -231,18 +258,19 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
         await interaction.response.defer(ephemeral=True)
 
 # =====================
-# VIEWS (PERSISTENT)
+# UI: VIEWS / BUTTONS (PERSISTENT)
 # =====================
 class WritePanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Write Log", style=discord.ButtonStyle.primary, emoji="🖋️", custom_id="travelerlogs:write")
+    @discord.ui.button(label="Write Log", style=discord.ButtonStyle.primary, emoji="🖋️", custom_id=WRITE_BUTTON_CUSTOM_ID)
     async def write_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         year, day = _get_current_day_year()
         modal = WriteLogModal(default_year=year, default_day=day)
         await interaction.response.send_modal(modal)
         await modal.wait()
+
         if not modal.result:
             return
 
@@ -264,19 +292,13 @@ class WritePanelView(discord.ui.View):
             )
             view = LogActionsView(author_id=interaction.user.id)
             msg = await interaction.channel.send(embed=emb, view=view)
+
             if first_msg is None:
                 first_msg = msg
                 _LOG_META[msg.id] = {"author_id": interaction.user.id, "image_filename": None}
 
         if first_msg:
             _LAST_LOG_BY_USER_CHANNEL[(interaction.user.id, interaction.channel_id)] = first_msg.id
-
-        # Repost panel so it stays at bottom
-        try:
-            if isinstance(interaction.channel, discord.TextChannel):
-                await upsert_write_panel(interaction.channel)
-        except Exception:
-            pass
 
         try:
             await interaction.followup.send("✅ Traveler log recorded.", ephemeral=True)
@@ -289,22 +311,30 @@ class LogActionsView(discord.ui.View):
         super().__init__(timeout=None)
         self.author_id = author_id
 
-    @discord.ui.button(label="Edit Log", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id="travelerlogs:edit")
+    @discord.ui.button(label="Edit Log", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id=EDIT_BUTTON_CUSTOM_ID)
     async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         msg = interaction.message
         meta = _LOG_META.get(msg.id)
-
         if not meta or meta.get("author_id") != interaction.user.id:
             await interaction.response.send_message("❌ Only the log author can edit this.", ephemeral=True)
             return
 
-        emb = msg.embeds[0] if msg.embeds else None
-        if not emb:
-            await interaction.response.send_message("❌ Log embed missing.", ephemeral=True)
-            return
+        year, day = 1, 1
+        title, body = "Log", ""
+        try:
+            emb = msg.embeds[0]
+            # Description contains "**Year X • Day Y**"
+            desc = (emb.description or "").replace("*", "")
+            # Year 2 • Day 341
+            parts = desc.replace("•", "").split()
+            if "Year" in parts and "Day" in parts:
+                year = int(parts[parts.index("Year") + 1])
+                day = int(parts[parts.index("Day") + 1])
 
-        year, day = _parse_year_day_from_footer(emb)
-        title, body = _parse_title_body(emb)
+            title = emb.fields[0].name
+            body = emb.fields[0].value
+        except Exception:
+            pass
 
         modal = EditLogModal(default_year=year, default_day=day, default_title=title, default_body=body)
         await interaction.response.send_modal(modal)
@@ -313,6 +343,7 @@ class LogActionsView(discord.ui.View):
             return
 
         image_filename = meta.get("image_filename")
+
         new_chunks = _chunk_text(modal.result["body"])
         new_body = new_chunks[0] if new_chunks else ""
 
@@ -333,7 +364,6 @@ class LogActionsView(discord.ui.View):
             await interaction.followup.send(f"❌ Edit failed: {e}", ephemeral=True)
             return
 
-        # Continuation pages (new messages)
         if len(new_chunks) > 1:
             for i, chunk in enumerate(new_chunks[1:], start=2):
                 cont = _build_log_embed(
@@ -348,16 +378,9 @@ class LogActionsView(discord.ui.View):
                 )
                 await interaction.channel.send(embed=cont)
 
-        # Repost panel to keep it at bottom
-        try:
-            if isinstance(interaction.channel, discord.TextChannel):
-                await upsert_write_panel(interaction.channel)
-        except Exception:
-            pass
-
         await interaction.followup.send("✅ Updated.", ephemeral=True)
 
-    @discord.ui.button(label="Add Image", style=discord.ButtonStyle.success, emoji="📸", custom_id="travelerlogs:addimg")
+    @discord.ui.button(label="Add Image", style=discord.ButtonStyle.success, emoji="📸", custom_id=ADDIMG_BUTTON_CUSTOM_ID)
     async def add_img_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         msg = interaction.message
         meta = _LOG_META.get(msg.id)
@@ -371,7 +394,7 @@ class LogActionsView(discord.ui.View):
             return
 
         await interaction.response.send_message(
-            f"📸 Send up to {MAX_IMAGES_PER_LOG} image in this channel now.\n"
+            f"📸 Send up to {MAX_IMAGES_PER_LOG} image(s) in this channel now.\n"
             "I’ll attach it to your log and delete your upload message.\n\n"
             "Timeout: 180s",
             ephemeral=True,
@@ -415,27 +438,38 @@ class LogActionsView(discord.ui.View):
 
         image_filename = file.filename
 
-        emb = msg.embeds[0] if msg.embeds else None
-        if not emb:
-            await interaction.followup.send("❌ Log embed missing.", ephemeral=True)
-            return
-
-        year, day = _parse_year_day_from_footer(emb)
-        title, body = _parse_title_body(emb)
-
-        new_embed = _build_log_embed(
-            year=year,
-            day=day,
-            title=title,
-            body=body,
-            author_name=_display_name(interaction.user),
-            image_filename=image_filename,
-            page=1,
-            total_pages=1,
-        )
-
         try:
-            # Attach image to the log message and reference attachment://filename
+            # Rebuild embed so it references attachment://filename
+            emb = msg.embeds[0] if msg.embeds else None
+            if emb is None:
+                await interaction.followup.send("❌ Log embed missing.", ephemeral=True)
+                return
+
+            # Extract current year/day from description
+            year, day = 1, 1
+            title, body = "Log", ""
+            try:
+                desc = (emb.description or "").replace("*", "")
+                parts = desc.replace("•", "").split()
+                if "Year" in parts and "Day" in parts:
+                    year = int(parts[parts.index("Year") + 1])
+                    day = int(parts[parts.index("Day") + 1])
+                title = emb.fields[0].name
+                body = emb.fields[0].value
+            except Exception:
+                pass
+
+            new_embed = _build_log_embed(
+                year=year,
+                day=day,
+                title=title,
+                body=body,
+                author_name=_display_name(interaction.user),
+                image_filename=image_filename,
+                page=1,
+                total_pages=1,
+            )
+
             await msg.edit(embed=new_embed, attachments=[file], view=LogActionsView(author_id=interaction.user.id))
 
             meta["image_filename"] = image_filename
@@ -446,97 +480,74 @@ class LogActionsView(discord.ui.View):
             except Exception:
                 pass
 
-            # Repost panel to keep it at bottom
-            try:
-                if isinstance(interaction.channel, discord.TextChannel):
-                    await upsert_write_panel(interaction.channel)
-            except Exception:
-                pass
-
             await interaction.followup.send("✅ Image attached to your log.", ephemeral=True)
-
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to attach image: {e}", ephemeral=True)
-
-# =====================
-# PANEL FIND/DELETE/UPSERT
-# =====================
-async def _is_panel_message(msg: discord.Message) -> bool:
-    try:
-        if not msg.author.bot:
-            return False
-        if (msg.content or "") != PANEL_HIDDEN_MARKER:
-            return False
-        if not msg.embeds:
-            return False
-        return True
-    except Exception:
-        return False
-
-async def _delete_existing_panels(channel: discord.TextChannel):
-    # delete pinned panels first
-    try:
-        pins = await channel.pins()
-        for m in pins:
-            if await _is_panel_message(m):
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # also scan recent messages
-    try:
-        async for m in channel.history(limit=50):
-            if await _is_panel_message(m):
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-async def upsert_write_panel(channel: discord.TextChannel) -> Optional[discord.Message]:
-    """
-    Delete any old panels and post a fresh one so:
-      - buttons never go stale after redeploy
-      - panel stays near bottom
-    """
-    try:
-        await _delete_existing_panels(channel)
-    except Exception:
-        pass
-
-    try:
-        view = WritePanelView()
-        emb = _build_panel_embed()
-        msg = await channel.send(content=PANEL_HIDDEN_MARKER, embed=emb, view=view)
-        try:
-            await msg.pin(reason="Traveler Log Write Panel")
-        except Exception:
-            pass
-        return msg
-    except Exception:
-        return None
 
 # =====================
 # PUBLIC: REGISTER VIEWS (persistent buttons)
 # =====================
 def register_views(client: discord.Client):
     client.add_view(WritePanelView())
-    client.add_view(LogActionsView(author_id=0))  # dummy for custom_ids after restart
+    client.add_view(LogActionsView(author_id=0))  # dummy for custom_id registration after restart
 
 # =====================
-# STARTUP CLEANUP + ENSURE PANEL
+# PANEL MANAGEMENT / CLEANUP
 # =====================
+async def _find_all_panels(channel: discord.TextChannel, limit: int = 50) -> list[discord.Message]:
+    """
+    Find panel messages by checking:
+    - pinned messages that have our marker content OR our panel embed title.
+    - recent history for marker content (in case unpinned duplicates exist).
+    """
+    found: list[discord.Message] = []
+
+    # Pins first
+    try:
+        pins = await channel.pins()
+        for m in pins:
+            if m.author.bot and (
+                (m.content and "TRAVELERLOG_PANEL_V2" in m.content)
+                or (m.embeds and m.embeds[0].title == "🖋️ Write a Traveler Log")
+            ):
+                found.append(m)
+    except Exception:
+        pass
+
+    # Recent history (to delete duplicates)
+    try:
+        async for m in channel.history(limit=limit):
+            if m.author.bot and m.content and "TRAVELERLOG_PANEL_V2" in m.content:
+                if m not in found:
+                    found.append(m)
+    except Exception:
+        pass
+
+    return found
+
+async def _post_and_pin_panel(channel: discord.TextChannel) -> Optional[discord.Message]:
+    try:
+        view = WritePanelView()
+        emb = _build_panel_embed()
+        # Marker in message content (not embed footer)
+        msg = await channel.send(content=PANEL_MARKER_TEXT, embed=emb, view=view)
+        try:
+            await msg.pin()
+        except Exception:
+            pass
+        return msg
+    except Exception:
+        return None
+
 async def ensure_write_panels(client: discord.Client, guild_id: int):
+    """
+    Cleanup + ensure exactly one pinned panel in TEST channel.
+    """
     await client.wait_until_ready()
     guild = client.get_guild(guild_id)
     if guild is None:
         return
 
-    # Only test channel
     ch = guild.get_channel(TEST_ONLY_CHANNEL_ID)
     if not isinstance(ch, discord.TextChannel):
         try:
@@ -546,31 +557,56 @@ async def ensure_write_panels(client: discord.Client, guild_id: int):
     if not isinstance(ch, discord.TextChannel):
         return
 
-    # Cleanup + post fresh
-    await upsert_write_panel(ch)
+    panels = await _find_all_panels(ch)
+
+    # Keep 1 panel (prefer a pinned one)
+    pinned = [m for m in panels if m.pinned]
+    keep: Optional[discord.Message] = pinned[0] if pinned else (panels[0] if panels else None)
+
+    # Delete the rest (duplicates)
+    for m in panels:
+        if keep and m.id == keep.id:
+            continue
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+    # If none, post new
+    if keep is None:
+        keep = await _post_and_pin_panel(ch)
+    else:
+        # Make sure it's pinned + has the correct embed/view
+        try:
+            if not keep.pinned:
+                await keep.pin()
+        except Exception:
+            pass
+        try:
+            await keep.edit(content=PANEL_MARKER_TEXT, embed=_build_panel_embed(), view=WritePanelView())
+        except Exception:
+            pass
 
 # =====================
 # SLASH COMMANDS
 # =====================
-def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int = None):
+def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int, admin_role_id: int):
     """
-    Registers:
-      - /postlogbutton (admin): posts/reposts the write panel in current channel
-      - /writelog: fallback command to open modal
+    /postlogbutton (admin): posts/reposts and pins panel in current channel
+    /writelog: optional fallback that opens the same modal
     """
     guild_obj = discord.Object(id=guild_id)
-    admin_role = int(admin_role_id or ADMIN_ROLE_ID)
 
     @tree.command(
         name="postlogbutton",
-        description="(Admin) Post/Repost the 'Write Log' panel in this channel",
+        description="(Admin) Post/repost the 'Write Log' panel in this channel and pin it",
         guild=guild_obj,
     )
     async def postlogbutton(interaction: discord.Interaction):
         ok = False
         try:
             if isinstance(interaction.user, discord.Member):
-                ok = any(r.id == admin_role for r in interaction.user.roles)
+                ok = any(r.id == int(admin_role_id) for r in interaction.user.roles)
         except Exception:
             ok = False
 
@@ -580,14 +616,41 @@ def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int, ad
 
         ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
-            await interaction.response.send_message("❌ Must be used in a text channel.", ephemeral=True)
+            await interaction.response.send_message("❌ This must be used in a text channel.", ephemeral=True)
             return
 
-        msg = await upsert_write_panel(ch)
-        if msg:
+        panels = await _find_all_panels(ch)
+        pinned = [m for m in panels if m.pinned]
+        keep: Optional[discord.Message] = pinned[0] if pinned else (panels[0] if panels else None)
+
+        # delete duplicates
+        for m in panels:
+            if keep and m.id == keep.id:
+                continue
+            try:
+                await m.delete()
+            except Exception:
+                pass
+
+        if keep is None:
+            keep = await _post_and_pin_panel(ch)
+            if keep:
+                await interaction.response.send_message("✅ Posted/reposted and pinned.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Could not post/pin (missing perms?).", ephemeral=True)
+            return
+
+        # Refresh existing
+        try:
+            await keep.edit(content=PANEL_MARKER_TEXT, embed=_build_panel_embed(), view=WritePanelView())
+            if not keep.pinned:
+                try:
+                    await keep.pin()
+                except Exception:
+                    pass
             await interaction.response.send_message("✅ Posted/reposted and pinned.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ Could not post/pin (missing perms?).", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("❌ Could not repost (missing perms?).", ephemeral=True)
 
     @tree.command(
         name="writelog",
@@ -600,7 +663,7 @@ def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int, ad
         await interaction.response.send_modal(modal)
 
 # =====================
-# No lock enforcement (per your request)
+# NO LOCK ENFORCEMENT
 # =====================
 async def enforce_travelerlog_lock(message: discord.Message):
     return
