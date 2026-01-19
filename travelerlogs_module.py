@@ -154,6 +154,68 @@ def _build_panel_embed() -> discord.Embed:
     )
     return e
 
+# =====================
+# TEMP UPLOAD PERMS (Option 3)
+# =====================
+_TEMP_PERM_TASKS: Dict[Tuple[int, int], asyncio.Task] = {}  # (channel_id, user_id) -> task
+
+
+async def _grant_temp_upload_perms(
+    channel: discord.TextChannel,
+    member: discord.Member,
+    seconds: int = 90,
+) -> bool:
+    """
+    Temporarily allow a member to Send Messages + Attach Files in a locked channel.
+    Reverts after `seconds`.
+    Returns True if perms were applied, False if we couldn't.
+    """
+    key = (channel.id, member.id)
+
+    # Cancel any existing timer for this user/channel
+    existing = _TEMP_PERM_TASKS.get(key)
+    if existing and not existing.done():
+        existing.cancel()
+
+    try:
+        current = channel.overwrites_for(member)
+        # Save a copy so we can restore exactly
+        original = discord.PermissionOverwrite.from_pair(current.pair()[0], current.pair()[1])
+
+        # Apply temp allows
+        current.send_messages = True
+        current.attach_files = True
+        current.embed_links = True  # optional but usually safe/helpful
+
+        await channel.set_permissions(member, overwrite=current, reason="TravelerLogs: temp upload perms")
+    except Exception as e:
+        print(f"[travelerlogs] temp perm grant failed: {e}")
+        return False
+
+    async def _revert_later():
+        try:
+            await asyncio.sleep(seconds)
+            try:
+                await channel.set_permissions(member, overwrite=original, reason="TravelerLogs: revert temp upload perms")
+            except Exception as e2:
+                print(f"[travelerlogs] temp perm revert failed: {e2}")
+        except asyncio.CancelledError:
+            # If a new timer replaces this one, we still want to revert using the newest timer
+            return
+
+    _TEMP_PERM_TASKS[key] = asyncio.create_task(_revert_later())
+    return True
+
+
+async def _revert_temp_upload_perms_now(channel: discord.TextChannel, member: discord.Member):
+    """
+    Immediately cancels any scheduled revert task for this user/channel.
+    (We do NOT revert here because we don’t have the original overwrite stored outside the task.)
+    """
+    key = (channel.id, member.id)
+    t = _TEMP_PERM_TASKS.get(key)
+    if t and not t.done():
+        t.cancel()
 
 # =====================
 # UI: MODALS
@@ -423,12 +485,29 @@ class LogActionsView(discord.ui.View):
             await interaction.response.send_message("❌ This log already has an image.", ephemeral=True)
             return
 
-        await interaction.response.send_message(
-            f"📸 Send up to {MAX_IMAGES_PER_LOG} image(s) in this channel now.\n"
-            "I’ll attach it to your log and delete your upload message.\n\n"
-            "Timeout: 180s",
-            ephemeral=True,
-        )
+        ch = interaction.channel
+if not isinstance(ch, discord.TextChannel):
+    await interaction.response.send_message("❌ This must be used in a text channel.", ephemeral=True)
+    return
+
+if not isinstance(interaction.user, discord.Member):
+    await interaction.response.send_message("❌ Could not resolve your server membership.", ephemeral=True)
+    return
+
+ok = await _grant_temp_upload_perms(ch, interaction.user, seconds=90)
+if not ok:
+    await interaction.response.send_message(
+        "❌ I couldn’t grant temporary upload permissions.\n"
+        "Make sure I have **Manage Channels** and my role is above the member.",
+        ephemeral=True,
+    )
+    return
+
+await interaction.response.send_message(
+    "📸 You can upload **one image** in this channel now.\n"
+    "You have **90 seconds**. I’ll attach it to your log and delete your upload message.",
+    ephemeral=True,
+)
 
         def check(m: discord.Message) -> bool:
             if m.author.id != interaction.user.id:
