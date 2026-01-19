@@ -39,6 +39,12 @@ _webhook_message_ids = {
     "players": None,
 }
 
+# Traveler Logs: persistent views (required or buttons will fail after redeploy)
+try:
+    travelerlogs_module.register_views(client)
+    print("[travelerlogs] ✅ persistent views registered")
+except Exception as e:
+    print(f"[travelerlogs] register_views error: {e}")
 
 async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: str, embed: dict):
     """
