@@ -1,3 +1,4 @@
+# main.py (FULL)
 import os
 import asyncio
 import discord
@@ -10,34 +11,49 @@ import players_module
 import vcstatus_module
 import crosschat_module
 import gamelogs_autopost_module
-import travelerlogs_module  # ✅ button-only traveler logs module
+import travelerlogs_module  # ✅ button-only traveler logs module (persistent views)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Your Discord server + admin role
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL")
+# Webhooks (time + players) used by your webhook-upsert system
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
+PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL") # players webhook
 
+# ---- Discord client / intents ----
 intents = discord.Intents.default()
+# Needed for Discord -> in-game crosschat (reading message.content)
 intents.message_content = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-_webhook_message_ids = {"time": None, "players": None}
+# Store message IDs so webhooks EDIT instead of posting new
+_webhook_message_ids = {
+    "time": None,
+    "players": None,
+}
 
 
 async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: str, embed: dict):
+    """
+    Create-or-edit a webhook message (edit if we have an ID; otherwise create once).
+    """
     mid = _webhook_message_ids.get(key)
+
+    # Edit existing message
     if mid:
         async with session.patch(f"{url}/messages/{mid}", json={"embeds": [embed]}) as r:
+            # If message/webhook removed => recreate
             if r.status == 404:
                 _webhook_message_ids[key] = None
                 return await _webhook_upsert_impl(session, url, key, embed)
             return
 
+    # Create new (store returned ID)
     async with session.post(url + "?wait=true", json={"embeds": [embed]}) as r:
         data = await r.json()
         if isinstance(data, dict) and "id" in data:
@@ -47,6 +63,12 @@ async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: st
 
 
 async def webhook_upsert(*args, **kwargs):
+    """
+    Flexible wrapper so modules can call this in different ways:
+      - webhook_upsert(embed)
+      - webhook_upsert(key, embed)
+      - webhook_upsert(session, url, key, embed)
+    """
     session = kwargs.get("session")
     url = kwargs.get("url")
     key = kwargs.get("key")
@@ -56,11 +78,14 @@ async def webhook_upsert(*args, **kwargs):
         embed = args[0]
         key = key or "time"
         url = url or (WEBHOOK_URL if key == "time" else PLAYERS_WEBHOOK_URL)
+
     elif len(args) == 2:
         key, embed = args
         url = url or (WEBHOOK_URL if key == "time" else PLAYERS_WEBHOOK_URL)
+
     elif len(args) == 4:
         session, url, key, embed = args
+
     else:
         raise TypeError(f"webhook_upsert() got unsupported args: {args} {kwargs}")
 
@@ -75,31 +100,49 @@ async def webhook_upsert(*args, **kwargs):
 
 
 def _get_rcon_command():
+    """
+    Your project already exposes an RCON function somewhere.
+    Historically you've had tribelogs_module.rcon_command.
+    """
     return getattr(tribelogs_module, "rcon_command", None)
 
 
 async def _start_task_maybe(func, *args):
+    """
+    Accepts:
+      - async function returning coroutine
+      - sync function returning coroutine/task/None
+    Ensures it gets scheduled safely.
+    """
     try:
         res = func(*args)
         if asyncio.iscoroutine(res):
             asyncio.create_task(res)
+        elif isinstance(res, asyncio.Task):
+            pass
+        else:
+            pass
     except TypeError:
         res = func()
         if asyncio.iscoroutine(res):
             asyncio.create_task(res)
+        elif isinstance(res, asyncio.Task):
+            pass
 
 
 @client.event
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # ✅ Traveler Logs persistent buttons + interaction routing
-    travelerlogs_module.register_views(client)
-    travelerlogs_module.setup_interaction_router(client)
-    asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
-    print("[travelerlogs] ✅ persistent views + panel ensure scheduled")
+    # ---- Traveler Logs (persistent buttons) ----
+    # IMPORTANT: this prevents "interaction failed" after redeploys.
+    try:
+        travelerlogs_module.register_views(client)
+        print("[travelerlogs] ✅ persistent views registered")
+    except Exception as e:
+        print(f"[travelerlogs] register views error: {e}")
 
-    # Commands
+    # ---- Register commands ----
     try:
         tribelogs_module.setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
     except TypeError:
@@ -109,38 +152,49 @@ async def on_ready():
     if rcon_cmd is None:
         print("⚠️ WARNING: rcon_command not found. Time/Crosschat/GameLogs may not function correctly.")
 
+    # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # Optional /writelog fallback (button is primary)
+    # Traveler logs commands (includes /postlogbutton)
+    # NOTE: signature here matches the updated travelerlogs_module.
     try:
-        travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
+        travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
     except Exception as e:
         print(f"[travelerlogs] command setup error: {e}")
 
     await tree.sync(guild=guild_obj)
 
-    # Loops
+    # ---- Start loops ----
     await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
+
     await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
+
     await _start_task_maybe(players_module.run_players_loop)
+
     await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
     if rcon_cmd is not None:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-    print(f"✅ Bot online | commands synced to guild {GUILD_ID}")
+    # Ensure "Write Log" panels exist wherever your travelerlogs module wants them
+    # (module handles exclusions / test-only mode internally)
+    try:
+        asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
+        print("[travelerlogs] ✅ ensure_write_panels scheduled")
+    except Exception as e:
+        print(f"[travelerlogs] ensure_write_panels error: {e}")
+
+    print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
+    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
 
 
 @client.event
 async def on_message(message: discord.Message):
-    # ✅ Traveler logs: image upload collector (Add Images button)
-    try:
-        await travelerlogs_module.handle_possible_image_upload(message)
-    except Exception as e:
-        print(f"[travelerlogs] image handler error: {e}")
-
-    # Crosschat relay
+    """
+    Crosschat relay only.
+    (Traveler log channel restriction is handled via Discord permissions, per your plan.)
+    """
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is not None:
         try:
