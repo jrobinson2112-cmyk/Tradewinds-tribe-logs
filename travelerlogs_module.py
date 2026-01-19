@@ -38,7 +38,7 @@ MAX_IMAGES_PER_LOG = 1
 
 # Hidden (non-visible) content marker to identify the panel message
 # This renders as nothing, but is detectable in code.
-
+PANEL_HIDDEN_MARKER = "\u200b\u200b\u200bTRAVELERLOG_PANEL\u200b\u200b\u200b"
 
 # =====================
 # IN-MEMORY STATE
