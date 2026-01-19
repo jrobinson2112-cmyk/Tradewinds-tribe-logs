@@ -366,6 +366,23 @@ def setup_time_commands(tree: app_commands.CommandTree, guild_id: int, admin_rol
 # =====================
 # LOOP
 # =====================
+
+# =====================
+# PUBLIC TIME ACCESSOR
+# =====================
+
+def get_time_state() -> dict:
+    """
+    Public accessor for the current Solunaris time.
+    Used by travelerlogs_module and other systems.
+    MUST always return the live state.
+    """
+    return {
+        "year": CURRENT_YEAR,
+        "day": CURRENT_DAY,
+        "hour": CURRENT_HOUR,
+        "minute": CURRENT_MINUTE,
+    }
 async def run_time_loop(client: discord.Client, rcon_command, webhook_upsert):
     """
     - Updates the time webhook on round step minutes
