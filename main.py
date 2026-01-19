@@ -38,8 +38,6 @@ _webhook_message_ids = {
     "players": None,
 }
 
-travelerlogs_module.register_views(client)
-asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
 
 async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: str, embed: dict):
     """
