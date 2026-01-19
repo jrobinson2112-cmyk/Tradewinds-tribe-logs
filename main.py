@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import asyncio
 import discord
@@ -22,9 +24,6 @@ ADMIN_ROLE_ID = 1439069787207766076
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL") # players webhook
 
-# Traveler Logs category to lock + auto-panel
-TRAVELERLOG_CATEGORY_ID = int(os.getenv("TRAVELERLOG_CATEGORY_ID", "1434615650890023133"))
-
 # ---- Discord client / intents ----
 intents = discord.Intents.default()
 # Needed for Discord -> in-game crosschat (reading message.content)
@@ -39,12 +38,6 @@ _webhook_message_ids = {
     "players": None,
 }
 
-# Traveler Logs: persistent views (required or buttons will fail after redeploy)
-try:
-    travelerlogs_module.register_views(client)
-    print("[travelerlogs] ✅ persistent views registered")
-except Exception as e:
-    print(f"[travelerlogs] register_views error: {e}")
 
 async def _webhook_upsert_impl(session: aiohttp.ClientSession, url: str, key: str, embed: dict):
     """
@@ -142,17 +135,24 @@ async def _start_task_maybe(func, *args):
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # ---- Traveler Logs (IMPORTANT: persistent views so old buttons don't die) ----
+    # ---- Traveler Logs (IMPORTANT: persistent buttons) ----
+    # If you don't do this, old buttons will show "interaction failed" after redeploy.
     try:
-        travelerlogs_module.register_persistent_views(client)
+        travelerlogs_module.register_views(client)  # registers persistent views
+        # Backwards compat if some versions call this:
+        try:
+            travelerlogs_module.register_persistent_views(client)
+        except Exception:
+            pass
+        # optional (exists in module as no-op, but safe)
+        try:
+            travelerlogs_module.setup_interaction_router(client)
+        except Exception:
+            pass
+
         print("[travelerlogs] ✅ persistent views registered")
     except Exception as e:
-        print(f"[travelerlogs] register_persistent_views error: {e}")
-        
-    # ---- Traveler Logs: ensure Write Log button exists (testing channel only) ----
-    asyncio.create_task(
-        travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID)
-    )
+        print(f"[travelerlogs] register_views error: {e}")
 
     # ---- Register commands ----
     try:
@@ -167,11 +167,11 @@ async def on_ready():
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
-    # Traveler logs slash fallback (optional). Button-only works even if you remove this.
+    # Traveler logs (adds /writelog fallback + /postlogbutton)
     try:
         travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID)
     except Exception as e:
-        print(f"[travelerlogs] setup_travelerlog_commands error: {e}")
+        print(f"[travelerlogs] command setup error: {e}")
 
     await tree.sync(guild=guild_obj)
 
@@ -185,13 +185,12 @@ async def on_ready():
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-    # ---- Traveler Logs: ensure pinned Write Log panel exists in category (RUN ONCE) ----
+    # Traveler Logs: ensure the pinned "Write Log" panel exists (TEST MODE: test channel only)
     try:
-        # Run once after ready; do NOT loop this or you'll hit 429s.
-        asyncio.create_task(travelerlogs_module.ensure_controls_in_category(client, TRAVELERLOG_CATEGORY_ID))
-        print("[travelerlogs] ✅ ensure_controls_in_category scheduled")
+        asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
+        print("[travelerlogs] ✅ ensure_write_panels scheduled")
     except Exception as e:
-        print(f"[travelerlogs] ensure_controls_in_category error: {e}")
+        print(f"[travelerlogs] ensure_write_panels error: {e}")
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
     print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
@@ -200,10 +199,10 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     """
-    - Enforces traveler log lock so only buttons/embeds remain in the traveler log category.
-    - Relays Discord -> in-game chat (crosschat) if enabled.
+    - Traveler log lock enforcement in test channel (deletes normal text)
+    - Discord -> in-game chat relay (crosschat)
     """
-    # Traveler logs lock enforcement (deletes normal messages in locked channels/category)
+    # Traveler logs lock enforcement
     try:
         await travelerlogs_module.enforce_travelerlog_lock(message)
     except Exception as e:
