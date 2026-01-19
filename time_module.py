@@ -43,6 +43,11 @@ STATE_FILE = os.getenv("TIME_STATE_FILE", "/data/time_state.json")
 DAY_COLOR = 0xF1C40F
 NIGHT_COLOR = 0x5865F2
 
+CURRENT_YEAR = 1
+CURRENT_DAY = 1
+CURRENT_HOUR = 0
+CURRENT_MINUTE = 0
+
 # =====================
 # INTERNAL STATE
 # =====================
