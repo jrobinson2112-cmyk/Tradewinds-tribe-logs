@@ -182,14 +182,13 @@ async def on_ready():
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-        # ✅ NEW: In-game AdminCmd watcher -> posts embeds to ADMINCMD_LOG_CHANNEL_ID
         asyncio.create_task(
-            admincmd_watch_module.run_admincmd_watch_loop(
-                client,
-                rcon_cmd,
-                channel_id=ADMINCMD_LOG_CHANNEL_ID
-            )
-        )
+    admincmd_watch_module.run_admincmd_watch_loop(
+        client,
+        rcon_cmd,
+        ADMINCMD_LOG_CHANNEL_ID
+    )
+)
 
     # Ensure "Write Log" panels exist wherever your travelerlogs module wants them
     # (module handles exclusions / test-only mode internally)
