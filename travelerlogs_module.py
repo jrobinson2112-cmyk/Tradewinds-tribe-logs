@@ -25,7 +25,7 @@ import time_module
 PANEL_EMBED_COLOR = 0xFFFFFF  # "white" accent strip
 LOG_EMBED_COLOR = 0x2563EB    # blue
 
-TRAVELERLOG_TITLE = "📖 Traveler Log"
+TRAVELERLOG_TITLE = "📜 Traveler Log"
 
 # Only this channel gets the panel while testing
 TEST_ONLY_CHANNEL_ID = int(os.getenv("TRAVELERLOGS_TEST_CHANNEL_ID", "1462402354535075890"))
@@ -38,7 +38,7 @@ MAX_IMAGES_PER_LOG = 1
 
 # Hidden (non-visible) content marker to identify the panel message
 # This renders as nothing, but is detectable in code.
-PANEL_HIDDEN_MARKER = "\u200b\u200b\u200bTRAVELERLOG_PANEL\u200b\u200b\u200b"
+
 
 # =====================
 # IN-MEMORY STATE
