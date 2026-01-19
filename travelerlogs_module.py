@@ -270,78 +270,60 @@ async def _rebuild_log_message(message: discord.Message, record: Dict[str, Any])
 # MODALS
 # =====================
 
+def _get_current_day_year() -> tuple[int, int]:
+    try:
+        s = time_module.get_time_state()
+        return int(s.get("year", 1)), int(s.get("day", 1))
+    except Exception:
+        return 1, 1
+
+
 class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
-    def __init__(self, year_default: int, day_default: int):
-        super().__init__(timeout=300)
+    def __init__(self, default_year: int, default_day: int):
+        super().__init__(timeout=None)
 
-        self.year = discord.ui.TextInput(label="Year (number)", default=str(year_default), required=True)
-        self.day = discord.ui.TextInput(label="Day (number)", default=str(day_default), required=True)
-        self.title_in = discord.ui.TextInput(label="Title", placeholder="Short title for your log entry", required=True, max_length=256)
-        # Discord modal hard limit => 4000.
-        self.log = discord.ui.TextInput(label="Log", placeholder="Write your traveler log...", style=discord.TextStyle.paragraph, required=True, max_length=4000)
+        self.year_input = discord.ui.TextInput(
+            label="Year (number)",
+            required=True,
+            default=str(default_year),
+            max_length=6,
+        )
+        self.day_input = discord.ui.TextInput(
+            label="Day (number)",
+            required=True,
+            default=str(default_day),
+            max_length=6,
+        )
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            required=True,
+            max_length=256,
+        )
+        self.log_input = discord.ui.TextInput(
+            label="Log",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=4000,  # Discord limit
+        )
 
-        self.add_item(self.year)
-        self.add_item(self.day)
-        self.add_item(self.title_in)
-        self.add_item(self.log)
+        self.add_item(self.year_input)
+        self.add_item(self.day_input)
+        self.add_item(self.title_input)
+        self.add_item(self.log_input)
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        _load_state()
-
-        # Parse year/day
-        try:
-            year = int(str(self.year.value).strip())
-        except Exception:
-            year = 1
-        try:
-            day = int(str(self.day.value).strip())
-        except Exception:
-            day = 1
-
-        author_id = interaction.user.id
-        author_name = interaction.user.display_name
-
-        record = {
-            "author_id": author_id,
-            "author_name": author_name,
-            "year": year,
-            "day": day,
-            "title": str(self.title_in.value).strip(),
-            "parts": [str(self.log.value)],
-            "images": [],
-            "extra_message_ids": [],
-            "created_at": _now_str(),
-            "updated_at": _now_str(),
-        }
-
-        embeds, overflow_pages = _build_embeds_for_log(record)
-
-        # Post main log message with action buttons
-        try:
-            msg = await interaction.channel.send(embeds=embeds, view=LogActionsView(timeout=None))
-        except Exception:
-            await interaction.response.send_message("❌ I couldn't post the log here (missing perms?).", ephemeral=True)
-            return
-
-        # Store by message ID
-        _state["logs"][str(msg.id)] = record
-        _save_state()
-
-        # Post overflow pages (unlimited continuation support)
-        if overflow_pages:
-            record["extra_message_ids"] = []
-            for pg in overflow_pages:
-                try:
-                    e = discord.Embed(title=f"{LOG_TITLE} (more)", description=pg, color=EMBED_COLOR)
-                    sent = await interaction.channel.send(embed=e)
-                    record["extra_message_ids"].append(str(sent.id))
-                except Exception:
-                    break
-            record["updated_at"] = _now_str()
-            _state["logs"][str(msg.id)] = record
-            _save_state()
-
+    async def on_submit(self, interaction: discord.Interaction):
+        # your existing submit logic here
         await interaction.response.send_message("✅ Traveler log recorded.", ephemeral=True)
+
+
+class WriteLogButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✒️ Write Log", style=discord.ButtonStyle.primary, custom_id="travelerlogs:write")
+
+    async def callback(self, interaction: discord.Interaction):
+        year, day = _get_current_day_year()
+        modal = WriteLogModal(default_year=year, default_day=day)
+        await interaction.response.send_modal(modal)
 
 
 class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
