@@ -2,14 +2,13 @@
 # Button-only Traveler Logs with:
 # - Persistent "Write Log" panel (survives redeploy)
 # - Author-only Edit + Add Images buttons
-# - Image upload via attachments (NOT pasted URLs) to avoid grey placeholder embeds
+# - Image upload via Discord attachments (robust: handled via on_message, not wait_for)
 # - Default Day/Year pulled from time_module (but editable in modal)
-# - Optional lock: delete normal messages in the channel (except image-upload replies when prompted)
+# - Testing mode: panel only in TEST_CHANNEL_ID (not entire category)
 
 import os
 import json
 import time
-import asyncio
 from typing import Optional, Dict, Any, List, Tuple
 
 import discord
@@ -27,8 +26,8 @@ STATE_FILE = os.path.join(DATA_DIR, "travelerlogs_state.json")
 # Testing-only: only ensure the panel exists in this channel
 TEST_CHANNEL_ID = int(os.getenv("TRAVELERLOG_TEST_CHANNEL_ID", "1462402354535075890"))
 
-# If you later want category mode again, set this env and adjust ensure_write_panels
-LOCK_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_LOCK_CATEGORY_ID", "0"))
+# If you later want category mode again, you can use this.
+TRAVELERLOGS_LOCK_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_LOCK_CATEGORY_ID", "0"))
 
 # Excluded channels for panel posting
 EXCLUDED_CHANNEL_IDS = {
@@ -50,19 +49,19 @@ PANEL_DESC = "Tap the button below to write a Traveler Log.\n\n**Tap the button 
 # Limits
 MAX_IMAGES_PER_LOG = int(os.getenv("TRAVELERLOGS_MAX_IMAGES", "6"))
 IMAGE_UPLOAD_TIMEOUT = int(os.getenv("TRAVELERLOGS_IMAGE_TIMEOUT_SEC", "180"))  # 3 mins
-PANEL_SEARCH_LIMIT = 50  # how many recent messages to scan for an existing panel
+PANEL_SEARCH_LIMIT = 50  # scan recent messages for existing panel
 
 
 # =====================
 # STATE
 # =====================
-# message_id -> log dict (author_id, author_name, title, body, year, day, image_urls[])
+# message_id -> log dict
 _LOGS: Dict[str, Dict[str, Any]] = {}
 
 # (channel_id, user_id) -> {"target_mid": int, "expires_at": float}
 _PENDING_IMAGE_UPLOAD: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
-# Persistent views need stable custom_ids
+# Persistent views stable IDs
 CID_WRITE = "travelerlogs:write"
 CID_EDIT = "travelerlogs:edit"
 CID_ADD_IMAGES = "travelerlogs:add_images"
@@ -103,9 +102,6 @@ def _save_state():
 # TIME HELPERS
 # =====================
 def _get_current_day_year() -> Tuple[int, int]:
-    """
-    Pull current Year + Day from the time system.
-    """
     try:
         state = time_module.get_time_state()
         year = int(state.get("year", 1))
@@ -140,13 +136,10 @@ def _build_log_embed(
     embed.add_field(name=title, value=body if body else "—", inline=False)
 
     if image_urls:
-        # show the first image as the embed image (most reliable rendering)
+        # First image as embed image (renders reliably)
         embed.set_image(url=image_urls[0])
 
-        # and list the rest as links (including first, so it’s all visible)
-        links = []
-        for i, url in enumerate(image_urls[:MAX_IMAGES_PER_LOG], start=1):
-            links.append(f"[Image {i}]({url})")
+        links = [f"[Image {i}]({url})" for i, url in enumerate(image_urls[:MAX_IMAGES_PER_LOG], start=1)]
         embed.add_field(name="📸 Images", value="\n".join(links), inline=False)
 
     embed.set_footer(text=f"Logged by {author_name}")
@@ -170,14 +163,12 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
 
         self.year = discord.ui.TextInput(
             label="Year (number)",
-            placeholder=str(default_year),
             default=str(default_year),
             required=True,
             max_length=6,
         )
         self.day = discord.ui.TextInput(
             label="Day (number)",
-            placeholder=str(default_day),
             default=str(default_day),
             required=True,
             max_length=6,
@@ -202,7 +193,6 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
         self.add_item(self.body)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Parse numeric fields
         try:
             year = int(str(self.year.value).strip())
             day = int(str(self.day.value).strip())
@@ -222,13 +212,11 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
             image_urls=[],
         )
 
-        # Post log
         msg = await interaction.channel.send(
             embed=embed,
-            view=_log_view_for(message_id=0, author_id=author_id),  # temp; replaced below
+            view=_log_view_for(message_id=0, author_id=author_id),  # replaced below
         )
 
-        # Persist
         _LOGS[str(msg.id)] = {
             "author_id": author_id,
             "author_name": author_name,
@@ -240,9 +228,7 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
         }
         _save_state()
 
-        # Re-attach the correct view with the real message_id
         await msg.edit(view=_log_view_for(message_id=msg.id, author_id=author_id))
-
         await interaction.response.send_message("✅ Traveler log recorded.", ephemeral=True)
 
 
@@ -251,24 +237,9 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
         super().__init__(timeout=300)
         self.message_id = message_id
 
-        self.year = discord.ui.TextInput(
-            label="Year (number)",
-            default=str(current.get("year", 1)),
-            required=True,
-            max_length=6,
-        )
-        self.day = discord.ui.TextInput(
-            label="Day (number)",
-            default=str(current.get("day", 1)),
-            required=True,
-            max_length=6,
-        )
-        self.log_title = discord.ui.TextInput(
-            label="Title",
-            default=str(current.get("title", ""))[:120],
-            required=True,
-            max_length=120,
-        )
+        self.year = discord.ui.TextInput(label="Year (number)", default=str(current.get("year", 1)), required=True, max_length=6)
+        self.day = discord.ui.TextInput(label="Day (number)", default=str(current.get("day", 1)), required=True, max_length=6)
+        self.log_title = discord.ui.TextInput(label="Title", default=str(current.get("title", ""))[:120], required=True, max_length=120)
         self.body = discord.ui.TextInput(
             label="Log",
             default=str(current.get("body", ""))[:1900],
@@ -303,7 +274,7 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
         log["day"] = day
         log["title"] = str(self.log_title.value).strip()
         log["body"] = str(self.body.value).strip()
-        # keep images
+
         image_urls = list(log.get("image_urls", []) or [])
         author_name = str(log.get("author_name") or interaction.user.display_name)
 
@@ -319,7 +290,10 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
         )
 
         try:
-            await interaction.message.edit(embed=embed, view=_log_view_for(message_id=self.message_id, author_id=interaction.user.id))
+            await interaction.message.edit(
+                embed=embed,
+                view=_log_view_for(message_id=self.message_id, author_id=interaction.user.id),
+            )
         except Exception:
             pass
 
@@ -367,7 +341,6 @@ class TravelerLogView(discord.ui.View):
             await interaction.response.send_message("❌ Only the author can add images to this log.", ephemeral=True)
             return
 
-        # Create a pending upload slot
         key = (interaction.channel_id, interaction.user.id)
         _PENDING_IMAGE_UPLOAD[key] = {
             "target_mid": self.message_id,
@@ -375,83 +348,61 @@ class TravelerLogView(discord.ui.View):
         }
 
         await interaction.response.send_message(
-            f"📸 **Send up to {MAX_IMAGES_PER_LOG} images** in this channel now.\n"
-            f"I’ll attach them to your log and delete your upload message.\n"
-            f"Timeout: {IMAGE_UPLOAD_TIMEOUT}s",
+            f"📸 **Send images in this channel now** (up to {MAX_IMAGES_PER_LOG} total).\n"
+            f"I’ll attach them to your log. Timeout: {IMAGE_UPLOAD_TIMEOUT}s",
             ephemeral=True,
         )
 
-        # Kick off waiter task
-        asyncio.create_task(_await_image_upload(interaction.client, interaction.channel_id, interaction.user.id))
-
 
 # =====================
-# IMAGE UPLOAD FLOW
+# IMAGE UPLOAD (HANDLED VIA on_message)
 # =====================
-async def _await_image_upload(client: discord.Client, channel_id: int, user_id: int):
-    key = (channel_id, user_id)
-    info = _PENDING_IMAGE_UPLOAD.get(key)
-    if not info:
-        return
+async def maybe_consume_image_upload(message: discord.Message) -> bool:
+    """
+    If this message is an image upload that belongs to a pending Add Images flow,
+    attach images to the target log + edit the embed, and optionally delete the upload message.
 
-    # Wait for the next message from that user in that channel containing attachments
-    def check(m: discord.Message) -> bool:
-        if m.channel.id != channel_id:
-            return False
-        if m.author.id != user_id:
-            return False
-        if not m.attachments:
-            return False
-        # Still pending & not expired
-        meta = _PENDING_IMAGE_UPLOAD.get(key)
-        return bool(meta) and time.time() < float(meta.get("expires_at", 0))
+    Returns True if consumed (caller should stop further handling).
+    """
+    if not message.attachments:
+        return False
 
-    try:
-        msg: discord.Message = await client.wait_for("message", check=check, timeout=IMAGE_UPLOAD_TIMEOUT)
-    except asyncio.TimeoutError:
-        # Expired
+    key = (message.channel.id, message.author.id)
+    pending = _PENDING_IMAGE_UPLOAD.get(key)
+    if not pending:
+        return False
+
+    if time.time() > float(pending.get("expires_at", 0)):
         _PENDING_IMAGE_UPLOAD.pop(key, None)
-        return
-    except Exception:
-        _PENDING_IMAGE_UPLOAD.pop(key, None)
-        return
+        return False
 
-    # Resolve target log
-    info = _PENDING_IMAGE_UPLOAD.pop(key, None)
-    if not info:
-        return
-
-    target_mid = int(info.get("target_mid", 0))
+    target_mid = int(pending.get("target_mid", 0))
     log = _LOGS.get(str(target_mid))
     if not log:
-        # delete upload message anyway to keep clean
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        return
+        _PENDING_IMAGE_UPLOAD.pop(key, None)
+        return False
 
-    # Extract attachment URLs (this is the reliable way)
-    urls = []
-    for a in msg.attachments[:MAX_IMAGES_PER_LOG]:
+    # Extract attachment URLs
+    new_urls = []
+    for a in message.attachments:
         if a.url:
-            urls.append(a.url)
+            new_urls.append(a.url)
 
-    if not urls:
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        return
+    if not new_urls:
+        return False
 
-    # Append to existing
+    # Append up to max
     existing = list(log.get("image_urls", []) or [])
-    combined = (existing + urls)[:MAX_IMAGES_PER_LOG]
+    combined = (existing + new_urls)[:MAX_IMAGES_PER_LOG]
     log["image_urls"] = combined
     _save_state()
 
-    # Update embed
-    author_name = str(log.get("author_name") or msg.author.display_name)
+    # If we've hit max, stop waiting
+    if len(combined) >= MAX_IMAGES_PER_LOG:
+        _PENDING_IMAGE_UPLOAD.pop(key, None)
+
+    # Build updated embed
+    author_name = str(log.get("author_name") or message.author.display_name)
     embed = _build_log_embed(
         author_name=author_name,
         title=str(log.get("title", "Untitled")),
@@ -461,19 +412,23 @@ async def _await_image_upload(client: discord.Client, channel_id: int, user_id: 
         image_urls=combined,
     )
 
-    # Edit the original log message
+    # Edit original message WITHOUT fetch (more reliable perms-wise)
     try:
-        channel = msg.channel
-        target_message = await channel.fetch_message(target_mid)
-        await target_message.edit(embed=embed, view=_log_view_for(message_id=target_mid, author_id=int(log.get("author_id", 0))))
+        pm = message.channel.get_partial_message(target_mid)
+        await pm.edit(
+            embed=embed,
+            view=_log_view_for(message_id=target_mid, author_id=int(log.get("author_id", 0))),
+        )
+    except Exception as e:
+        print(f"[travelerlogs] image attach edit error: {e}")
+
+    # Delete the upload message (if bot can)
+    try:
+        await message.delete()
     except Exception:
         pass
 
-    # Delete the upload message so channels stay clean
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    return True
 
 
 # =====================
@@ -481,25 +436,21 @@ async def _await_image_upload(client: discord.Client, channel_id: int, user_id: 
 # =====================
 def register_views(client: discord.Client):
     """
-    Must be called on_ready BEFORE syncing / before users click buttons.
-    This prevents "interaction failed" after redeploy.
+    Must be called on_ready to prevent old buttons showing "interaction failed" after redeploy.
     """
     client.add_view(TravelerWritePanelView())
-    # Log view is created per-message, but buttons share same custom_ids,
-    # so persistent registration of the class isn't required here.
 
 
 def setup_interaction_router(client: discord.Client):
     """
-    No-op for this implementation (we use normal View callbacks).
-    Kept because your main.py calls it.
+    Kept for compatibility with your main.py. No-op in this implementation.
     """
     return
 
 
 def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int):
     """
-    Optional fallback slash command, useful for admins / debugging:
+    Optional slash command:
       /postlogbutton -> posts panel in current channel (admin role only)
     """
 
@@ -509,25 +460,19 @@ def setup_travelerlog_commands(tree: app_commands.CommandTree, guild_id: int):
         guild=discord.Object(id=guild_id),
     )
     async def postlogbutton(interaction: discord.Interaction):
-        # role check
         role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
         if ADMIN_ROLE_ID not in role_ids:
             await interaction.response.send_message("❌ Admin only.", ephemeral=True)
             return
 
         ok, reason = await ensure_panel_in_channel(interaction.channel)
-        if ok:
-            await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"ℹ️ {reason}", ephemeral=True)
+        await interaction.response.send_message(("✅ Panel posted." if ok else f"ℹ️ {reason}"), ephemeral=True)
 
 
 async def ensure_write_panels(client: discord.Client, guild_id: int):
     """
-    Ensures the panel exists.
-    **Testing mode:** only in TEST_CHANNEL_ID.
+    Testing mode: only ensure panel exists in TEST_CHANNEL_ID.
     """
-    # Only test channel for now (your request)
     try:
         ch = client.get_channel(TEST_CHANNEL_ID) or await client.fetch_channel(TEST_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel) and ch.id not in EXCLUDED_CHANNEL_IDS:
@@ -536,19 +481,22 @@ async def ensure_write_panels(client: discord.Client, guild_id: int):
         print(f"[travelerlogs] ensure_write_panels error: {e}")
 
 
+# ✅ Alias to stop your main.py errors if it calls the old name:
+async def ensure_controls_in_category(client: discord.Client, category_id: int):
+    """
+    Compatibility shim: old main.py calls this.
+    For now, we just ensure the test channel panel.
+    """
+    await ensure_write_panels(client, guild_id=0)
+
+
 async def ensure_panel_in_channel(channel: discord.abc.Messageable) -> Tuple[bool, str]:
-    """
-    Posts & pins a "Write Log" panel if one doesn't exist recently.
-    Returns (ok, reason).
-    """
-    # Only real text channels
     if not isinstance(channel, discord.TextChannel):
         return False, "Not a text channel."
-
     if channel.id in EXCLUDED_CHANNEL_IDS:
         return False, "Channel is excluded."
 
-    # Scan recent messages for an existing panel
+    # Scan recent for existing panel
     try:
         async for m in channel.history(limit=PANEL_SEARCH_LIMIT):
             if m.author.bot and m.embeds:
@@ -563,7 +511,6 @@ async def ensure_panel_in_channel(channel: discord.abc.Messageable) -> Tuple[boo
 
     try:
         msg = await channel.send(embed=embed, view=view)
-        # Pin it
         try:
             await msg.pin(reason="Traveler Log panel")
         except Exception:
@@ -577,30 +524,29 @@ async def ensure_panel_in_channel(channel: discord.abc.Messageable) -> Tuple[boo
 
 async def enforce_travelerlog_lock(message: discord.Message):
     """
-    Deletes normal messages in the TEST channel (or later category),
-    BUT allows:
-      - bot messages
-      - slash commands
-      - the special image-upload reply (when Add Images is waiting)
+    Enforce testing-only lock in TEST_CHANNEL_ID:
+    - deletes normal messages
+    - BUT consumes image uploads if Add Images is pending
     """
     if message.author.bot:
         return
 
-    # Only enforce in testing channel for now
     if message.channel.id != TEST_CHANNEL_ID:
         return
 
-    # Allow slash commands typed (if user can type at all)
+    # If this is an image upload for a pending Add Images, consume it.
+    try:
+        consumed = await maybe_consume_image_upload(message)
+        if consumed:
+            return
+    except Exception as e:
+        print(f"[travelerlogs] maybe_consume_image_upload error: {e}")
+
+    # Allow slash commands typed (if user can type)
     if message.content and message.content.startswith("/"):
         return
 
-    # Allow image-upload replies ONLY if we are waiting for them
-    key = (message.channel.id, message.author.id)
-    pending = _PENDING_IMAGE_UPLOAD.get(key)
-    if pending and time.time() < float(pending.get("expires_at", 0)) and message.attachments:
-        return
-
-    # Otherwise remove normal messages
+    # Otherwise delete normal messages
     try:
         await message.delete()
     except Exception:
