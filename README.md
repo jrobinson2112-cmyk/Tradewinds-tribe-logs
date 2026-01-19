@@ -1,1 +1,1 @@
-# Tradewinds-tribe-logs
+# Tradewinds-bot
