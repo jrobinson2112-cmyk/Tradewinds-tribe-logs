@@ -11,18 +11,13 @@ import players_module
 import vcstatus_module
 import crosschat_module
 import gamelogs_autopost_module
-import travelerlogs_module  # ✅ button-only traveler logs module (persistent views)
-
-import admincmd_watch_module  # ✅ NEW: watches in-game AdminCmd lines and posts embeds
+import travelerlogs_module  # ✅ traveler logs (persistent views + /postlogbutton)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Your Discord server + admin role
 GUILD_ID = 1430388266393276509
 ADMIN_ROLE_ID = 1439069787207766076
-
-# ✅ NEW: channel to post in-game AdminCmd embeds to
-ADMINCMD_LOG_CHANNEL_ID = 1451514425302454333
 
 # Webhooks (time + players) used by your webhook-upsert system
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
@@ -155,13 +150,13 @@ async def on_ready():
 
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is None:
-        print("⚠️ WARNING: rcon_command not found. Time/Crosschat/GameLogs/AdminCmd may not function correctly.")
+        print("⚠️ WARNING: rcon_command not found. Time/Crosschat/GameLogs may not function correctly.")
 
     # Time commands (requires webhook_upsert)
     time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
 
     # Traveler logs commands (includes /postlogbutton)
-    # NOTE: signature here matches the updated travelerlogs_module.
+    # NOTE: signature here matches the travelerlogs_module you pasted.
     try:
         travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
     except Exception as e:
@@ -182,16 +177,7 @@ async def on_ready():
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-        asyncio.create_task(
-    admincmd_watch_module.run_admincmd_watch_loop(
-        client,
-        rcon_cmd,
-        ADMINCMD_LOG_CHANNEL_ID
-    )
-)
-
-    # Ensure "Write Log" panels exist wherever your travelerlogs module wants them
-    # (module handles exclusions / test-only mode internally)
+    # Ensure the "Write Log" panel exists where your module wants it (test-only/channel mode inside module)
     try:
         asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
         print("[travelerlogs] ✅ ensure_write_panels scheduled")
@@ -199,14 +185,14 @@ async def on_ready():
         print(f"[travelerlogs] ensure_write_panels error: {e}")
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
-    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs, admincmd_watch")
+    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
 
 
 @client.event
 async def on_message(message: discord.Message):
     """
     Crosschat relay only.
-    (Traveler log channel restriction is handled via Discord permissions, per your plan.)
+    (Traveler log channel restriction is handled via Discord permissions.)
     """
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is not None:
