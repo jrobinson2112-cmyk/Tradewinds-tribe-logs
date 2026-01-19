@@ -189,18 +189,23 @@ def _make_time_embed_dict() -> dict:
     day = _TIME_STATE["day"]
     hour = _TIME_STATE["hour"]
     minute = _TIME_STATE["minute"]
-    icon = _time_icon(hour)
 
-    title = f"{icon} | Solunaris Time | Year {year} | Day {day} | {_format_hhmm(hour, minute)}"
-    desc = ""
+    is_day = 6 <= hour < 18
 
-    footer = f"Auto-sync: {'ON' if TIME_GAMELOGS_CHANNEL_ID else 'OFF'} | rate={_rate_game_per_real_min:.3f}x"
+    # Colors
+    DAY_COLOR = 0xF1C40F   # yellow
+    NIGHT_COLOR = 0x0B1C2D # dark blue
+
+    color = DAY_COLOR if is_day else NIGHT_COLOR
+    icon = "☀️" if is_day else "🌙"
+
+    title = f"{icon} | Solunaris Time"
+    description = f"**Year {year} • Day {day} • {hour:02d}:{minute:02d}**"
 
     return {
         "title": title,
-        "description": desc,
-        "color": EMBED_COLOR,
-        "footer": {"text": footer},
+        "description": description,
+        "color": color,
     }
 
 
