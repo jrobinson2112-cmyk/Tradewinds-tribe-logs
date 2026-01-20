@@ -159,67 +159,121 @@ def _build_log_embed(
     return e
 
 # =====================
-# PANEL DETECTION / MANAGEMENT
+# PANEL CATEGORY MODE
 # =====================
 
-def _is_panel_message(msg: discord.Message) -> bool:
-    if not msg.author.bot:
-        return False
-    if not msg.embeds:
-        return False
-    if (msg.embeds[0].title or "") != PANEL_TITLE:
-        return False
-    # Must have components (button)
-    if not msg.components:
-        return False
-    return True
+# Put your category ID here (or set env var TRAVELERLOGS_CATEGORY_ID)
+TRAVELERLOGS_CATEGORY_ID = int(os.getenv("TRAVELERLOGS_CATEGORY_ID", "1434615650890023133"))
 
-async def _delete_old_panels(channel: discord.TextChannel):
-    """
-    Deletes any prior panel messages we can find (recent scan + cached ID),
-    so we can repost a new one to keep it at the bottom.
-    """
-    # 1) Try cached ID first
-    cid = channel.id
-    cached_id = _LAST_PANEL_ID.get(cid)
-    if cached_id:
-        try:
-            m = await channel.fetch_message(cached_id)
-            if _is_panel_message(m):
-                await m.delete()
-        except Exception:
-            pass
+# Delay between channels to avoid rate limits
+PANEL_SCAN_DELAY_SECONDS = float(os.getenv("TRAVELERLOGS_PANEL_SCAN_DELAY_SECONDS", "1.25"))
 
-    # 2) Scan recent history
+
+def _is_panel_message(m: discord.Message) -> bool:
+    """
+    Detect our panel without any visible marker text.
+    We detect:
+      - message by the bot
+      - has a view/components
+      - has a button with custom_id = "travelerlogs:write"
+    """
     try:
-        async for m in channel.history(limit=PANEL_SCAN_LIMIT):
+        if not m.author.bot:
+            return False
+        if not m.components:
+            return False
+
+        # discord.py components are ActionRow -> children (buttons)
+        for row in m.components:
+            for child in getattr(row, "children", []):
+                if getattr(child, "custom_id", None) == "travelerlogs:write":
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+async def _find_existing_panel_anywhere(channel: discord.TextChannel) -> discord.Message | None:
+    """
+    Look for an existing panel either:
+      - pinned (preferred)
+      - or among the most recent messages (fallback)
+    """
+    # 1) pinned check
+    try:
+        pins = await channel.pins()
+        for m in pins:
             if _is_panel_message(m):
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
+                return m
     except Exception:
         pass
 
-async def _post_panel(channel: discord.TextChannel) -> Optional[discord.Message]:
-    """
-    Posts a new panel at the bottom.
-    """
+    # 2) recent history fallback (in case it got unpinned)
     try:
-        view = WritePanelView()
-        emb = _build_panel_embed()
-        msg = await channel.send(embed=emb, view=view)
-        _LAST_PANEL_ID[channel.id] = msg.id
-        return msg
+        async for m in channel.history(limit=25):
+            if _is_panel_message(m):
+                return m
     except Exception:
-        return None
+        pass
 
-async def refresh_panel(channel: discord.TextChannel):
+    return None
+
+
+async def ensure_write_panels(client: discord.Client, guild_id: int):
     """
-    Deletes existing panel(s) and posts a fresh one at the bottom.
+    Ensures the write panel exists (and pinned) in every text channel inside
+    TRAVELERLOGS_CATEGORY_ID, except EXCLUDED_CHANNEL_IDS.
+
+    Safe behavior:
+      - skips excluded channels
+      - skips non-text channels
+      - rate-limit friendly (sleep between channels)
     """
-    await _delete_old_panels(channel)
-    await _post_panel(channel)
+    await client.wait_until_ready()
+
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(int(guild_id))
+        except Exception:
+            return
+
+    # Fetch category
+    cat = guild.get_channel(TRAVELERLOGS_CATEGORY_ID)
+    if cat is None:
+        try:
+            cat = await guild.fetch_channel(TRAVELERLOGS_CATEGORY_ID)
+        except Exception as e:
+            print(f"[travelerlogs] ❌ could not fetch category {TRAVELERLOGS_CATEGORY_ID}: {e}")
+            return
+
+    if not isinstance(cat, discord.CategoryChannel):
+        print(f"[travelerlogs] ❌ TRAVELERLOGS_CATEGORY_ID is not a category: {TRAVELERLOGS_CATEGORY_ID}")
+        return
+
+    # Iterate channels in category
+    for ch in cat.channels:
+        try:
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if ch.id in EXCLUDED_CHANNEL_IDS:
+                continue
+
+            existing = await _find_existing_panel_anywhere(ch)
+            if existing is None:
+                # Post + pin a fresh one
+                msg = await _post_and_pin_panel(ch)
+                if msg:
+                    print(f"[travelerlogs] ✅ panel posted in #{ch.name}")
+                else:
+                    print(f"[travelerlogs] ⚠️ could not post/pin in #{ch.name}")
+
+            await asyncio.sleep(PANEL_SCAN_DELAY_SECONDS)
+
+        except Exception as e:
+            # Keep going; don't die on one channel
+            print(f"[travelerlogs] ensure_write_panels error in #{getattr(ch,'name','?')}: {e}")
+            await asyncio.sleep(PANEL_SCAN_DELAY_SECONDS)
 
 # =====================
 # TEMP PERMISSIONS FOR IMAGE UPLOAD
