@@ -1,8 +1,10 @@
 # travelerlogs_module.py
-# Button-only Traveler Logs (FINAL, category-wide panels + safe rate-limit pacing):
+# Button-only Traveler Logs (FINAL, category-wide panels + safe rate-limit pacing) + LOCATION FIELD:
 # - White panel embed with Write Log button
 # - Blue log embeds (📜 Traveler Log)
 # - Shows Year/Day under title at top (no "Solunaris time" field)
+# - ✅ Adds mandatory one-line "Location" field in Write + Edit modals
+# - ✅ Displays Location under Year/Day at the top of the embed
 # - Panel stays at bottom by deleting previous panel and reposting after each log
 # - Edit Log + Add Image buttons (only author)
 # - Add Image grants temporary Send Messages permission for upload window
@@ -90,9 +92,9 @@ def _get_current_day_year() -> Tuple[int, int]:
 # TEXT HELPERS
 # =====================
 
-def _chunk_text(text: str, limit: int = 3800) -> List[str]:
+def _chunk_text(text: str, limit: int = 3400) -> List[str]:
     """
-    Embed description hard limit 4096; keep margin for header/title.
+    Embed description hard limit 4096; keep margin for header/location/title and spacing.
     Splits long logs into multiple pages (auto continuation).
     """
     text = text or ""
@@ -116,6 +118,15 @@ def _display_name(user: discord.abc.User) -> str:
     except Exception:
         return str(user)
 
+def _sanitize_location(loc: str) -> str:
+    loc = (loc or "").strip()
+    # Keep it one line
+    loc = loc.replace("\n", " ").replace("\r", " ")
+    # Reasonable length to prevent embed bloat
+    if len(loc) > 120:
+        loc = loc[:120].rstrip() + "…"
+    return loc
+
 # =====================
 # EMBED BUILDERS
 # =====================
@@ -133,6 +144,7 @@ def _build_log_embed(
     *,
     year: int,
     day: int,
+    location: str,
     entry_title: str,
     body: str,
     author_name: str,
@@ -140,13 +152,21 @@ def _build_log_embed(
     page: int = 1,
     total_pages: int = 1,
 ) -> discord.Embed:
+    # Structured description so we can parse it back reliably:
+    # Line 1: **Year X • Day Y** *(Page a/b)*
+    # Line 2: **Location:** Somewhere
+    # Line 3: **Title**
+    # Blank
+    # Body...
+
     header = f"**Year {year} • Day {day}**"
     if total_pages > 1:
         header += f"   *(Page {page}/{total_pages})*"
 
-    desc_parts = [header]
-    if entry_title:
-        desc_parts.append(f"**{entry_title}**")
+    loc_line = f"**Location:** {(_sanitize_location(location) or 'Unknown')}"
+    title_line = f"**{(entry_title or '').strip() or 'Untitled'}**"
+
+    desc_parts = [header, loc_line, title_line]
     if body:
         desc_parts.append(body)
 
@@ -161,6 +181,91 @@ def _build_log_embed(
 
     e.set_footer(text=f"Logged by {author_name}")
     return e
+
+def _parse_log_embed_description(desc: str) -> Tuple[int, int, str, str, str]:
+    """
+    Returns (year, day, location, title, body) from our structured description.
+    Safe defaults if parsing fails.
+    """
+    year, day = 1, 1
+    location = ""
+    title = ""
+    body = ""
+
+    if not desc:
+        return year, day, location, title, body
+
+    lines = desc.splitlines()
+
+    # First line: **Year X • Day Y**   *(Page a/b)*
+    try:
+        first = lines[0].replace("*", "")
+        tokens = first.replace("•", "").split()
+        # tokens like: ['Year','2','Day','336','(Page','1/2)'] (page bits may exist)
+        if "Year" in tokens and "Day" in tokens:
+            year = int(tokens[tokens.index("Year") + 1])
+            day = int(tokens[tokens.index("Day") + 1])
+    except Exception:
+        pass
+
+    # Find "Location:" line and Title line
+    # Because we add blank lines between sections, lines may include empty strings.
+    # We'll search for a line containing "Location:" (after stripping *)
+    loc_idx = None
+    for i, ln in enumerate(lines[:10]):  # only need the top bit
+        cleaned = ln.replace("*", "").strip()
+        if cleaned.lower().startswith("location:") or cleaned.lower().startswith("location"):
+            loc_idx = i
+            break
+        if "Location:" in cleaned:
+            loc_idx = i
+            break
+
+    if loc_idx is not None:
+        try:
+            loc_line = lines[loc_idx].replace("*", "").strip()
+            # "Location: Something" or "Location:  Something"
+            if "Location:" in loc_line:
+                location = loc_line.split("Location:", 1)[1].strip()
+            else:
+                # fallback
+                parts = loc_line.split(":", 1)
+                if len(parts) == 2:
+                    location = parts[1].strip()
+        except Exception:
+            location = ""
+
+        # Title should be after location line, skipping blanks
+        t_idx = loc_idx + 1
+        while t_idx < len(lines) and not lines[t_idx].strip():
+            t_idx += 1
+        if t_idx < len(lines):
+            try:
+                title = lines[t_idx].strip()
+                # remove surrounding ** if present
+                if title.startswith("**") and title.endswith("**") and len(title) >= 4:
+                    title = title[2:-2].strip()
+                else:
+                    title = title.replace("**", "").strip()
+            except Exception:
+                title = ""
+
+        # Body is everything after title line (skip blank lines)
+        b_idx = t_idx + 1
+        while b_idx < len(lines) and not lines[b_idx].strip():
+            b_idx += 1
+        if b_idx < len(lines):
+            body = "\n".join(lines[b_idx:]).strip()
+    else:
+        # If location line missing, best-effort:
+        # try treat second non-empty line as title, rest body
+        nonempty = [ln for ln in lines if ln.strip()]
+        if len(nonempty) >= 2:
+            possible_title = nonempty[1].replace("**", "").strip()
+            title = possible_title
+            body = "\n".join(nonempty[2:]).strip() if len(nonempty) > 2 else ""
+
+    return year, day, location, title, body
 
 # =====================
 # PANEL DETECTION / MANAGEMENT
@@ -243,7 +348,7 @@ async def _revoke_temp_send_messages(channel: discord.TextChannel, member: disco
         pass
 
 # =====================
-# UI: MODALS
+# UI: MODALS  ✅ LOCATION ADDED
 # =====================
 
 class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
@@ -262,6 +367,12 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
             default=str(default_day),
             max_length=6,
         )
+        self.location = discord.ui.TextInput(
+            label="Location",
+            required=True,
+            placeholder="Where are you? (one line)",
+            max_length=120,
+        )
         self.entry_title = discord.ui.TextInput(
             label="Title",
             required=True,
@@ -278,6 +389,7 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
 
         self.add_item(self.year)
         self.add_item(self.day)
+        self.add_item(self.location)
         self.add_item(self.entry_title)
         self.add_item(self.entry_body)
 
@@ -293,16 +405,19 @@ class WriteLogModal(discord.ui.Modal, title="Write a Traveler Log"):
         except Exception:
             d = 1
 
+        loc = _sanitize_location(str(self.location.value))
+
         self.result = {
             "year": max(1, y),
             "day": max(1, d),
+            "location": loc if loc else "Unknown",
             "title": str(self.entry_title.value).strip()[:256],
             "body": str(self.entry_body.value).rstrip(),
         }
         await interaction.response.defer(ephemeral=True)
 
 class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
-    def __init__(self, *, default_year: int, default_day: int, default_title: str, default_body: str):
+    def __init__(self, *, default_year: int, default_day: int, default_location: str, default_title: str, default_body: str):
         super().__init__(timeout=300)
 
         self.year = discord.ui.TextInput(
@@ -316,6 +431,12 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
             required=True,
             default=str(default_day),
             max_length=6,
+        )
+        self.location = discord.ui.TextInput(
+            label="Location",
+            required=True,
+            default=_sanitize_location(default_location) or "Unknown",
+            max_length=120,
         )
         self.entry_title = discord.ui.TextInput(
             label="Title",
@@ -333,6 +454,7 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
 
         self.add_item(self.year)
         self.add_item(self.day)
+        self.add_item(self.location)
         self.add_item(self.entry_title)
         self.add_item(self.entry_body)
 
@@ -348,9 +470,12 @@ class EditLogModal(discord.ui.Modal, title="Edit Traveler Log"):
         except Exception:
             d = 1
 
+        loc = _sanitize_location(str(self.location.value))
+
         self.result = {
             "year": max(1, y),
             "day": max(1, d),
+            "location": loc if loc else "Unknown",
             "title": str(self.entry_title.value).strip()[:256],
             "body": str(self.entry_body.value).rstrip(),
         }
@@ -383,6 +508,7 @@ class WritePanelView(discord.ui.View):
             emb = _build_log_embed(
                 year=modal.result["year"],
                 day=modal.result["day"],
+                location=modal.result["location"],
                 entry_title=modal.result["title"],
                 body=chunk,
                 author_name=author_name,
@@ -420,34 +546,21 @@ class LogActionsView(discord.ui.View):
             await interaction.response.send_message("❌ Only the log author can edit this.", ephemeral=True)
             return
 
-        year = 1
-        day = 1
-        title = ""
-        body = ""
+        year, day, location, title, body = 1, 1, "Unknown", "", ""
 
         try:
             emb = msg.embeds[0]
-            raw_desc = emb.description or ""
-
-            first_line = raw_desc.splitlines()[0]
-            cleaned = first_line.replace("*", "").replace("•", "")
-            tokens = cleaned.split()
-            if "Year" in tokens and "Day" in tokens:
-                year = int(tokens[tokens.index("Year") + 1])
-                day = int(tokens[tokens.index("Day") + 1])
-
-            rest = "\n".join(raw_desc.splitlines()[1:]).strip()
-            if rest.startswith("**") and "**" in rest[2:]:
-                end = rest.find("**", 2)
-                title = rest[2:end].strip()
-                body = rest[end + 2:].strip()
-            else:
-                title = ""
-                body = rest
+            year, day, location, title, body = _parse_log_embed_description(emb.description or "")
         except Exception:
             pass
 
-        modal = EditLogModal(default_year=year, default_day=day, default_title=title, default_body=body)
+        modal = EditLogModal(
+            default_year=year,
+            default_day=day,
+            default_location=location,
+            default_title=title,
+            default_body=body,
+        )
         await interaction.response.send_modal(modal)
         await modal.wait()
 
@@ -462,6 +575,7 @@ class LogActionsView(discord.ui.View):
         new_embed = _build_log_embed(
             year=modal.result["year"],
             day=modal.result["day"],
+            location=modal.result["location"],
             entry_title=modal.result["title"],
             body=new_body,
             author_name=_display_name(interaction.user),
@@ -476,11 +590,13 @@ class LogActionsView(discord.ui.View):
             await interaction.followup.send(f"❌ Edit failed: {e}", ephemeral=True)
             return
 
+        # Continuations
         if len(new_chunks) > 1:
             for i, chunk in enumerate(new_chunks[1:], start=2):
                 cont = _build_log_embed(
                     year=modal.result["year"],
                     day=modal.result["day"],
+                    location=modal.result["location"],
                     entry_title=modal.result["title"],
                     body=chunk,
                     author_name=_display_name(interaction.user),
@@ -567,31 +683,12 @@ class LogActionsView(discord.ui.View):
 
         try:
             emb = msg.embeds[0]
-            raw_desc = emb.description or ""
-
-            # Reuse current title/body from description
-            first_line = raw_desc.splitlines()[0]
-            cleaned = first_line.replace("*", "").replace("•", "")
-            tokens = cleaned.split()
-            year = 1
-            day = 1
-            if "Year" in tokens and "Day" in tokens:
-                year = int(tokens[tokens.index("Year") + 1])
-                day = int(tokens[tokens.index("Day") + 1])
-
-            rest = "\n".join(raw_desc.splitlines()[1:]).strip()
-            title = ""
-            body = ""
-            if rest.startswith("**") and "**" in rest[2:]:
-                end = rest.find("**", 2)
-                title = rest[2:end].strip()
-                body = rest[end + 2:].strip()
-            else:
-                body = rest
+            year, day, location, title, body = _parse_log_embed_description(emb.description or "")
 
             new_embed = _build_log_embed(
                 year=year,
                 day=day,
+                location=location or "Unknown",
                 entry_title=title,
                 body=body,
                 author_name=_display_name(interaction.user),
@@ -653,7 +750,6 @@ async def ensure_write_panels(client: discord.Client, guild_id: int):
     if not isinstance(category, discord.CategoryChannel):
         return
 
-    # Iterate channels (text only), pace to avoid 429
     for ch in category.channels:
         if not isinstance(ch, discord.TextChannel):
             continue
@@ -661,12 +757,10 @@ async def ensure_write_panels(client: discord.Client, guild_id: int):
             continue
 
         try:
-            # Cleanup duplicates + ensure a fresh panel exists
             await refresh_panel(ch)
         except Exception:
             pass
 
-        # Pace
         await asyncio.sleep(max(0.5, ENSURE_PANEL_DELAY_SECONDS))
 
 # =====================
