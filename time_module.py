@@ -2,10 +2,13 @@
 # Solunaris Time system (webhook embed updater + Discord gamelog embed sync)
 #
 # Updates in this version (per your request):
-# ✅ Auto rollover years (365-day years): Day 366 -> Year+1 Day 1 (display)
+# ✅ REMOVE manual/forced year rollover logic
+#    - Year is ONLY whatever is stored in state / set by /settime
+#    - Day can keep increasing from logs; we DO NOT auto-wrap it
 # ✅ Option A display: ALL on one line in the EMBED TITLE (larger look)
 # ✅ Sends a message to a channel at the start of each NEW DAY (once per day)
-# ✅ Keeps compatibility: get_time_state() still returns {"year","day","hour","minute"} for other modules
+#    - Message: "🌅 A New Day in Solunaris - Year {year} - Day {day}"
+# ✅ Keeps compatibility: get_time_state() returns {"year","day","hour","minute"} for other modules
 #
 # Env vars:
 #   TIME_STATE_DIR=/data
@@ -19,13 +22,7 @@
 #   TIME_SHOW_DEBUG=0
 #
 # NEW:
-#   TIME_DAYS_PER_YEAR=365
 #   TIME_DAY_ROLLOVER_CHANNEL_ID=1430388267446042666
-#   TIME_DAY_ROLLOVER_MESSAGE="🌅 A New Day in Solunaris: Year {year} • Day {day}"
-#
-# Notes:
-# - Internally we track ABSOLUTE day from game logs (abs_day).
-# - Public API exposes "day" as DAY-OF-YEAR (1..365) and "year" computed automatically.
 
 from __future__ import annotations
 
@@ -59,30 +56,21 @@ RATE_SMOOTHING = float(os.getenv("TIME_RATE_SMOOTHING", "0.2"))
 
 SHOW_DEBUG = os.getenv("TIME_SHOW_DEBUG", "0").lower() in ("1", "true", "yes", "on")
 
-# Year rollover rules
-DAYS_PER_YEAR = int(os.getenv("TIME_DAYS_PER_YEAR", "365"))
-
 # Daily rollover announcement channel + message
 DAY_ROLLOVER_CHANNEL_ID = int(os.getenv("TIME_DAY_ROLLOVER_CHANNEL_ID", "1430388267446042666"))
-DAY_ROLLOVER_MESSAGE = os.getenv(
-    "TIME_DAY_ROLLOVER_MESSAGE",
-    "🗓️ New day: Year {year} • Day {day}"
-)
+DAY_ROLLOVER_MESSAGE = "🌅 A New Day in Solunaris - Year {year} - Day {day}"
 
 # =====================
 # STATE (single source of truth)
 # =====================
 # Public state (Traveler Logs reads this).
-# NOTE: "day" here is DAY-OF-YEAR (1..DAYS_PER_YEAR), not absolute.
+# NOTE: year is NOT auto-rolled; it's manual (via /settime or persisted state).
 _TIME_STATE: Dict[str, int] = {
     "year": 1,
-    "day": 1,      # day-of-year (1..365)
+    "day": 1,      # in-game day number (can keep increasing)
     "hour": 0,
     "minute": 0,
 }
-
-# Internal absolute day (as seen in game logs: "Day 366, ...")
-_ABS_DAY: int = 1
 
 # Anchor model for forecasting between syncs:
 #   game_minutes_now ~= anchor_game_minutes + (real_minutes_delta * rate_game_per_real_min)
@@ -94,7 +82,7 @@ _last_sync_game_minutes: Optional[float] = None     # last synced in-game minute
 _last_timed_line_fingerprint: Optional[str] = None  # prevents re-syncing the same line repeatedly
 
 # Day rollover announcement guard
-_last_announced_abs_day: Optional[int] = None
+_last_announced_day: Optional[int] = None
 
 
 # =====================
@@ -103,7 +91,7 @@ _last_announced_abs_day: Optional[int] = None
 def get_time_state() -> dict:
     """
     Public accessor for other modules.
-    Returns: {"year","day","hour","minute"} where day=DAY-OF-YEAR.
+    Returns: {"year","day","hour","minute"}.
     """
     return dict(_TIME_STATE)
 
@@ -119,7 +107,7 @@ def _ensure_dir(path: str):
 def _load_state():
     global _anchor_real_epoch, _anchor_game_minutes, _rate_game_per_real_min
     global _last_sync_real_epoch, _last_sync_game_minutes, _last_timed_line_fingerprint
-    global _ABS_DAY, _last_announced_abs_day
+    global _last_announced_day
 
     try:
         if not os.path.exists(STATE_FILE):
@@ -129,23 +117,12 @@ def _load_state():
         if not isinstance(data, dict):
             return
 
-        # public time fields (computed fields)
         ts = data.get("time_state", {})
         if isinstance(ts, dict):
             for k in ("year", "day", "hour", "minute"):
                 if k in ts:
                     _TIME_STATE[k] = int(ts[k])
 
-        # internal absolute day (preferred)
-        if data.get("abs_day") is not None:
-            _ABS_DAY = max(1, int(data["abs_day"]))
-        else:
-            # fallback: reconstruct from year/day-of-year if present
-            y = int(_TIME_STATE.get("year", 1))
-            doy = int(_TIME_STATE.get("day", 1))
-            _ABS_DAY = max(1, (max(1, y) - 1) * DAYS_PER_YEAR + max(1, doy))
-
-        # anchor fields
         _anchor_real_epoch = data.get("anchor_real_epoch", None)
         _anchor_game_minutes = data.get("anchor_game_minutes", None)
         if data.get("rate_game_per_real_min") is not None:
@@ -155,8 +132,8 @@ def _load_state():
         _last_sync_game_minutes = data.get("last_sync_game_minutes", None)
         _last_timed_line_fingerprint = data.get("last_timed_line_fingerprint", None)
 
-        if data.get("last_announced_abs_day") is not None:
-            _last_announced_abs_day = int(data["last_announced_abs_day"])
+        if data.get("last_announced_day") is not None:
+            _last_announced_day = int(data["last_announced_day"])
 
     except Exception as e:
         if SHOW_DEBUG:
@@ -167,14 +144,13 @@ def _save_state():
         _ensure_dir(STATE_FILE)
         payload = {
             "time_state": dict(_TIME_STATE),
-            "abs_day": int(_ABS_DAY),
             "anchor_real_epoch": _anchor_real_epoch,
             "anchor_game_minutes": _anchor_game_minutes,
             "rate_game_per_real_min": _rate_game_per_real_min,
             "last_sync_real_epoch": _last_sync_real_epoch,
             "last_sync_game_minutes": _last_sync_game_minutes,
             "last_timed_line_fingerprint": _last_timed_line_fingerprint,
-            "last_announced_abs_day": _last_announced_abs_day,
+            "last_announced_day": _last_announced_day,
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -186,18 +162,9 @@ def _save_state():
 # =====================
 # TIME HELPERS
 # =====================
-def _compute_year_and_doy(abs_day: int) -> Tuple[int, int]:
-    """
-    Convert absolute day (1..infinity) to (year, day_of_year) using DAYS_PER_YEAR.
-    """
-    abs_day = max(1, int(abs_day))
-    year = ((abs_day - 1) // DAYS_PER_YEAR) + 1
-    doy = ((abs_day - 1) % DAYS_PER_YEAR) + 1
-    return year, doy
-
-def _game_minutes_from_parts(abs_day: int, hour: int, minute: int) -> int:
-    # For arithmetic, treat AbsDay N as ((N-1)*1440 + ...)
-    day_index = max(1, int(abs_day)) - 1
+def _game_minutes_from_parts(day: int, hour: int, minute: int) -> int:
+    # For arithmetic, treat Day N as ((N-1)*1440 + ...)
+    day_index = max(1, int(day)) - 1
     return day_index * 1440 + int(hour) * 60 + int(minute)
 
 def _parts_from_game_minutes(game_minutes: float) -> Tuple[int, int, int]:
@@ -206,23 +173,18 @@ def _parts_from_game_minutes(game_minutes: float) -> Tuple[int, int, int]:
         gm = 0
     day_index, rem = divmod(gm, 1440)
     hour, minute = divmod(rem, 60)
-    abs_day = day_index + 1
-    return abs_day, hour, minute
+    day = day_index + 1
+    return day, hour, minute
 
-def _set_time_state_from_abs(abs_day: int, hour: int, minute: int):
-    """
-    Centralized write: update internal abs day + computed public year/day-of-year + hh:mm.
-    """
-    global _ABS_DAY
-    _ABS_DAY = max(1, int(abs_day))
-    year, doy = _compute_year_and_doy(_ABS_DAY)
-    _TIME_STATE["year"] = int(year)
-    _TIME_STATE["day"] = int(doy)
-    _TIME_STATE["hour"] = int(hour)
-    _TIME_STATE["minute"] = int(minute)
-
-def _format_hhmm(hour: int, minute: int) -> str:
-    return f"{int(hour):02d}:{int(minute):02d}"
+def _set_time_state(year: Optional[int] = None, day: Optional[int] = None, hour: Optional[int] = None, minute: Optional[int] = None):
+    if year is not None:
+        _TIME_STATE["year"] = max(1, int(year))
+    if day is not None:
+        _TIME_STATE["day"] = max(1, int(day))
+    if hour is not None:
+        _TIME_STATE["hour"] = int(hour)
+    if minute is not None:
+        _TIME_STATE["minute"] = int(minute)
 
 def _make_time_embed_dict() -> dict:
     """
@@ -244,7 +206,7 @@ def _make_time_embed_dict() -> dict:
 
     return {
         "title": title,
-        "description": "",   # keep single-line look
+        "description": "",
         "color": color,
     }
 
@@ -285,17 +247,17 @@ def _find_newest_timed_line_in_text(text: str) -> Optional[dict]:
         return None
 
     last = matches[-1]
-    abs_day = int(last.group("day"))
+    day = int(last.group("day"))
     hh = int(last.group("h"))
     mm = int(last.group("m"))
 
     real_epoch = _parse_real_epoch_from_line(text[last.start(): last.end()+200]) or _parse_real_epoch_from_line(text)
 
     snippet = text[max(0, last.start()-40): min(len(text), last.end()+80)].strip()
-    fingerprint = f"D{abs_day}-{hh:02d}{mm:02d}-{hash(snippet)}"
+    fingerprint = f"D{day}-{hh:02d}{mm:02d}-{hash(snippet)}"
 
     return {
-        "abs_day": abs_day,
+        "day": day,
         "hour": hh,
         "minute": mm,
         "real_epoch": real_epoch,
@@ -335,11 +297,11 @@ def _apply_sync_from_timed(parsed: dict) -> Tuple[bool, str]:
     if fp and _last_timed_line_fingerprint == fp:
         return False, "Timed line already applied."
 
-    abs_day = int(parsed["abs_day"])
+    day = int(parsed["day"])
     hh = int(parsed["hour"])
     mm = int(parsed["minute"])
 
-    game_minutes = _game_minutes_from_parts(abs_day, hh, mm)
+    game_minutes = _game_minutes_from_parts(day, hh, mm)
 
     real_epoch = parsed.get("real_epoch")
     if real_epoch is None:
@@ -361,31 +323,31 @@ def _apply_sync_from_timed(parsed: dict) -> Tuple[bool, str]:
     _last_sync_game_minutes = float(game_minutes)
     _last_timed_line_fingerprint = fp
 
-    # Update state (this computes year/day-of-year)
-    _set_time_state_from_abs(abs_day, hh, mm)
+    # Update public time state (Year is NOT derived here; keep current year)
+    _set_time_state(day=day, hour=hh, minute=mm)
 
     _save_state()
-    return True, f"Synced to AbsDay {abs_day} {hh:02d}:{mm:02d} (rate={_rate_game_per_real_min:.3f}x)."
+    return True, f"Synced to Day {day} {hh:02d}:{mm:02d} (rate={_rate_game_per_real_min:.3f}x)."
 
 
 def _tick_forecast_now() -> Optional[int]:
     """
-    Update state from anchor + current time using estimated rate.
-    Returns previous abs day if changed can be detected by caller.
+    Forecast time from anchor + current time using estimated rate.
+    Returns previous day so caller can detect rollover.
     """
     if _anchor_real_epoch is None or _anchor_game_minutes is None:
         return None
 
-    prev_abs = int(_ABS_DAY)
+    prev_day = int(_TIME_STATE["day"])
 
     now = time.time()
     dr_min = (now - float(_anchor_real_epoch)) / 60.0
     gm_now = float(_anchor_game_minutes) + dr_min * float(_rate_game_per_real_min)
 
-    abs_day, hh, mm = _parts_from_game_minutes(gm_now)
-    _set_time_state_from_abs(abs_day, hh, mm)
+    day, hh, mm = _parts_from_game_minutes(gm_now)
+    _set_time_state(day=day, hour=hh, minute=mm)
 
-    return prev_abs
+    return prev_day
 
 
 async def _sync_from_discord_gamelogs(client: discord.Client) -> Tuple[bool, str]:
@@ -424,29 +386,26 @@ async def _sync_from_discord_gamelogs(client: discord.Client) -> Tuple[bool, str
 # =====================
 # DAY ROLLOVER ANNOUNCEMENT
 # =====================
-async def _announce_new_day_if_needed(client: discord.Client, prev_abs_day: Optional[int]):
+async def _announce_new_day_if_needed(client: discord.Client, prev_day: Optional[int]):
     """
-    If abs day advanced and we haven't announced it yet, post message in DAY_ROLLOVER_CHANNEL_ID.
+    If day advanced and we haven't announced it yet, post message in DAY_ROLLOVER_CHANNEL_ID.
     """
-    global _last_announced_abs_day
+    global _last_announced_day
 
-    if prev_abs_day is None:
+    if prev_day is None:
         return
 
-    current_abs = int(_ABS_DAY)
-    if current_abs == int(prev_abs_day):
+    current_day = int(_TIME_STATE["day"])
+    if current_day == int(prev_day):
         return
 
-    # Only announce the newest day (guard against duplicate calls)
-    if _last_announced_abs_day is not None and int(_last_announced_abs_day) == current_abs:
+    # Only announce once per day value
+    if _last_announced_day is not None and int(_last_announced_day) == current_day:
         return
 
-    # Build message
     year = _TIME_STATE["year"]
-    doy = _TIME_STATE["day"]
-    msg_text = DAY_ROLLOVER_MESSAGE.format(year=year, day=doy)
+    msg_text = DAY_ROLLOVER_MESSAGE.format(year=year, day=current_day)
 
-    # Send
     try:
         ch = client.get_channel(DAY_ROLLOVER_CHANNEL_ID)
         if ch is None:
@@ -454,7 +413,7 @@ async def _announce_new_day_if_needed(client: discord.Client, prev_abs_day: Opti
 
         if isinstance(ch, (discord.TextChannel, discord.Thread)):
             await ch.send(msg_text)
-            _last_announced_abs_day = current_abs
+            _last_announced_day = current_day
             _save_state()
     except Exception as e:
         if SHOW_DEBUG:
@@ -494,7 +453,7 @@ def setup_time_commands(
     )
     @app_commands.describe(
         year="Year number",
-        day="Day of year (1-365)",
+        day="In-game day number",
         hour="Hour (0-23)",
         minute="Minute (0-59)",
     )
@@ -512,16 +471,13 @@ def setup_time_commands(
         hour = max(0, min(23, int(hour)))
         minute = max(0, min(59, int(minute)))
         year = max(1, int(year))
-        day = max(1, min(DAYS_PER_YEAR, int(day)))
-
-        # Convert year/day-of-year to absolute day
-        abs_day = (year - 1) * DAYS_PER_YEAR + day
+        day = max(1, int(day))
 
         global _anchor_real_epoch, _anchor_game_minutes, _last_sync_real_epoch, _last_sync_game_minutes, _last_timed_line_fingerprint
 
-        _set_time_state_from_abs(abs_day, hour, minute)
+        _set_time_state(year=year, day=day, hour=hour, minute=minute)
 
-        gm = _game_minutes_from_parts(abs_day, hour, minute)
+        gm = _game_minutes_from_parts(day, hour, minute)
         now = time.time()
         _anchor_real_epoch = now
         _anchor_game_minutes = float(gm)
@@ -538,7 +494,7 @@ def setup_time_commands(
                 print("[time_module] webhook_upsert error:", e)
 
         await interaction.response.send_message(
-            f"✅ Set time: Year {year} • Day {day} • {_format_hhmm(hour, minute)}",
+            f"✅ Set time: Year {year} • Day {day} • {hour:02d}:{minute:02d}",
             ephemeral=True,
         )
 
@@ -580,24 +536,23 @@ async def run_time_loop(client: discord.Client, rcon_cmd, webhook_upsert):
     - Every UPDATE_SECONDS:
         - forecast time from anchor
         - attempt auto-sync from discord gamelog embeds (quietly)
-        - detect day rollover and announce
+        - detect new day and announce
         - update time webhook
     """
     _ensure_dir(STATE_FILE)
     _load_state()
 
-    # If no anchor, create one from saved time
-    global _anchor_real_epoch, _anchor_game_minutes, _last_announced_abs_day
+    global _anchor_real_epoch, _anchor_game_minutes, _last_announced_day
 
     if _anchor_real_epoch is None or _anchor_game_minutes is None:
-        gm = _game_minutes_from_parts(_ABS_DAY, _TIME_STATE["hour"], _TIME_STATE["minute"])
+        gm = _game_minutes_from_parts(_TIME_STATE["day"], _TIME_STATE["hour"], _TIME_STATE["minute"])
         _anchor_real_epoch = time.time()
         _anchor_game_minutes = float(gm)
         _save_state()
 
-    # Prevent announcing immediately on startup unless the day actually changes later
-    if _last_announced_abs_day is None:
-        _last_announced_abs_day = int(_ABS_DAY)
+    # Don't announce immediately on startup unless day actually changes later
+    if _last_announced_day is None:
+        _last_announced_day = int(_TIME_STATE["day"])
         _save_state()
 
     print("[time_module] ✅ time loop running")
@@ -605,23 +560,17 @@ async def run_time_loop(client: discord.Client, rcon_cmd, webhook_upsert):
     last_webhook_push = 0.0
     while True:
         try:
-            # Forecast
-            prev_abs = _tick_forecast_now()
+            prev_day = _tick_forecast_now()
 
-            # Auto-sync (non-fatal)
             ok, info = await _sync_from_discord_gamelogs(client)
             if SHOW_DEBUG:
                 print(f"[time_module] Auto-sync: {'OK' if ok else 'NO'} - {info}")
 
-            # Forecast again (stabilize)
-            prev_abs_2 = _tick_forecast_now()
-            # Use the earlier prev_abs if available, otherwise the second
-            prev_for_roll = prev_abs if prev_abs is not None else prev_abs_2
+            prev_day_2 = _tick_forecast_now()
+            prev_for_roll = prev_day if prev_day is not None else prev_day_2
 
-            # Announce day rollover if needed
             await _announce_new_day_if_needed(client, prev_for_roll)
 
-            # Push webhook
             now = time.time()
             if now - last_webhook_push >= max(5, UPDATE_SECONDS - 1):
                 try:
@@ -631,7 +580,6 @@ async def run_time_loop(client: discord.Client, rcon_cmd, webhook_upsert):
                         print("[time_module] webhook_upsert error:", e)
                 last_webhook_push = now
 
-            # Persist
             _save_state()
 
         except Exception as e:
