@@ -1,4 +1,4 @@
-# main.py (FULL)
+# main.py (FULL) — with per-module enable/disable env toggles
 import os
 import asyncio
 import discord
@@ -22,6 +22,28 @@ ADMIN_ROLE_ID = 1439069787207766076
 # Webhooks (time + players) used by your webhook-upsert system
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")                 # time webhook
 PLAYERS_WEBHOOK_URL = os.getenv("PLAYERS_WEBHOOK_URL") # players webhook
+
+# =====================
+# MODULE TOGGLES (Railway env vars)
+# Set any to "0" to disable:
+#   ENABLE_TIME=0
+#   ENABLE_TRIBELOGS=0
+#   ENABLE_PLAYERS=0
+#   ENABLE_VCSTATUS=0
+#   ENABLE_CROSSCHAT=0
+#   ENABLE_GAMELOGS_AUTOPOST=0
+#   ENABLE_TRAVELERLOGS=0
+# =====================
+def _env_on(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+ENABLE_TIME = _env_on("ENABLE_TIME", "1")
+ENABLE_TRIBELOGS = _env_on("ENABLE_TRIBELOGS", "1")
+ENABLE_PLAYERS = _env_on("ENABLE_PLAYERS", "0")
+ENABLE_VCSTATUS = _env_on("ENABLE_VCSTATUS", "0")
+ENABLE_CROSSCHAT = _env_on("ENABLE_CROSSCHAT", "0")
+ENABLE_GAMELOGS_AUTOPOST = _env_on("ENABLE_GAMELOGS_AUTOPOST", "1")
+ENABLE_TRAVELERLOGS = _env_on("ENABLE_TRAVELERLOGS", "1")
 
 # ---- Discord client / intents ----
 intents = discord.Intents.default()
@@ -134,66 +156,86 @@ async def _start_task_maybe(func, *args):
 async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
 
-    # ---- Traveler Logs (persistent buttons) ----
-    # IMPORTANT: this prevents "interaction failed" after redeploys.
-    try:
-        travelerlogs_module.register_views(client)
-        print("[travelerlogs] ✅ persistent views registered")
-    except Exception as e:
-        print(f"[travelerlogs] register views error: {e}")
-
-    # ---- Register commands ----
-    try:
-        tribelogs_module.setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
-    except TypeError:
-        tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
-
     rcon_cmd = _get_rcon_command()
-    if rcon_cmd is None:
+    if rcon_cmd is None and (ENABLE_TIME or ENABLE_CROSSCHAT or ENABLE_GAMELOGS_AUTOPOST):
         print("⚠️ WARNING: rcon_command not found. Time/Crosschat/GameLogs may not function correctly.")
 
-    # Time commands (requires webhook_upsert)
-    time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
+    # ---- Traveler Logs (persistent buttons) ----
+    if ENABLE_TRAVELERLOGS:
+        try:
+            travelerlogs_module.register_views(client)
+            print("[travelerlogs] ✅ persistent views registered")
+        except Exception as e:
+            print(f"[travelerlogs] register views error: {e}")
 
-    # Traveler logs commands (includes /postlogbutton)
-    # NOTE: signature here matches the travelerlogs_module you pasted.
-    try:
-        travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
-    except Exception as e:
-        print(f"[travelerlogs] command setup error: {e}")
+    # ---- Register commands ----
+    if ENABLE_TRIBELOGS:
+        try:
+            tribelogs_module.setup_tribelog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
+        except TypeError:
+            tribelogs_module.setup_tribelog_commands(tree, GUILD_ID)
+
+    if ENABLE_TIME:
+        # Time commands (requires webhook_upsert)
+        time_module.setup_time_commands(tree, GUILD_ID, ADMIN_ROLE_ID, rcon_cmd, webhook_upsert)
+
+    if ENABLE_TRAVELERLOGS:
+        # Traveler logs commands (includes /postlogbutton)
+        try:
+            travelerlogs_module.setup_travelerlog_commands(tree, GUILD_ID, ADMIN_ROLE_ID)
+        except Exception as e:
+            print(f"[travelerlogs] command setup error: {e}")
 
     await tree.sync(guild=guild_obj)
 
     # ---- Start loops ----
-    await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
+    if ENABLE_TRIBELOGS:
+        await _start_task_maybe(tribelogs_module.run_tribelogs_loop)
 
-    await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
+    if ENABLE_TIME:
+        await _start_task_maybe(time_module.run_time_loop, client, rcon_cmd, webhook_upsert)
 
-    await _start_task_maybe(players_module.run_players_loop)
+    if ENABLE_PLAYERS:
+        await _start_task_maybe(players_module.run_players_loop)
 
-    await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
+    if ENABLE_VCSTATUS:
+        await _start_task_maybe(vcstatus_module.run_vcstatus_loop, client)
 
-    if rcon_cmd is not None:
+    if rcon_cmd is not None and ENABLE_CROSSCHAT:
         await _start_task_maybe(crosschat_module.run_crosschat_loop, client, rcon_cmd)
+
+    if rcon_cmd is not None and ENABLE_GAMELOGS_AUTOPOST:
         asyncio.create_task(gamelogs_autopost_module.run_gamelogs_autopost_loop(client, rcon_cmd))
 
-    # Ensure the "Write Log" panel exists where your module wants it (test-only/channel mode inside module)
-    try:
-        asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
-        print("[travelerlogs] ✅ ensure_write_panels scheduled")
-    except Exception as e:
-        print(f"[travelerlogs] ensure_write_panels error: {e}")
+    # Ensure the "Write Log" panels exist (category mode inside module)
+    if ENABLE_TRAVELERLOGS:
+        try:
+            asyncio.create_task(travelerlogs_module.ensure_write_panels(client, guild_id=GUILD_ID))
+            print("[travelerlogs] ✅ ensure_write_panels scheduled")
+        except Exception as e:
+            print(f"[travelerlogs] ensure_write_panels error: {e}")
+
+    running = []
+    if ENABLE_TRIBELOGS: running.append("tribelogs")
+    if ENABLE_TIME: running.append("time")
+    if ENABLE_VCSTATUS: running.append("vcstatus")
+    if ENABLE_PLAYERS: running.append("players")
+    if ENABLE_CROSSCHAT: running.append("crosschat")
+    if ENABLE_GAMELOGS_AUTOPOST: running.append("gamelogs_autopost")
+    if ENABLE_TRAVELERLOGS: running.append("travelerlogs")
 
     print(f"✅ Solunaris bot online | commands synced to guild {GUILD_ID}")
-    print("✅ Modules running: tribelogs, time, vcstatus, players, crosschat, gamelogs_autopost, travelerlogs")
+    print(f"✅ Modules running: {', '.join(running) if running else '(none)'}")
 
 
 @client.event
 async def on_message(message: discord.Message):
     """
     Crosschat relay only.
-    (Traveler log channel restriction is handled via Discord permissions.)
     """
+    if not ENABLE_CROSSCHAT:
+        return
+
     rcon_cmd = _get_rcon_command()
     if rcon_cmd is not None:
         try:
